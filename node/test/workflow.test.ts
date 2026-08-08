@@ -99,8 +99,68 @@ test("accepts supported coding-agent runtimes and rejects unknown kinds during c
   );
 });
 
+test("host delivery is explicit, label-bound, and keeps tracker credentials out of the agent", () => {
+  const config = {
+    tracker: {
+      kind: "github",
+      provider: { owner: "acme", repo: "widget", token: "$TRACKER_TOKEN" },
+      required_labels: ["Symphony"],
+    },
+    delivery: { queue_label: "SYMPHONY", review_label: "Human-Review" },
+    runtime: { kind: "codex", options: { env_allowlist: ["CI"] } },
+  };
+
+  assert.deepEqual(parseWorkflowConfig(config).delivery, {
+    queueLabel: "symphony",
+    reviewLabel: "human-review",
+  });
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { queue_label: "missing", review_label: "human-review" } }),
+    /queue_label.*required_labels/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { queue_label: "symphony", review_label: "symphony" } }),
+    /review_label.*required_labels/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { queue_label: "s".repeat(51), review_label: "human-review" } }),
+    /50/,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { queue_label: "symphony", review_label: "r".repeat(51) } }),
+    /50/,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, hooks: { after_run: "docker compose down" } }),
+    /does not support hooks\.after_run/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { kind: "memory", required_labels: ["symphony"] } }),
+    /GitHub tracker/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, provider: { owner: "acme", repo: "widget" } } }),
+    /explicit tracker token environment reference/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...config,
+      runtime: { kind: "claude", options: { env_allowlist: ["TRACKER_TOKEN"] } },
+    }),
+    /credentials must not be passed/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...config,
+      runtime: { kind: "codex", options: { env_allowlist: ["GITHUB_TOKEN"] } },
+    }),
+    /credentials must not be passed/i,
+  );
+});
+
 test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   const workflow = await loadWorkflow(path.resolve("WORKFLOW.github.md"));
+  const codexWorkflow = await loadWorkflow(path.resolve("WORKFLOW.codex.github.md"));
 
   assert.equal(workflow.config.tracker.kind, "github");
   assert.deepEqual(workflow.config.tracker.requiredLabels, ["symphony"]);
@@ -110,17 +170,18 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
     token: "$GITHUB_TOKEN",
     base_branch: "main",
   });
+  assert.deepEqual(workflow.config.delivery, { queueLabel: "symphony", reviewLabel: "human-review" });
+  assert.equal(workflow.config.agent.maxTurns, 1);
   assert.deepEqual(workflow.config.runtime.options.allowed_tools, [
     "Read",
     "Edit",
     "Write",
     "Glob",
     "Grep",
-    "mcp__symphony__publish_current_change",
-    "mcp__symphony__comment_current_issue",
-    "mcp__symphony__add_current_issue_label",
-    "mcp__symphony__remove_current_issue_label",
   ]);
+  assert.equal(codexWorkflow.config.runtime.kind, "codex");
+  assert.equal(codexWorkflow.config.agent.maxTurns, 1);
+  assert.deepEqual(codexWorkflow.config.delivery, workflow.config.delivery);
 });
 
 const sampleIssue: Issue = {

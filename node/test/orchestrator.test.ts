@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { stringify as stringifyYaml } from "yaml";
 import { WorkflowStore } from "../src/config/store.js";
-import type { AgentDriver, AgentEvent, AgentRunContext, Tracker } from "../src/domain.js";
+import type { AgentDriver, AgentEvent, AgentRunContext, Issue, Tracker } from "../src/domain.js";
 import { createLogger, type AppLogger } from "../src/log.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { MemoryTracker } from "../src/trackers/memory.js";
@@ -177,6 +177,319 @@ test("binds provider operations to the current issue and owned workspace", async
   await access(path.join(directory, "workspaces", workspaceKey("BOUND-1")));
   await orchestrator.stop();
   await rm(directory, { recursive: true, force: true });
+});
+
+for (const runtimeKind of ["claude", "codex"] as const) {
+  test(`host delivery publishes and hands off one ${runtimeKind} completion exactly once`, async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), `symphony-delivery-${runtimeKind}-`));
+    let current = githubIssue();
+    let driverRuns = 0;
+    let streamClosed = false;
+    const operations: string[] = [];
+    const tracker: Tracker = {
+      async fetchIssuesByStates(states) {
+        return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+      },
+      async fetchIssuesByIds(ids) {
+        return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+      },
+      async publishIssueChange(target, workspacePath, input, signal) {
+        assert.equal(streamClosed, true);
+        assert.equal(signal.aborted, false);
+        assert.equal(target.id, current.id);
+        assert.equal(workspacePath, path.join(await realpath(directory), "workspaces", workspaceKey(current.identifier)));
+        assert.equal(input.commitMessage, "acme/widget#7: Fix the widget");
+        assert.match(input.pullRequestBody, /npm test/);
+        operations.push("publish");
+        return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
+      },
+      async mutateIssue(target, mutation, signal) {
+        assert.equal(signal.aborted, false);
+        assert.equal(target.id, current.id);
+        if (mutation.kind === "add_label") {
+          operations.push(`add:${mutation.label}`);
+          current = { ...current, labels: [...new Set([...current.labels, mutation.label])] };
+        } else if (mutation.kind === "comment") {
+          assert.match(
+            mutation.idempotencyKey ?? "",
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          );
+          operations.push("comment:uuid");
+          assert.match(mutation.body, /https:\/\/github\.com\/acme\/widget\/pull\/11/);
+          assert.match(mutation.body, /npm test/);
+        } else if (mutation.kind === "remove_label") {
+          operations.push(`remove:${mutation.label}`);
+          current = { ...current, labels: current.labels.filter((label) => label !== mutation.label) };
+        } else {
+          throw new Error(`Unexpected mutation ${mutation.kind}`);
+        }
+      },
+    };
+    const driver = new FakeDriver(async function* (context) {
+      driverRuns += 1;
+      assert.equal(context.completionMode, "publish_change");
+      assert.deepEqual(context.sensitiveEnvNames, ["GITHUB_TOKEN", "TRACKER_TOKEN"]);
+      assert.equal(context.publishCurrentChange, undefined);
+      assert.equal(context.mutateCurrentIssue, undefined);
+      try {
+        yield event("turn_completed", {
+          sessionId: `${runtimeKind}-delivery-session`,
+          completion: {
+            status: "ready",
+            summary: "Implemented the requested fix.",
+            verification: ["npm test"],
+          },
+        });
+      } finally {
+        streamClosed = true;
+      }
+    }, runtimeKind);
+    const workflowPath = await writeDeliveryWorkflow(directory, runtimeKind);
+    const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+
+    assert.deepEqual(operations, [
+      "publish",
+      "comment:uuid",
+      "add:human-review",
+      "remove:symphony",
+    ]);
+    assert.equal(driverRuns, 1);
+    assert.deepEqual(current.labels, ["human-review"]);
+    assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+    await access(path.join(directory, "workspaces", workspaceKey(current.identifier)));
+
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+    assert.equal(driverRuns, 1);
+    assert.equal(operations.filter((operation) => operation === "publish").length, 1);
+
+    await orchestrator.stop();
+    await rm(directory, { recursive: true, force: true });
+  });
+}
+
+test("a partial host-delivery failure retries host work without rerunning the agent", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-delivery-retry-"));
+  let current = githubIssue();
+  let driverRuns = 0;
+  let publicationCalls = 0;
+  let loseFirstCommentResponse = true;
+  const pullRequests = new Set<number>();
+  const commits = new Set<string>();
+  const comments = new Map<string, string>();
+  const commentKeys: string[] = [];
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async publishIssueChange(_target, _workspacePath, input) {
+      publicationCalls += 1;
+      commits.add(input.commitMessage);
+      pullRequests.add(11);
+      return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
+    },
+    async mutateIssue(_target, mutation) {
+      if (mutation.kind === "add_label") {
+        current = { ...current, labels: [...new Set([...current.labels, mutation.label])] };
+        return;
+      }
+      if (mutation.kind === "comment") {
+        const key = mutation.idempotencyKey ?? "ordinary";
+        commentKeys.push(key);
+        comments.set(key, mutation.body);
+        if (loseFirstCommentResponse) {
+          loseFirstCommentResponse = false;
+          throw new Error("simulated lost response");
+        }
+        return;
+      }
+      if (mutation.kind === "remove_label") {
+        current = { ...current, labels: current.labels.filter((label) => label !== mutation.label) };
+      }
+    },
+  };
+  const driver = new FakeDriver(async function* () {
+    driverRuns += 1;
+    yield event("turn_completed", {
+      completion: { status: "ready", summary: "Fixed.", verification: ["npm test"] },
+    });
+  });
+  const workflowPath = await writeDeliveryWorkflow(directory, "claude");
+  let now = Date.UTC(2026, 0, 1);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    now: () => now,
+    failureBaseDelayMs: 10,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
+  const [deliveryKey] = commentKeys;
+  assert.match(
+    deliveryKey ?? "",
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
+  assert.doesNotMatch(JSON.stringify(orchestrator.snapshot()), new RegExp(deliveryKey ?? "never-match"));
+
+  now += 10;
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(driverRuns, 1);
+  assert.equal(publicationCalls, 2);
+  assert.equal(commits.size, 1);
+  assert.equal(pullRequests.size, 1);
+  assert.equal(comments.size, 1);
+  assert.deepEqual(commentKeys, [deliveryKey, deliveryKey]);
+  assert.deepEqual(current.labels, ["human-review"]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("a stalled host delivery preserves its completion for a host-only retry", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-delivery-stall-"));
+  const publishStarted = deferred<void>();
+  let current = githubIssue();
+  let driverRuns = 0;
+  let publicationCalls = 0;
+  const tracker: Tracker = {
+    async fetchIssuesByStates() {
+      return [{ ...current, labels: [...current.labels] }];
+    },
+    async fetchIssuesByIds() {
+      return [{ ...current, labels: [...current.labels] }];
+    },
+    async publishIssueChange(_target, _workspacePath, _input, signal) {
+      publicationCalls += 1;
+      if (publicationCalls === 1) {
+        publishStarted.resolve();
+        await new Promise<never>((_resolve, reject) => {
+          const abort = () => reject(signal.reason);
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
+    },
+    async mutateIssue(_target, mutation) {
+      if (mutation.kind === "add_label") {
+        current = { ...current, labels: [...new Set([...current.labels, mutation.label])] };
+      } else if (mutation.kind === "remove_label") {
+        current = { ...current, labels: current.labels.filter((label) => label !== mutation.label) };
+      }
+    },
+  };
+  const driver = new FakeDriver(async function* () {
+    driverRuns += 1;
+    yield event("turn_completed", {
+      completion: { status: "ready", summary: "Fixed.", verification: ["npm test"] },
+    });
+  });
+  const workflowPath = await writeDeliveryWorkflow(directory, "claude", { stallTimeoutMs: 10 });
+  let now = Date.UTC(2026, 0, 1);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    now: () => now,
+    failureBaseDelayMs: 10,
+  });
+
+  await orchestrator.pollOnce();
+  await publishStarted.promise;
+  now += 11;
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
+
+  now += 10;
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(driverRuns, 1);
+  assert.equal(publicationCalls, 2);
+  assert.deepEqual(current.labels, ["human-review"]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("host delivery does not publish blocked, stale, or failed completions", async () => {
+  const cases = [
+    {
+      name: "blocked",
+      mutateBeforeTerminal: false,
+      terminal: event("turn_completed", {
+        completion: { status: "blocked", summary: "Needs an API fixture.", verification: ["npm test: blocked"] },
+      }),
+      expected: { running: 0, retrying: 0, blocked: 1 },
+    },
+    {
+      name: "stale",
+      mutateBeforeTerminal: true,
+      terminal: event("turn_completed", {
+        completion: { status: "ready", summary: "Done.", verification: ["npm test"] },
+      }),
+      expected: { running: 0, retrying: 0, blocked: 0 },
+    },
+    {
+      name: "missing",
+      mutateBeforeTerminal: false,
+      terminal: event("turn_completed"),
+      expected: { running: 0, retrying: 1, blocked: 0 },
+    },
+    {
+      name: "invalid",
+      mutateBeforeTerminal: false,
+      terminal: event("turn_completed", {
+        completion: { status: "ready", summary: "", verification: [] },
+      }),
+      expected: { running: 0, retrying: 1, blocked: 0 },
+    },
+  ] as const;
+
+  for (const scenario of cases) {
+    const directory = await mkdtemp(path.join(tmpdir(), `symphony-delivery-${scenario.name}-`));
+    let current = githubIssue();
+    let publications = 0;
+    const tracker: Tracker = {
+      async fetchIssuesByStates() {
+        return [{ ...current, labels: [...current.labels] }];
+      },
+      async fetchIssuesByIds() {
+        return [{ ...current, labels: [...current.labels] }];
+      },
+      async publishIssueChange() {
+        publications += 1;
+        return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
+      },
+      async mutateIssue() {},
+    };
+    const driver = new FakeDriver(async function* () {
+      if (scenario.mutateBeforeTerminal) current = { ...current, labels: [] };
+      yield scenario.terminal;
+    });
+    const workflowPath = await writeDeliveryWorkflow(directory, "claude");
+    const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+
+    assert.equal(publications, 0, scenario.name);
+    assert.deepEqual(compactState(orchestrator), scenario.expected, scenario.name);
+    await orchestrator.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("refreshes before exponential retries and starts fresh sessions after failures", async () => {
@@ -509,11 +822,12 @@ test("tracker reload cannot retarget running, blocked, or retried work with a re
 });
 
 class FakeDriver implements AgentDriver {
-  readonly kind = "claude";
+  readonly kind: string;
   readonly #script: (context: AgentRunContext) => AsyncIterable<AgentEvent>;
 
-  constructor(script: (context: AgentRunContext) => AsyncIterable<AgentEvent>) {
+  constructor(script: (context: AgentRunContext) => AsyncIterable<AgentEvent>, kind = "claude") {
     this.#script = script;
+    this.kind = kind;
   }
 
   run(context: AgentRunContext): AsyncIterable<AgentEvent> {
@@ -542,6 +856,56 @@ function rawIssue(
     dispatchable: true,
     created_at: createdAt,
   };
+}
+
+function githubIssue(): Issue {
+  return {
+    id: "7",
+    nativeRef: { owner: "acme", repo: "widget", number: 7 },
+    identifier: "acme/widget#7",
+    title: "Fix\n\0the\twidget",
+    description: "Test issue",
+    priority: 1,
+    state: "open",
+    branchName: null,
+    url: "https://github.com/acme/widget/issues/7",
+    assigneeId: null,
+    labels: ["symphony"],
+    blockedBy: [],
+    dispatchable: true,
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-01T00:00:00Z",
+  };
+}
+
+async function writeDeliveryWorkflow(
+  directory: string,
+  runtimeKind: "claude" | "codex",
+  options: { stallTimeoutMs?: number } = {},
+): Promise<string> {
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const config = {
+    tracker: {
+      kind: "github",
+      provider: { owner: "acme", repo: "widget", token: "$TRACKER_TOKEN" },
+      required_labels: ["symphony"],
+      active_states: ["open"],
+      terminal_states: ["closed"],
+    },
+    delivery: { queue_label: "symphony", review_label: "human-review" },
+    polling: { interval_ms: 60_000 },
+    workspace: { root: "./workspaces" },
+    hooks: { timeout_ms: 1_000 },
+    agent: { max_concurrent_agents: 1, max_turns: 1, max_retry_backoff_ms: 1_000 },
+    runtime: {
+      kind: runtimeKind,
+      turn_timeout_ms: 10_000,
+      stall_timeout_ms: options.stallTimeoutMs ?? 0,
+      options: {},
+    },
+  };
+  await writeFile(workflowPath, `---\n${stringifyYaml(config)}---\nWork on {{ issue.identifier }}.\n`);
+  return workflowPath;
 }
 
 async function writeWorkflow(

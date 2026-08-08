@@ -4,6 +4,7 @@ import path from "node:path";
 
 const positiveInteger = z.number().int().positive();
 const nonEmptyString = z.string().trim().min(1);
+const githubLabel = z.string().trim().min(1).max(50);
 const githubStates = new Set(["open", "closed", "all"]);
 
 const trackerSchema = z
@@ -82,6 +83,13 @@ const runtimeSchema = z
   })
   .prefault({});
 
+const deliverySchema = z
+  .object({
+    queue_label: githubLabel,
+    review_label: githubLabel,
+  })
+  .strict();
+
 const rawWorkflowConfigSchema = z
   .object({
     tracker: trackerSchema,
@@ -90,8 +98,71 @@ const rawWorkflowConfigSchema = z
     hooks: hooksSchema,
     agent: agentSchema,
     runtime: runtimeSchema,
+    delivery: deliverySchema.optional(),
   })
-  .passthrough();
+  .passthrough()
+  .superRefine((value, context) => {
+    if (value.delivery === undefined) return;
+    if (value.tracker.kind !== "github") {
+      context.addIssue({
+        code: "custom",
+        path: ["delivery"],
+        message: "Host delivery currently requires the GitHub tracker",
+      });
+    }
+    if (value.hooks.after_run !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["hooks", "after_run"],
+        message: "Host delivery does not support hooks.after_run",
+      });
+    }
+
+    const queueLabel = value.delivery.queue_label.trim().toLowerCase();
+    const reviewLabel = value.delivery.review_label.trim().toLowerCase();
+    const requiredLabels = value.tracker.required_labels.map((label) => label.trim().toLowerCase());
+    if (!requiredLabels.includes(queueLabel)) {
+      context.addIssue({
+        code: "custom",
+        path: ["delivery", "queue_label"],
+        message: "delivery.queue_label must be present in tracker.required_labels",
+      });
+    }
+    if (requiredLabels.includes(reviewLabel)) {
+      context.addIssue({
+        code: "custom",
+        path: ["delivery", "review_label"],
+        message: "delivery.review_label must differ from every tracker.required_labels entry",
+      });
+    }
+
+    const tokenReference = value.tracker.provider.token;
+    const tokenMatch = typeof tokenReference === "string"
+      ? /^\$([A-Za-z_][A-Za-z0-9_]*)$/u.exec(tokenReference.trim())
+      : null;
+    if (!tokenMatch?.[1]) {
+      context.addIssue({
+        code: "custom",
+        path: ["tracker", "provider", "token"],
+        message: "Host delivery requires an explicit tracker token environment reference",
+      });
+      return;
+    }
+
+    const allowlist = value.runtime.options.env_allowlist;
+    if (!Array.isArray(allowlist)) return;
+    const forbidden = new Set(["github_token", tokenMatch[1].toLowerCase()]);
+    const leakedIndex = allowlist.findIndex(
+      (name) => typeof name === "string" && forbidden.has(name.toLowerCase()),
+    );
+    if (leakedIndex >= 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["runtime", "options", "env_allowlist", leakedIndex],
+        message: "Tracker credentials must not be passed to the coding-agent child",
+      });
+    }
+  });
 
 export interface WorkflowConfig {
   tracker: {
@@ -121,6 +192,10 @@ export interface WorkflowConfig {
     turnTimeoutMs: number;
     stallTimeoutMs: number;
     options: Record<string, unknown>;
+  };
+  delivery?: {
+    queueLabel: string;
+    reviewLabel: string;
   };
 }
 
@@ -162,5 +237,13 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
       stallTimeoutMs: parsed.runtime.stall_timeout_ms,
       options: parsed.runtime.options,
     },
+    ...(parsed.delivery === undefined
+      ? {}
+      : {
+          delivery: {
+            queueLabel: parsed.delivery.queue_label.trim().toLowerCase(),
+            reviewLabel: parsed.delivery.review_label.trim().toLowerCase(),
+          },
+        }),
   };
 }

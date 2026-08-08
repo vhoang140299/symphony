@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { agentCompletionOutputSchema, parseAgentCompletionJson } from "../completion.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, AgentUsage } from "../domain.js";
 
 const codexOptionsSchema = z
@@ -31,6 +32,7 @@ export interface CodexStreamRequest {
   threadOptions: ThreadOptions;
   prompt: string;
   signal: AbortSignal;
+  outputSchema?: unknown;
   sessionId?: string;
 }
 
@@ -42,7 +44,12 @@ async function openCodexStream(request: CodexStreamRequest): Promise<AsyncIterab
     request.sessionId === undefined
       ? codex.startThread(request.threadOptions)
       : codex.resumeThread(request.sessionId, request.threadOptions);
-  return (await thread.runStreamed(request.prompt, { signal: request.signal })).events;
+  return (
+    await thread.runStreamed(request.prompt, {
+      signal: request.signal,
+      ...(request.outputSchema === undefined ? {} : { outputSchema: request.outputSchema }),
+    })
+  ).events;
 }
 
 export class CodexAgentDriver implements AgentDriver {
@@ -60,6 +67,7 @@ export class CodexAgentDriver implements AgentDriver {
     let turnFailed = false;
     let commandTempPath: string | undefined;
     let sessionId = context.sessionId;
+    let lastCompletedAgentMessage: string | undefined;
 
     try {
       const configured = codexOptionsSchema.parse(context.runtimeOptions);
@@ -93,7 +101,11 @@ export class CodexAgentDriver implements AgentDriver {
           ? {}
           : { modelReasoningEffort: configured.model_reasoning_effort }),
       };
-      const clientEnvironment = buildCodexEnvironment(configured.env_allowlist, codexHome);
+      const clientEnvironment = buildCodexEnvironment(
+        configured.env_allowlist,
+        codexHome,
+        context.sensitiveEnvNames,
+      );
       if (configured.codex_executable !== undefined) {
         clientEnvironment.SYMPHONY_CODEX_REAL_EXECUTABLE = configured.codex_executable;
       }
@@ -125,7 +137,7 @@ export class CodexAgentDriver implements AgentDriver {
           shell_environment_policy: {
             inherit: "none",
             ignore_default_excludes: false,
-            set: buildCodexShellEnvironment(commandTempPath),
+            set: buildCodexShellEnvironment(commandTempPath, context.sensitiveEnvNames),
           },
         },
       };
@@ -134,6 +146,7 @@ export class CodexAgentDriver implements AgentDriver {
         threadOptions,
         prompt: context.prompt,
         signal: context.signal,
+        ...(context.completionMode === "publish_change" ? { outputSchema: agentCompletionOutputSchema } : {}),
         ...(sessionId === undefined ? {} : { sessionId }),
       });
 
@@ -158,6 +171,14 @@ export class CodexAgentDriver implements AgentDriver {
           continue;
         }
 
+        if (
+          context.completionMode === "publish_change" &&
+          event.type === "item.completed" &&
+          event.item.type === "agent_message"
+        ) {
+          lastCompletedAgentMessage = event.item.text;
+        }
+
         yield eventNow("activity", {
           summary: activitySummary(event),
           ...(sessionId === undefined ? {} : { sessionId }),
@@ -172,10 +193,26 @@ export class CodexAgentDriver implements AgentDriver {
         });
       } else if (turnCompleted) {
         terminalEmitted = true;
-        yield eventNow("turn_completed", {
-          summary: "Codex turn completed",
-          ...(sessionId === undefined ? {} : { sessionId }),
-        });
+        if (context.completionMode === "publish_change") {
+          const completion = parseAgentCompletionJson(lastCompletedAgentMessage);
+          if (completion === undefined) {
+            yield eventNow("turn_failed", {
+              summary: "Codex returned invalid structured completion",
+              ...(sessionId === undefined ? {} : { sessionId }),
+            });
+          } else {
+            yield eventNow("turn_completed", {
+              summary: completion.summary,
+              completion,
+              ...(sessionId === undefined ? {} : { sessionId }),
+            });
+          }
+        } else {
+          yield eventNow("turn_completed", {
+            summary: "Codex turn completed",
+            ...(sessionId === undefined ? {} : { sessionId }),
+          });
+        }
       } else if (!terminalEmitted) {
         terminalEmitted = true;
         yield eventNow("turn_failed", {
@@ -207,20 +244,26 @@ export class CodexAgentDriver implements AgentDriver {
   }
 }
 
-export function buildCodexEnvironment(extraNames: string[], codexHome = process.env.CODEX_HOME): Record<string, string> {
+export function buildCodexEnvironment(
+  extraNames: string[],
+  codexHome = process.env.CODEX_HOME,
+  sensitiveEnvNames: string[] = [],
+): Record<string, string> {
   const names = new Set([...safeEnvironmentNames, ...extraNames]);
+  const excluded = new Set(sensitiveEnvNames.map((name) => name.toUpperCase()));
   const environment: Record<string, string> = {};
   for (const name of names) {
+    if (excluded.has(name.toUpperCase())) continue;
     const value = process.env[name];
     if (value !== undefined) environment[name] = value;
   }
   if (codexHome !== undefined) {
-    environment.CODEX_HOME = codexHome;
-    environment.HOME = codexHome;
+    if (!excluded.has("CODEX_HOME")) environment.CODEX_HOME = codexHome;
+    if (!excluded.has("HOME")) environment.HOME = codexHome;
     if (process.platform === "win32") {
-      environment.USERPROFILE = codexHome;
-      environment.APPDATA = codexHome;
-      environment.LOCALAPPDATA = codexHome;
+      if (!excluded.has("USERPROFILE")) environment.USERPROFILE = codexHome;
+      if (!excluded.has("APPDATA")) environment.APPDATA = codexHome;
+      if (!excluded.has("LOCALAPPDATA")) environment.LOCALAPPDATA = codexHome;
     }
   }
   return environment;
@@ -263,15 +306,20 @@ export async function resolveSafeCodexHome(configuredPath: string | undefined): 
   }
 }
 
-export function buildCodexShellEnvironment(commandTempPath: string): Record<string, string> {
+export function buildCodexShellEnvironment(
+  commandTempPath: string,
+  sensitiveEnvNames: string[] = [],
+): Record<string, string> {
+  const excluded = new Set(sensitiveEnvNames.map((name) => name.toUpperCase()));
   const environment: Record<string, string> = {};
   for (const name of safeShellEnvironmentNames) {
+    if (excluded.has(name.toUpperCase())) continue;
     const value = process.env[name];
     if (value !== undefined) environment[name] = value;
   }
-  environment.TEMP = commandTempPath;
-  environment.TMP = commandTempPath;
-  environment.TMPDIR = commandTempPath;
+  if (!excluded.has("TEMP")) environment.TEMP = commandTempPath;
+  if (!excluded.has("TMP")) environment.TMP = commandTempPath;
+  if (!excluded.has("TMPDIR")) environment.TMPDIR = commandTempPath;
   return environment;
 }
 

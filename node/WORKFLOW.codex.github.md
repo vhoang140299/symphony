@@ -6,7 +6,6 @@ tracker:
     repo: YOUR_REPO
     token: $GITHUB_TOKEN
     base_branch: main
-    # For a custom API endpoint, also set an explicit HTTPS git_url.
   required_labels: [symphony]
   active_states: [open]
   terminal_states: [closed]
@@ -32,21 +31,11 @@ agent:
   max_retry_backoff_ms: 300000
 
 runtime:
-  kind: claude
+  kind: codex
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
   options:
-    max_agentic_turns: 50
-    max_budget_usd: 2
-    permission_mode: default
-    setting_sources: []
-    allowed_tools:
-      - Read
-      - Edit
-      - Write
-      - Glob
-      - Grep
-    tools: [Read, Edit, Write, Glob, Grep]
+    model_reasoning_effort: high
 ---
 
 You are implementing GitHub issue {{ issue.identifier }} in its dedicated workspace.

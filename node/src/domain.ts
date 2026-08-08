@@ -23,10 +23,16 @@ export interface Issue {
 }
 
 export type IssueMutation =
-  | { kind: "comment"; body: string }
+  | { kind: "comment"; body: string; idempotencyKey?: string }
   | { kind: "add_label"; label: string }
   | { kind: "remove_label"; label: string }
   | { kind: "set_state"; state: string };
+
+export interface AgentCompletion {
+  status: "ready" | "blocked";
+  summary: string;
+  verification: string[];
+}
 
 export interface PublishChangeInput {
   commitMessage: string;
@@ -79,6 +85,7 @@ export interface AgentEvent {
   usage?: AgentUsage;
   rateLimits?: unknown;
   blockingReason?: "approval" | "input";
+  completion?: AgentCompletion;
   providerData?: Record<string, unknown>;
 }
 
@@ -90,6 +97,8 @@ export interface AgentRunContext {
   continuation: number;
   signal: AbortSignal;
   runtimeOptions: Record<string, unknown>;
+  completionMode?: "publish_change";
+  sensitiveEnvNames?: string[];
   mutateCurrentIssue?: (mutation: IssueMutation, signal: AbortSignal) => Promise<void>;
   publishCurrentChange?: (input: PublishChangeInput, signal: AbortSignal) => Promise<PublishedChange>;
   sessionId?: string;

@@ -35,9 +35,9 @@ help with the setup:
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
 For a smaller Node.js implementation, see [node/README.md](node/README.md). It supports Claude Code
-and an initial Codex runtime, with in-memory and GitHub Issues trackers plus an opt-in GitHub
-issue-to-pull-request flow; it does not yet provide the full adapter and operational surface of the
-Elixir reference implementation.
+and Codex, with in-memory and GitHub Issues trackers plus an opt-in, host-controlled GitHub
+issue-to-pull-request flow for either agent; it does not yet provide the full adapter and operational
+surface of the Elixir reference implementation.
 
 ---
 

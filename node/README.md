@@ -14,7 +14,8 @@ Claude Code or Codex through their official SDKs.
 
 - Runtime: Node.js with strict TypeScript and ESM
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
-- Trackers: in-memory issues, or GitHub Issues polling with opt-in issue mutations and PR publishing
+- Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools and host-controlled
+  PR delivery
 - Operations: structured logs and an in-process runtime snapshot
 
 The in-memory tracker is for development and smoke tests. It does not persist state, synchronize
@@ -86,8 +87,10 @@ Useful prompt values include `issue.identifier`, `issue.title`, `issue.descripti
 `issue.state`, `issue.labels`, and `attempt`. Configuration is reloaded when the file changes; an
 invalid reload keeps the last known-good configuration.
 
-[`WORKFLOW.github.md`](WORKFLOW.github.md) is a GitHub issue-to-PR profile. Copy it before editing;
-the default `WORKFLOW.md` remains an inert local example.
+[`WORKFLOW.github.md`](WORKFLOW.github.md) and
+[`WORKFLOW.codex.github.md`](WORKFLOW.codex.github.md) are host-delivery GitHub issue-to-PR profiles
+for Claude and Codex. Copy one before editing; the default `WORKFLOW.md` remains an inert local
+example.
 
 Claude-specific settings live under `runtime.options` when `runtime.kind` is `claude`:
 
@@ -128,9 +131,9 @@ environment preserves the local Codex login and basic process/TLS variables whil
 unrelated host secrets. Add `CODEX_API_KEY` or `OPENAI_API_KEY` to `env_allowlist` only when that
 credential mode is intentional.
 
-This first Codex adapter does not expose Symphony's host-side GitHub mutation or PR publishing
-tools. It is suitable for local/memory workflows and coding work whose tracker transition is handled
-outside the agent.
+The Codex adapter does not expose Symphony's manual GitHub mutation or publishing tools. Use the
+host-delivery configuration below when Codex should hand verified work back to Symphony for
+publishing.
 
 The Codex SDK does not yet expose the CLI's `--ignore-user-config` switch. Symphony therefore runs
 the bundled CLI through a small wrapper that always adds `--ignore-user-config` and `--ignore-rules`,
@@ -153,7 +156,8 @@ runs. That value means “unavailable,” not “free.”
 
 ### GitHub Issues tracker
 
-Use GitHub issue numbers as tracker IDs and `open`/`closed` as states:
+Use GitHub issue numbers as tracker IDs and `open`/`closed` as states. Add `delivery` to opt in to
+host-controlled publishing:
 
 ```yaml
 tracker:
@@ -169,6 +173,13 @@ tracker:
   active_states: [open]
   terminal_states: [closed]
 
+delivery:
+  queue_label: symphony
+  review_label: human-review
+
+agent:
+  max_turns: 1
+
 runtime:
   kind: claude
   options:
@@ -178,37 +189,78 @@ runtime:
       - Write
       - Glob
       - Grep
-      # Add only the mutations this workflow needs:
+    tools: [Read, Edit, Write, Glob, Grep]
+```
+
+Host delivery currently requires the GitHub tracker. `delivery.queue_label` must be one of
+`tracker.required_labels`, and `delivery.review_label` must differ from every required label. Create
+both labels in the repository before starting Symphony so their color and description are controlled
+and the profile remains portable to GitHub Enterprise. GitHub.com may create a missing review label
+with default metadata. The checked-in profiles use one SDK query per issue (`agent.max_turns: 1`)
+because each run must make an explicit handoff decision.
+
+In delivery mode, Claude and Codex return a constrained result with this shape:
+
+```json
+{
+  "status": "ready",
+  "summary": "Implemented the requested change.",
+  "verification": ["npm test — passed"]
+}
+```
+
+`status` is `ready` or `blocked`; `summary` and at least one `verification` entry are required. The
+agent edits and verifies only—it cannot supply the repository, branch, issue, labels, or direct
+publishing input. Symphony refreshes the issue and validates the owned workspace before it derives
+commit and pull-request metadata from the issue and constrained result, then publishes. It creates
+or updates one handoff comment for the current in-process retry chain, adds the review label, and
+removes the queue label last. A host-side delivery retry reuses the completed result, deterministic
+branch, open pull request, and handoff comment without rerunning the agent. If an earlier step fails,
+the queue label remains for retry. Host delivery rejects `hooks.after_run` because running cleanup
+between host retries can change the pending commit, while delaying cleanup can leak resources.
+Pending delivery state is in memory; after a process restart, a still-routable issue can be dispatched
+to the agent again.
+
+Host delivery requires `tracker.provider.token` to be an explicit environment reference such as
+`$GITHUB_TOKEN`; set that variable in Symphony's host environment. The named variable and
+`GITHUB_TOKEN` must not appear in `runtime.options.env_allowlist`. Comment and label updates execute
+inside Symphony, so the tracker credential never needs to enter the coding-agent child. The token
+needs repository `Issues: write`, `Contents: write`, and `Pull requests: write` permissions.
+
+Outside delivery mode, the implicit `GITHUB_TOKEN` fallback is limited to `https://api.github.com`.
+A custom endpoint must name its token environment variable explicitly, and authenticated endpoints
+must use HTTPS. HTTP mutations from the manual tools below are not automatically retried.
+
+Publishing stages the bound workspace, creates a commit when needed, pushes the deterministic
+`symphony/issue-<number>` branch without force, and creates or updates the matching open pull
+request. Git hooks, signing, interactive credentials, and executable Git filters are disabled or
+rejected. For a custom API endpoint, configure an explicit HTTPS `git_url`; Symphony will not guess
+where to send Git credentials.
+
+When `delivery` is omitted, Claude's manual host tools remain available through explicit
+`allowed_tools` entries:
+
+```yaml
+runtime:
+  kind: claude
+  options:
+    allowed_tools:
+      - Read
+      - Edit
+      - Write
+      - Glob
+      - Grep
+      - mcp__symphony__publish_current_change
       - mcp__symphony__comment_current_issue
       - mcp__symphony__add_current_issue_label
       - mcp__symphony__remove_current_issue_label
       - mcp__symphony__set_current_issue_state
-      - mcp__symphony__publish_current_change
     tools: [Read, Edit, Write, Glob, Grep]
 ```
 
-The adapter polls issues and filters out pull requests. Each enabled mutation tool is bound to the
-current issue; Claude cannot provide a repository, URL, or issue number. Comment, label, and state
-updates execute inside the Symphony process, so the GitHub token never needs to enter the Claude
-child environment. A token with repository `Issues: write` permission is required for mutations;
-do not add `GITHUB_TOKEN` to `runtime.options.env_allowlist`.
-
-The implicit `GITHUB_TOKEN` fallback is limited to `https://api.github.com`; a custom endpoint must
-name its token environment variable explicitly, and authenticated endpoints must use HTTPS. HTTP
-mutations are not automatically retried, because retrying a comment could post it twice.
-
-`publish_current_change` stages the bound workspace, creates a commit when needed, pushes the
-deterministic `symphony/issue-<number>` branch without force, and creates or updates the matching
-open pull request. Its input contains only the commit message, PR title, and PR body; repository,
-remote, base branch, branch name, and issue number remain host-controlled. Git hooks, signing,
-interactive credentials, and executable Git filters are disabled or rejected during publishing.
-The token also needs repository `Contents: write` and `Pull requests: write` permissions. For a
-custom API endpoint, configure an explicit HTTPS `git_url`; Symphony will not guess where to send
-Git credentials.
-
-After publishing, the GitHub profile adds `human-review` and removes the required `symphony` label.
-That leaves the issue open for review while making it unroutable, so no extra workflow state or
-database is needed. Create both labels in the target repository before starting the daemon.
+Each enabled manual tool is bound to the current issue; Claude cannot provide a repository, URL, or
+issue number. `publish_current_change` accepts only the commit message, pull-request title, and
+pull-request body. Codex does not expose these in-process manual tools.
 
 Workspace hooks run with the issue workspace as their current directory. `after_create` is the
 normal place to clone the target repository. Workspaces must remain below `workspace.root`; do not
