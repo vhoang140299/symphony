@@ -228,13 +228,13 @@ test("hook timeout escalates to the detached process group", async (t) => {
   const leaderFile = path.join(root, "leader.pid");
   const manager = new WorkspaceManager(createLogger("silent"));
   const config = workflow(root, {
-    timeoutMs: 50,
+    timeoutMs: 500,
     beforeRun: `echo $$ > ${shellQuote(leaderFile)}; trap '' TERM; (trap '' TERM; while :; do sleep 30; done) & wait`,
   });
   const workspace = await manager.createForIssue(issue, config);
   const startedAt = Date.now();
 
-  await assert.rejects(manager.beforeRun(workspace.path, issue, config), /before_run hook timed out after 50ms/);
+  await assert.rejects(manager.beforeRun(workspace.path, issue, config), /before_run hook timed out after 500ms/);
   assert.ok(Date.now() - startedAt < 2_000);
 
   const leaderPid = Number.parseInt(await readFile(leaderFile, "utf8"), 10);
