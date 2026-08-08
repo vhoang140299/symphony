@@ -4,6 +4,7 @@ export { parseWorkflowConfig, type WorkflowConfig } from "./config/schema.js";
 export { WorkflowStore } from "./config/store.js";
 export { loadWorkflow, renderPrompt, type WorkflowDefinition } from "./config/workflow.js";
 export type {
+  AgentCompletion,
   AgentDriver,
   AgentEvent,
   AgentRunContext,

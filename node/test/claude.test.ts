@@ -52,6 +52,69 @@ test("normalizes Claude result usage as absolute totals", () => {
   });
 });
 
+test("validates Claude structured completion without exposing the raw result", () => {
+  const events = normalizeClaudeMessage(
+    {
+      type: "result",
+      subtype: "success",
+      session_id: "session-1",
+      result: "private raw result",
+      structured_output: {
+        status: "ready",
+        summary: "Implemented and verified the change",
+        verification: ["npm test"],
+      },
+      permission_denials: [],
+      modelUsage: {},
+    } as unknown as SDKMessage,
+    "publish_change",
+  );
+
+  assert.deepEqual(events.map(({ type }) => type), ["usage_updated", "turn_completed"]);
+  assert.deepEqual(events[1]?.completion, {
+    status: "ready",
+    summary: "Implemented and verified the change",
+    verification: ["npm test"],
+  });
+  assert.equal(events[1]?.summary, "Implemented and verified the change");
+  assert.equal(events.some(({ summary }) => summary?.includes("private raw result")), false);
+});
+
+test("fails Claude completion mode once for missing or invalid structured output", () => {
+  for (const structured_output of [undefined, { status: "ready", summary: "Done", verification: [] }]) {
+    const events = normalizeClaudeMessage(
+      {
+        type: "result",
+        subtype: "success",
+        session_id: "session-1",
+        result: "private raw result",
+        structured_output,
+        permission_denials: [],
+        modelUsage: {},
+      } as unknown as SDKMessage,
+      "publish_change",
+    );
+
+    assert.equal(events.filter(({ type }) => type === "turn_failed").length, 1);
+    assert.equal(events.filter(({ type }) => type === "turn_completed").length, 0);
+    assert.equal(events.some(({ summary }) => summary?.includes("private raw result")), false);
+  }
+
+  const sdkFailure = normalizeClaudeMessage(
+    {
+      type: "result",
+      subtype: "error_max_structured_output_retries",
+      session_id: "session-1",
+      permission_denials: [],
+      modelUsage: {},
+      errors: ["private malformed model output"],
+    } as unknown as SDKMessage,
+    "publish_change",
+  );
+  assert.equal(sdkFailure.filter(({ type }) => type === "turn_failed").length, 1);
+  assert.equal(sdkFailure.some(({ summary }) => summary?.includes("private malformed model output")), false);
+});
+
 test("maps Claude permission denials to a fail-closed approval event", () => {
   const events = normalizeClaudeMessage({
     type: "result",
@@ -156,6 +219,21 @@ test("Claude child environment strips unrelated host secrets unless explicitly a
   } finally {
     restoreEnvironment("ANTHROPIC_API_KEY", previousAnthropic);
     restoreEnvironment("GITHUB_TOKEN", previousGithub);
+  }
+});
+
+test("Claude sensitive environment names override defaults and explicit allowlists case-insensitively", () => {
+  const previousGithub = process.env.GITHUB_TOKEN;
+  const previousPath = process.env.PATH;
+  process.env.GITHUB_TOKEN = "github-test";
+  process.env.PATH = "path-test";
+  try {
+    const safe = buildClaudeEnvironment(["GITHUB_TOKEN"], ["github_token", "path"]);
+    assert.equal(safe.GITHUB_TOKEN, undefined);
+    assert.equal(safe.PATH, undefined);
+  } finally {
+    restoreEnvironment("GITHUB_TOKEN", previousGithub);
+    restoreEnvironment("PATH", previousPath);
   }
 });
 

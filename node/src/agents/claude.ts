@@ -11,6 +11,7 @@ import {
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { agentCompletionOutputSchema, parseAgentCompletion } from "../completion.js";
 import type {
   AgentDriver,
   AgentEvent,
@@ -87,8 +88,11 @@ export class ClaudeAgentDriver implements AgentDriver {
         settingSources: configured.setting_sources,
         strictMcpConfig: true,
         includePartialMessages: configured.include_partial_messages,
-        env: buildClaudeEnvironment(configured.env_allowlist),
+        env: buildClaudeEnvironment(configured.env_allowlist, context.sensitiveEnvNames),
         ...issueTools,
+        ...(context.completionMode === "publish_change"
+          ? { outputFormat: { type: "json_schema", schema: agentCompletionOutputSchema } as const }
+          : {}),
         ...(configured.model === undefined ? {} : { model: configured.model }),
         ...(configured.max_budget_usd === undefined ? {} : { maxBudgetUsd: configured.max_budget_usd }),
         ...(configured.claude_executable === undefined
@@ -99,7 +103,7 @@ export class ClaudeAgentDriver implements AgentDriver {
 
       claudeQuery = query({ prompt: context.prompt, options });
       for await (const message of claudeQuery) {
-        for (const event of normalizeClaudeMessage(message)) {
+        for (const event of normalizeClaudeMessage(message, context.completionMode)) {
           sessionId = event.sessionId ?? sessionId;
           if (event.type === "turn_completed" || event.type === "turn_failed") {
             if (terminalEmitted) continue;
@@ -121,7 +125,7 @@ export class ClaudeAgentDriver implements AgentDriver {
       if (!terminalEmitted) {
         terminalEmitted = true;
         yield eventNow("turn_failed", {
-          summary: errorMessage(error),
+          summary: context.completionMode === "publish_change" ? "Claude run failed" : errorMessage(error),
           ...(sessionId === undefined ? {} : { sessionId }),
         });
       }
@@ -325,19 +329,29 @@ export function createWorkspacePermissionPolicy(workspacePath: string, allowedTo
   };
 }
 
-export function buildClaudeEnvironment(extraNames: string[]): Record<string, string> {
+export function buildClaudeEnvironment(
+  extraNames: string[],
+  sensitiveEnvNames: string[] = [],
+): Record<string, string> {
   const names = new Set([...safeEnvironmentNames, ...extraNames]);
+  const excluded = new Set(sensitiveEnvNames.map((name) => name.toUpperCase()));
 
   const environment: Record<string, string> = {};
   for (const name of names) {
+    if (excluded.has(name.toUpperCase())) continue;
     const value = process.env[name];
     if (value !== undefined) environment[name] = value;
   }
-  environment.CLAUDE_AGENT_SDK_CLIENT_APP = "ai-symphony-node/0.1.0";
+  if (!excluded.has("CLAUDE_AGENT_SDK_CLIENT_APP")) {
+    environment.CLAUDE_AGENT_SDK_CLIENT_APP = "ai-symphony-node/0.1.0";
+  }
   return environment;
 }
 
-export function normalizeClaudeMessage(message: SDKMessage): AgentEvent[] {
+export function normalizeClaudeMessage(
+  message: SDKMessage,
+  completionMode?: AgentRunContext["completionMode"],
+): AgentEvent[] {
   const timestamp = new Date().toISOString();
   const sessionId = "session_id" in message ? message.session_id : undefined;
   const base = sessionId === undefined ? { timestamp } : { timestamp, sessionId };
@@ -356,6 +370,16 @@ export function normalizeClaudeMessage(message: SDKMessage): AgentEvent[] {
       });
     }
     if (message.subtype === "success") {
+      if (completionMode === "publish_change") {
+        const completion = parseAgentCompletion(message.structured_output);
+        if (completion === undefined) {
+          return [
+            ...events,
+            { type: "turn_failed", ...base, summary: "Claude returned invalid structured completion" },
+          ];
+        }
+        return [...events, { type: "turn_completed", ...base, summary: completion.summary, completion }];
+      }
       return [...events, { type: "turn_completed", ...base, summary: message.result }];
     }
     return [
@@ -363,7 +387,10 @@ export function normalizeClaudeMessage(message: SDKMessage): AgentEvent[] {
       {
         type: "turn_failed",
         ...base,
-        summary: message.errors.join("; ") || message.subtype,
+        summary:
+          completionMode === "publish_change"
+            ? "Claude structured completion failed"
+            : message.errors.join("; ") || message.subtype,
         providerData: { subtype: message.subtype },
       },
     ];

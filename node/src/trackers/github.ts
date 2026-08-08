@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type {
   Issue,
@@ -10,6 +11,7 @@ import { publishGitBranch } from "../publish/git.js";
 
 const DEFAULT_ENDPOINT = "https://api.github.com";
 const PAGE_SIZE = 100;
+const MAX_COMMENT_PAGES = 100;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ENV_REFERENCE = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9_.-]+$/;
@@ -19,6 +21,8 @@ const MAX_LABEL_LENGTH = 50;
 const MAX_COMMIT_MESSAGE_LENGTH = 200;
 const MAX_PULL_REQUEST_TITLE_LENGTH = 256;
 const MAX_PULL_REQUEST_BODY_LENGTH = 65_536;
+const IDEMPOTENCY_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const COMMENT_MARKER_PREFIX = "<!-- symphony-comment:";
 
 const githubIssueSchema = z
   .object({
@@ -52,6 +56,13 @@ const githubPullRequestSchema = z
   })
   .passthrough();
 
+const githubCommentSchema = z
+  .object({
+    id: z.number().int().positive().safe(),
+    body: z.string(),
+  })
+  .passthrough();
+
 type FetchLike = typeof globalThis.fetch;
 type GitPublisher = typeof publishGitBranch;
 type GitHubState = "open" | "closed";
@@ -79,11 +90,20 @@ interface GitHubRequestOptions {
   allowStatus?: number;
 }
 
-interface GitHubMutationRequest {
+interface GitHubRestMutationRequest {
+  kind: "request";
   method: "POST" | "PATCH" | "DELETE";
   suffix: string;
   payload?: Record<string, unknown>;
 }
+
+interface GitHubIdempotentCommentRequest {
+  kind: "idempotent_comment";
+  body: string;
+  marker: string;
+}
+
+type GitHubMutationRequest = GitHubRestMutationRequest | GitHubIdempotentCommentRequest;
 
 interface ValidPublishInput {
   commitMessage: string;
@@ -174,11 +194,75 @@ export class GitHubTracker implements Tracker {
       throw new Error("GitHub issue mutations require an authentication token");
     }
 
+    if (request.kind === "idempotent_comment") {
+      await this.#upsertIssueComment(issueNumber, request.body, request.marker, signal);
+      return;
+    }
+
     const issueUrl = this.#issuesUrl(issueNumber);
     const url = new URL(`${issueUrl.href}${request.suffix}`);
     await this.#request(url, false, {
       method: request.method,
       ...(request.payload === undefined ? {} : { payload: request.payload }),
+      signal,
+      parseResponse: false,
+    });
+  }
+
+  async #upsertIssueComment(
+    issueNumber: string,
+    body: string,
+    marker: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const commentsUrl = this.#commentsUrl(issueNumber);
+    const visited = new Set<string>();
+    let url = commentPageUrl(commentsUrl, 1);
+    let match: number | null = null;
+
+    for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
+      if (visited.has(url.href)) {
+        throw new Error(`GitHub issue comment pagination Link loop detected for GET ${url.pathname}`);
+      }
+      visited.add(url.href);
+
+      const response = await this.#request(url, false, { signal });
+      if (!Array.isArray(response.payload)) {
+        throw new Error(`GitHub API GET ${url.pathname} returned a non-array issue comment list`);
+      }
+
+      for (const raw of response.payload) {
+        const parsed = githubCommentSchema.safeParse(raw);
+        if (!parsed.success) {
+          throw new Error(`GitHub API GET ${url.pathname} returned an invalid issue comment`);
+        }
+        const comment = parsed.data;
+        if (!comment.body.includes(marker)) continue;
+        match = match === null ? comment.id : Math.min(match, comment.id);
+      }
+
+      const linkedPage = nextPageUrl(
+        response.link,
+        url,
+        commentsUrl,
+        "repository issue comments",
+      );
+      const next = linkedPage === null
+        ? response.link === null && response.payload.length === PAGE_SIZE
+          ? incrementPage(url)
+          : null
+        : validateNextCommentPage(linkedPage, url);
+      if (next === null) break;
+      if (page === MAX_COMMENT_PAGES) {
+        throw new Error(`GitHub issue comment pagination exceeded ${MAX_COMMENT_PAGES} pages`);
+      }
+      url = next;
+    }
+
+    const target = match === null ? commentsUrl : this.#commentUrl(match);
+    await this.#request(target, false, {
+      method: match === null ? "POST" : "PATCH",
+      payload: { body },
       signal,
       parseResponse: false,
     });
@@ -279,6 +363,17 @@ export class GitHubTracker implements Tracker {
     const suffix = pullNumber === undefined ? "" : `/${pullNumber}`;
     return new URL(
       `${endpoint}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls${suffix}`,
+    );
+  }
+
+  #commentsUrl(issueNumber: string): URL {
+    return new URL(`${this.#issuesUrl(issueNumber).href}/comments`);
+  }
+
+  #commentUrl(commentId: number): URL {
+    const { endpoint, owner, repo } = this.#settings;
+    return new URL(
+      `${endpoint}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${commentId}`,
     );
   }
 
@@ -420,7 +515,29 @@ function mutationRequest(mutation: IssueMutation): GitHubMutationRequest {
       ) {
         throw new Error(`GitHub issue comment must be 1-${MAX_COMMENT_LENGTH} characters`);
       }
-      return { method: "POST", suffix: "/comments", payload: { body: candidate.body } };
+      if (candidate.idempotencyKey === undefined) {
+        return {
+          kind: "request",
+          method: "POST",
+          suffix: "/comments",
+          payload: { body: candidate.body },
+        };
+      }
+      if (
+        typeof candidate.idempotencyKey !== "string" ||
+        !IDEMPOTENCY_KEY.test(candidate.idempotencyKey)
+      ) {
+        throw new Error("GitHub issue comment idempotency key must be a random UUID");
+      }
+      const digest = createHash("sha256").update(candidate.idempotencyKey).digest("hex");
+      const marker = `${COMMENT_MARKER_PREFIX}${digest} -->`;
+      const body = `${candidate.body}\n\n${marker}`;
+      if (body.length > MAX_COMMENT_LENGTH) {
+        throw new Error(
+          `GitHub issue comment including its idempotency marker must be at most ${MAX_COMMENT_LENGTH} characters`,
+        );
+      }
+      return { kind: "idempotent_comment", body, marker };
     }
     case "add_label":
     case "remove_label": {
@@ -433,8 +550,8 @@ function mutationRequest(mutation: IssueMutation): GitHubMutationRequest {
       }
       const label = candidate.label.trim();
       return candidate.kind === "add_label"
-        ? { method: "POST", suffix: "/labels", payload: { labels: [label] } }
-        : { method: "DELETE", suffix: `/labels/${encodeURIComponent(label)}` };
+        ? { kind: "request", method: "POST", suffix: "/labels", payload: { labels: [label] } }
+        : { kind: "request", method: "DELETE", suffix: `/labels/${encodeURIComponent(label)}` };
     }
     case "set_state": {
       if (typeof candidate.state !== "string") {
@@ -444,7 +561,7 @@ function mutationRequest(mutation: IssueMutation): GitHubMutationRequest {
       if (state !== "open" && state !== "closed") {
         throw new Error("GitHub issue state must be open or closed");
       }
-      return { method: "PATCH", suffix: "", payload: { state } };
+      return { kind: "request", method: "PATCH", suffix: "", payload: { state } };
     }
     default:
       throw new Error("Unsupported GitHub issue mutation");
@@ -659,6 +776,34 @@ function pageUrl(base: URL, state: "open" | "closed" | "all", page: number): URL
   return url;
 }
 
+function commentPageUrl(base: URL, page: number): URL {
+  const url = new URL(base);
+  url.search = new URLSearchParams({
+    per_page: String(PAGE_SIZE),
+    page: String(page),
+  }).toString();
+  return url;
+}
+
+function validateNextCommentPage(next: URL, current: URL): URL {
+  const pages = next.searchParams.getAll("page");
+  const pageSizes = next.searchParams.getAll("per_page");
+  const keys = [...next.searchParams.keys()];
+  const currentPage = current.searchParams.get("page");
+  if (
+    pages.length !== 1 ||
+    pageSizes.length !== 1 ||
+    keys.some((key) => key !== "page" && key !== "per_page") ||
+    !ISSUE_NUMBER.test(pages[0] ?? "") ||
+    pageSizes[0] !== String(PAGE_SIZE) ||
+    currentPage === null ||
+    Number(pages[0]) !== Number(currentPage) + 1
+  ) {
+    throw new Error("GitHub issue comment pagination Link must advance by one 100-comment page");
+  }
+  return next;
+}
+
 function incrementPage(current: URL): URL | null {
   const page = current.searchParams.get("page");
   if (page === null || !ISSUE_NUMBER.test(page)) return null;
@@ -670,7 +815,12 @@ function incrementPage(current: URL): URL | null {
   return next;
 }
 
-function nextPageUrl(link: string | null, current: URL, expected: URL): URL | null {
+function nextPageUrl(
+  link: string | null,
+  current: URL,
+  expected: URL,
+  resource = "repository issues",
+): URL | null {
   if (link === null) return null;
 
   let next: URL | null = null;
@@ -698,7 +848,7 @@ function nextPageUrl(link: string | null, current: URL, expected: URL): URL | nu
     throw new Error("GitHub pagination Link must use the configured API origin");
   }
   if (next.pathname !== expected.pathname) {
-    throw new Error("GitHub pagination Link must use the configured repository issues path");
+    throw new Error(`GitHub pagination Link must use the configured ${resource} path`);
   }
   if (next.hash !== "") {
     throw new Error("GitHub pagination Link must not contain a fragment");

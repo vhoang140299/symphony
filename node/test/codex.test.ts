@@ -10,10 +10,12 @@ import type { ThreadEvent } from "@openai/codex-sdk";
 import {
   CodexAgentDriver,
   buildCodexEnvironment,
+  buildCodexShellEnvironment,
   resolveSafeCodexHome,
   type CodexStreamRequest,
 } from "../src/agents/codex.js";
 import { createAgentDriver } from "../src/agents/registry.js";
+import { agentCompletionOutputSchema } from "../src/completion.js";
 import type { AgentEvent, AgentRunContext, Issue } from "../src/domain.js";
 
 const execFileAsync = promisify(execFile);
@@ -74,6 +76,96 @@ test("normalizes a Codex stream and keeps provider output out of summaries", asy
   assert.equal(events.some(({ summary }) => summary?.includes("private model response")), false);
 });
 
+test("requests and validates the last completed Codex structured response after draining", async () => {
+  const requests: CodexStreamRequest[] = [];
+  let drained = false;
+  const driver = new CodexAgentDriver(async (request) => {
+    requests.push(request);
+    return structuredStream();
+  });
+
+  const events = await collect(driver.run(context({ completionMode: "publish_change" })));
+
+  assert.equal(drained, true);
+  assert.deepEqual(requests[0]?.outputSchema, agentCompletionOutputSchema);
+  assert.deepEqual(events.at(-1), {
+    type: "turn_completed",
+    timestamp: events.at(-1)?.timestamp,
+    sessionId: "thread-structured",
+    summary: "Implemented and verified the change",
+    completion: {
+      status: "ready",
+      summary: "Implemented and verified the change",
+      verification: ["npm test"],
+    },
+  });
+  assert.equal(events.some(({ summary }) => summary?.includes("private superseded response")), false);
+
+  async function* structuredStream(): AsyncIterable<ThreadEvent> {
+    yield { type: "thread.started", thread_id: "thread-structured" };
+    yield {
+      type: "item.completed",
+      item: { id: "old", type: "agent_message", text: "private superseded response" },
+    };
+    yield {
+      type: "item.completed",
+      item: {
+        id: "final",
+        type: "agent_message",
+        text: JSON.stringify({
+          status: "ready",
+          summary: "Implemented and verified the change",
+          verification: ["npm test"],
+        }),
+      },
+    };
+    yield {
+      type: "turn.completed",
+      usage: {
+        input_tokens: 1,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 1,
+        reasoning_output_tokens: 0,
+      },
+    };
+    drained = true;
+  }
+});
+
+test("fails Codex completion mode once for missing or invalid structured output", async () => {
+  const invalidMessages = [undefined, "private malformed output", JSON.stringify({
+    status: "ready",
+    summary: "Done",
+    verification: [],
+  })];
+
+  for (const text of invalidMessages) {
+    const driver = new CodexAgentDriver(async () =>
+      eventStream([
+        ...(text === undefined
+          ? []
+          : [{ type: "item.completed", item: { id: "final", type: "agent_message", text } } as ThreadEvent]),
+        {
+          type: "turn.completed",
+          usage: {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+          },
+        },
+      ]),
+    );
+
+    const events = await collect(driver.run(context({ completionMode: "publish_change" })));
+    assert.equal(events.filter(({ type }) => type === "turn_failed").length, 1);
+    assert.equal(events.filter(({ type }) => type === "turn_completed").length, 0);
+    assert.equal(events.some(({ summary }) => summary?.includes("private malformed output")), false);
+  }
+});
+
 test("resumes a Codex thread with fixed sandbox options, an allowlisted environment, and the caller signal", async () => {
   const requests: CodexStreamRequest[] = [];
   const driver = new CodexAgentDriver(async (request) => {
@@ -102,9 +194,10 @@ test("resumes a Codex thread with fixed sandbox options, an allowlisted environm
       runtimeOptions: {
         model: "gpt-test",
         model_reasoning_effort: "high",
-        env_allowlist: ["CODEX_TEST_EXTRA"],
+        env_allowlist: ["CODEX_TEST_EXTRA", "GITHUB_TOKEN"],
         codex_executable: "/opt/codex",
       },
+      sensitiveEnvNames: ["github_token", "path"],
     });
     await collect(driver.run(runContext));
 
@@ -126,6 +219,7 @@ test("resumes a Codex thread with fixed sandbox options, an allowlisted environm
     assert.equal(request?.clientOptions.env?.SYMPHONY_CODEX_REAL_EXECUTABLE, "/opt/codex");
     assert.equal(request?.clientOptions.env?.CODEX_TEST_EXTRA, "allowed-value");
     assert.equal(request?.clientOptions.env?.GITHUB_TOKEN, undefined);
+    assert.equal(request?.clientOptions.env?.PATH, undefined);
     assert.equal(request?.clientOptions.env?.CODEX_HOME, testCodexHome);
     assert.equal(request?.clientOptions.env?.HOME, testCodexHome);
     const config = request?.clientOptions.config as Record<string, unknown>;
@@ -154,6 +248,7 @@ test("resumes a Codex thread with fixed sandbox options, an allowlisted environm
     assert.equal(shellPolicy.inherit, "none");
     assert.equal(shellPolicy.ignore_default_excludes, false);
     const shellEnvironment = shellPolicy.set as Record<string, string>;
+    assert.equal(shellEnvironment.PATH, undefined);
     assert.equal(shellEnvironment.TEMP, commandTemp);
     assert.equal(shellEnvironment.TMP, commandTemp);
     assert.equal(shellEnvironment.TMPDIR, commandTemp);
@@ -241,6 +336,28 @@ test("registers Codex and strips unrelated secrets from its default environment"
     assert.equal(buildCodexEnvironment(["GITHUB_TOKEN"]).GITHUB_TOKEN, "github-secret");
   } finally {
     restoreEnvironment("GITHUB_TOKEN", previousGithub);
+  }
+});
+
+test("Codex sensitive environment names override defaults and explicit allowlists case-insensitively", () => {
+  const previousGithub = process.env.GITHUB_TOKEN;
+  const previousPath = process.env.PATH;
+  process.env.GITHUB_TOKEN = "github-secret";
+  process.env.PATH = "path-secret";
+  try {
+    const client = buildCodexEnvironment(
+      ["GITHUB_TOKEN"],
+      testCodexHome,
+      ["github_token", "path"],
+    );
+    const shell = buildCodexShellEnvironment("/private/symphony-command", ["GitHub_ToKeN", "Path"]);
+    assert.equal(client.GITHUB_TOKEN, undefined);
+    assert.equal(client.PATH, undefined);
+    assert.equal(shell.GITHUB_TOKEN, undefined);
+    assert.equal(shell.PATH, undefined);
+  } finally {
+    restoreEnvironment("GITHUB_TOKEN", previousGithub);
+    restoreEnvironment("PATH", previousPath);
   }
 });
 

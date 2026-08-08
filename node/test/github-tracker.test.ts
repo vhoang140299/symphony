@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import type { Issue, IssueMutation } from "../src/domain.js";
 import { GitHubTracker } from "../src/trackers/github.js";
 import { createTracker } from "../src/trackers/registry.js";
+
+const TEST_IDEMPOTENCY_KEY = "123e4567-e89b-42d3-a456-426614174000";
 
 function rawIssue(number: number, overrides: Record<string, unknown> = {}) {
   return {
@@ -375,6 +378,179 @@ test("comments, adds and removes labels, and changes GitHub issue state", async 
   }
 });
 
+test("creates an idempotent comment once, then updates the exact existing comment", async () => {
+  const tokenVariable = "SYMPHONY_GITHUB_IDEMPOTENT_COMMENT_TEST_TOKEN";
+  const previousToken = process.env[tokenVariable];
+  process.env[tokenVariable] = "mutation-token";
+  const calls: Array<{ url: URL; method: string | undefined; body: string | undefined; signal: AbortSignal | null | undefined }> = [];
+  let storedBody: string | undefined;
+  const quotedMarkerBody = "Published pull request 12 with quoted <!-- symphony-comment:issue-text -->.";
+
+  try {
+    const tracker = new GitHubTracker(
+      { owner: "acme", repo: "widget", token: `$${tokenVariable}` },
+      async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        const body = typeof init?.body === "string" ? init.body : undefined;
+        calls.push({ url, method: init?.method, body, signal: init?.signal });
+        if (init?.method === "POST" || init?.method === "PATCH") {
+          storedBody = (JSON.parse(body ?? "{}") as { body?: string }).body;
+          return new Response(null, { status: init.method === "POST" ? 201 : 200 });
+        }
+        return Response.json(
+          storedBody === undefined ? [] : [{ id: 91, body: storedBody }],
+        );
+      },
+    );
+    const signal = new AbortController().signal;
+
+    await tracker.mutateIssue(
+      issue(),
+      { kind: "comment", body: quotedMarkerBody, idempotencyKey: TEST_IDEMPOTENCY_KEY },
+      signal,
+    );
+    const createdBody = storedBody;
+    await tracker.mutateIssue(
+      issue(),
+      { kind: "comment", body: "Updated pull request 12.", idempotencyKey: TEST_IDEMPOTENCY_KEY },
+      signal,
+    );
+
+    assert.ok(createdBody?.startsWith(`${quotedMarkerBody}\n\n`));
+    assert.match(createdBody ?? "", /<!-- symphony-comment:[a-f0-9]{64} -->$/);
+    assert.equal(
+      storedBody?.match(/<!-- symphony-comment:[a-f0-9]{64} -->$/)?.[0],
+      createdBody?.match(/<!-- symphony-comment:[a-f0-9]{64} -->$/)?.[0],
+    );
+    assert.deepEqual(
+      calls.map(({ url, method }) => ({ path: url.pathname, method })),
+      [
+        { path: "/repos/acme/widget/issues/7/comments", method: "GET" },
+        { path: "/repos/acme/widget/issues/7/comments", method: "POST" },
+        { path: "/repos/acme/widget/issues/7/comments", method: "GET" },
+        { path: "/repos/acme/widget/issues/comments/91", method: "PATCH" },
+      ],
+    );
+    assert.deepEqual(
+      calls.filter(({ method }) => method === "GET").map(({ url }) => Object.fromEntries(url.searchParams)),
+      Array(2).fill({ per_page: "100", page: "1" }),
+    );
+    assert.ok(calls.every(({ signal: requestSignal }) => requestSignal instanceof AbortSignal && requestSignal !== signal));
+  } finally {
+    if (previousToken === undefined) delete process.env[tokenVariable];
+    else process.env[tokenVariable] = previousToken;
+  }
+});
+
+test("scans every validated comment page before updating a marker match", async () => {
+  const tokenVariable = "SYMPHONY_GITHUB_IDEMPOTENT_COMMENT_TEST_TOKEN";
+  const previousToken = process.env[tokenVariable];
+  process.env[tokenVariable] = "mutation-token";
+  const key = TEST_IDEMPOTENCY_KEY;
+  const marker = `<!-- symphony-comment:${createHash("sha256").update(key).digest("hex")} -->`;
+  const calls: Array<{ url: URL; method: string | undefined }> = [];
+
+  try {
+    const tracker = new GitHubTracker(
+      {
+        owner: "acme",
+        repo: "widget",
+        endpoint: "https://github.example/api/v3",
+        token: `$${tokenVariable}`,
+      },
+      async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        calls.push({ url, method: init?.method });
+        if (init?.method === "PATCH") return new Response(null, { status: 200 });
+        if (url.searchParams.get("page") === "1") {
+          const next = "https://github.example/api/v3/repos/acme/widget/issues/7/comments?per_page=100&page=2";
+          return Response.json(
+            Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: `Comment ${index + 1}` })),
+            { headers: { Link: `<${next}>; rel=\"next\"` } },
+          );
+        }
+        return Response.json([
+          { id: 502, body: `Copied marker twice\n\n${marker}\n${marker}` },
+          { id: 501, body: `Previous result\n\n${marker}` },
+        ]);
+      },
+    );
+
+    await tracker.mutateIssue(
+      issue(),
+      { kind: "comment", body: "Current result", idempotencyKey: key },
+      new AbortController().signal,
+    );
+
+    assert.deepEqual(calls.map(({ method }) => method), ["GET", "GET", "PATCH"]);
+    assert.equal(calls[1]?.url.searchParams.get("page"), "2");
+    assert.equal(calls[2]?.url.pathname, "/api/v3/repos/acme/widget/issues/comments/501");
+  } finally {
+    if (previousToken === undefined) delete process.env[tokenVariable];
+    else process.env[tokenVariable] = previousToken;
+  }
+});
+
+test("rejects unsafe, malformed, and unbounded idempotent comment scans", async () => {
+  const tokenVariable = "SYMPHONY_GITHUB_IDEMPOTENT_COMMENT_TEST_TOKEN";
+  const previousToken = process.env[tokenVariable];
+  process.env[tokenVariable] = "mutation-token";
+  const provider = {
+    owner: "acme",
+    repo: "widget",
+    endpoint: "https://github.example/api/v3",
+    token: `$${tokenVariable}`,
+  };
+  const key = TEST_IDEMPOTENCY_KEY;
+  const mutation: IssueMutation = { kind: "comment", body: "Current result", idempotencyKey: key };
+
+  try {
+    const invalidLinks = [
+      ["https://evil.example/api/v3/repos/acme/widget/issues/7/comments?per_page=100&page=2", /configured API origin/],
+      ["https://github.example/api/v3/repos/acme/widget/issues/8/comments?per_page=100&page=2", /issue comments path/],
+      ["https://user:password@github.example/api/v3/repos/acme/widget/issues/7/comments?per_page=100&page=2", /must not contain credentials/],
+      ["https://github.example/api/v3/repos/acme/widget/issues/7/comments?per_page=100&page=3", /advance by one/],
+      ["https://github.example/api/v3/repos/acme/widget/issues/7/comments?per_page=99&page=2", /advance by one/],
+    ] as const;
+    for (const [link, error] of invalidLinks) {
+      const tracker = new GitHubTracker(
+        provider,
+        async () => Response.json([], { headers: { Link: `<${link}>; rel=\"next\"` } }),
+      );
+      await assert.rejects(
+        tracker.mutateIssue(issue(), mutation, new AbortController().signal),
+        error,
+      );
+    }
+
+    for (const [payload, error] of [
+      [{ comments: [] }, /non-array issue comment list/],
+      [[{ id: 0, body: "invalid" }], /invalid issue comment/],
+    ] as const) {
+      const tracker = new GitHubTracker(provider, async () => Response.json(payload));
+      await assert.rejects(
+        tracker.mutateIssue(issue(), mutation, new AbortController().signal),
+        error,
+      );
+    }
+
+    let pages = 0;
+    const fullPage = Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: "Other" }));
+    const unbounded = new GitHubTracker(provider, async () => {
+      pages += 1;
+      return Response.json(fullPage);
+    });
+    await assert.rejects(
+      unbounded.mutateIssue(issue(), mutation, new AbortController().signal),
+      /pagination exceeded 100 pages/,
+    );
+    assert.equal(pages, 100);
+  } finally {
+    if (previousToken === undefined) delete process.env[tokenVariable];
+    else process.env[tokenVariable] = previousToken;
+  }
+});
+
 test("requires authentication and validates issue binding and mutation payloads", async () => {
   const signal = new AbortController().signal;
   const unauthenticated = new GitHubTracker(
@@ -415,6 +591,10 @@ test("requires authentication and validates issue binding and mutation payloads"
       null,
       { kind: "comment", body: " " },
       { kind: "comment", body: "x".repeat(65_537) },
+      { kind: "comment", body: "valid", idempotencyKey: " unsafe" },
+      { kind: "comment", body: "valid", idempotencyKey: "<raw-marker>" },
+      { kind: "comment", body: "valid", idempotencyKey: "123e4567-e89b-32d3-a456-426614174000" },
+      { kind: "comment", body: "x".repeat(65_536), idempotencyKey: TEST_IDEMPOTENCY_KEY },
       { kind: "add_label", label: " " },
       { kind: "remove_label", label: "x".repeat(51) },
       { kind: "set_state", state: "merged" },
@@ -436,6 +616,7 @@ test("combines caller aborts with its timeout and redacts failed mutation detail
   const tokenVariable = "SYMPHONY_GITHUB_MUTATION_TEST_TOKEN";
   const token = "mutation-token-must-not-appear";
   const body = "comment-body-must-not-appear";
+  const idempotencyKey = TEST_IDEMPOTENCY_KEY;
   const rawResponse = "raw-response-must-not-appear";
   const previousToken = process.env[tokenVariable];
   process.env[tokenVariable] = token;
@@ -452,6 +633,25 @@ test("combines caller aborts with its timeout and redacts failed mutation detail
         assert.match(error.message, /GitHub API POST .* failed$/);
         assert.doesNotMatch(error.message, new RegExp(token));
         assert.doesNotMatch(error.message, new RegExp(body));
+        return true;
+      },
+    );
+
+    const failedUpsert = new GitHubTracker(provider, async () => {
+      throw new Error(`${token} ${body} ${idempotencyKey}`);
+    });
+    await assert.rejects(
+      failedUpsert.mutateIssue(
+        issue(),
+        { kind: "comment", body, idempotencyKey },
+        new AbortController().signal,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /GitHub API GET .* failed$/);
+        assert.doesNotMatch(error.message, new RegExp(token));
+        assert.doesNotMatch(error.message, new RegExp(body));
+        assert.doesNotMatch(error.message, new RegExp(idempotencyKey));
         return true;
       },
     );

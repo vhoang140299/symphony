@@ -1,11 +1,15 @@
+import { randomUUID } from "node:crypto";
 import type { WorkflowConfig } from "./config/schema.js";
 import { WorkflowStore } from "./config/store.js";
 import { renderPrompt, type WorkflowDefinition } from "./config/workflow.js";
+import { parseAgentCompletion } from "./completion.js";
 import type {
+  AgentCompletion,
   AgentDriver,
   AgentEvent,
   AgentUsage,
   Issue,
+  PublishChangeInput,
   Tracker,
 } from "./domain.js";
 import { isTerminalAgentEvent, normalizeState } from "./domain.js";
@@ -47,6 +51,11 @@ interface SessionConfig {
   driver: AgentDriver;
 }
 
+interface PendingDelivery {
+  completion: AgentCompletion;
+  idempotencyKey: string;
+}
+
 interface RunningEntry extends SessionConfig {
   issue: Issue;
   attempt: number | null;
@@ -58,6 +67,7 @@ interface RunningEntry extends SessionConfig {
   workspacePath: string | undefined;
   stopReason: StopReason | undefined;
   lastUsage: AgentUsage;
+  pendingDelivery?: PendingDelivery;
   done: Promise<void>;
 }
 
@@ -68,6 +78,7 @@ interface RetryEntry extends SessionConfig {
   sessionId: string | undefined;
   dueAtMs: number;
   reason: "continuation" | "failure";
+  pendingDelivery?: PendingDelivery;
 }
 
 interface BlockedEntry extends SessionConfig {
@@ -84,6 +95,7 @@ type RunOutcome =
   | { kind: "release"; summary: string }
   | { kind: "continuation" }
   | { kind: "blocked"; summary: string }
+  | { kind: "delivery_failure"; error: unknown; pendingDelivery: PendingDelivery }
   | { kind: "failure"; error: unknown };
 
 export interface OrchestratorDependencies {
@@ -317,6 +329,12 @@ export class Orchestrator {
     if (driver.kind !== workflow.config.runtime.kind) {
       throw new Error(`Runtime driver ${driver.kind} does not match configured kind ${workflow.config.runtime.kind}`);
     }
+    if (
+      workflow.config.delivery !== undefined &&
+      (tracker.publishIssueChange === undefined || tracker.mutateIssue === undefined)
+    ) {
+      throw new Error("Configured host delivery requires tracker publishing and mutation support");
+    }
     this.#workflow = workflow;
     this.#tracker = tracker;
     this.#driver = driver;
@@ -496,6 +514,7 @@ export class Orchestrator {
       workspacePath: undefined,
       stopReason: undefined,
       lastUsage: zeroUsage(),
+      ...(source.pendingDelivery === undefined ? {} : { pendingDelivery: source.pendingDelivery }),
       done: Promise.resolve(),
     };
     this.#running.set(entry.issue.id, entry);
@@ -508,12 +527,13 @@ export class Orchestrator {
         attempt: entry.attempt,
         runtime: entry.driver.kind,
       },
-      "Agent run started",
+      entry.pendingDelivery === undefined ? "Agent run started" : "Host delivery retry started",
     );
   }
 
   async #run(entry: RunningEntry): Promise<void> {
     let outcome: RunOutcome;
+    const runLifecycleHooks = entry.pendingDelivery === undefined;
     try {
       const workspace = await this.#workspaceManager.createForIssue(
         entry.issue,
@@ -521,17 +541,27 @@ export class Orchestrator {
         entry.controller.signal,
       );
       entry.workspacePath = workspace.path;
-      await this.#workspaceManager.beforeRun(
-        workspace.path,
-        entry.issue,
-        entry.workflow.config,
-        entry.controller.signal,
-      );
-      outcome = await this.#runTurns(entry);
+      if (entry.pendingDelivery === undefined) {
+        await this.#workspaceManager.beforeRun(
+          workspace.path,
+          entry.issue,
+          entry.workflow.config,
+          entry.controller.signal,
+        );
+        outcome = await this.#runTurns(entry);
+      } else {
+        outcome = await this.#retryDelivery(entry, entry.pendingDelivery);
+      }
     } catch (error) {
-      outcome = entry.stopReason ? this.#outcomeForStop(entry.stopReason) : { kind: "failure", error };
+      outcome = entry.stopReason
+        ? entry.pendingDelivery === undefined
+          ? this.#outcomeForStop(entry.stopReason)
+          : this.#outcomeForDeliveryStop(entry.stopReason, entry.pendingDelivery)
+        : entry.pendingDelivery === undefined
+          ? { kind: "failure", error }
+          : { kind: "delivery_failure", error, pendingDelivery: entry.pendingDelivery };
     } finally {
-      if (entry.workspacePath) {
+      if (runLifecycleHooks && entry.workspacePath) {
         await this.#workspaceManager.afterRun(
           entry.workspacePath,
           entry.issue,
@@ -566,6 +596,24 @@ export class Orchestrator {
       const classification = classifyIssue(refreshed, entry.workflow.config);
       if (classification === "terminal") return { kind: "terminal" };
       if (classification !== "routable") return { kind: "release", summary: `Issue became ${classification}` };
+
+      if (entry.workflow.config.delivery !== undefined) {
+        const completion = parseAgentCompletion(terminal.completion);
+        if (completion === undefined) {
+          return { kind: "failure", error: new Error("Agent returned an invalid delivery completion") };
+        }
+        if (completion.status === "blocked") {
+          return { kind: "blocked", summary: completion.summary };
+        }
+        const pendingDelivery = { completion, idempotencyKey: randomUUID() };
+        try {
+          await this.#deliverCompletion(entry, pendingDelivery);
+        } catch (error) {
+          if (entry.stopReason) return this.#outcomeForDeliveryStop(entry.stopReason, pendingDelivery);
+          return { kind: "delivery_failure", error, pendingDelivery };
+        }
+        return { kind: "release", summary: "Change published for human review" };
+      }
       entry.continuation += 1;
     }
     return { kind: "continuation" };
@@ -589,6 +637,7 @@ export class Orchestrator {
     const workspacePath = requireValue(entry.workspacePath, "Workspace is not initialized");
     const mutateIssue = entry.tracker.mutateIssue?.bind(entry.tracker);
     const publishIssueChange = entry.tracker.publishIssueChange?.bind(entry.tracker);
+    const hostDelivery = entry.workflow.config.delivery !== undefined;
 
     try {
       for await (const event of entry.driver.run({
@@ -599,12 +648,18 @@ export class Orchestrator {
         continuation: entry.continuation,
         signal: entry.controller.signal,
         runtimeOptions: entry.workflow.config.runtime.options,
-        ...(mutateIssue === undefined
+        ...(hostDelivery
+          ? {
+              completionMode: "publish_change" as const,
+              sensitiveEnvNames: deliveryCredentialNames(entry.workflow.config),
+            }
+          : {}),
+        ...(hostDelivery || mutateIssue === undefined
           ? {}
           : {
               mutateCurrentIssue: (mutation, signal) => mutateIssue(boundIssue, mutation, signal),
             }),
-        ...(publishIssueChange === undefined
+        ...(hostDelivery || publishIssueChange === undefined
           ? {}
           : {
               publishCurrentChange: async (input, signal) => {
@@ -684,6 +739,90 @@ export class Orchestrator {
     return terminal;
   }
 
+  async #retryDelivery(entry: RunningEntry, pendingDelivery: PendingDelivery): Promise<RunOutcome> {
+    let refreshed: Issue | undefined;
+    try {
+      [refreshed] = await entry.tracker.fetchIssuesByIds([entry.issue.id]);
+    } catch (error) {
+      return { kind: "delivery_failure", error, pendingDelivery };
+    }
+    if (!refreshed) return { kind: "release", summary: "Issue disappeared before delivery retry" };
+    entry.issue = refreshed;
+    const classification = classifyIssue(refreshed, entry.workflow.config);
+    if (classification === "terminal") return { kind: "terminal" };
+    if (classification !== "routable") {
+      return { kind: "release", summary: `Issue became ${classification} before delivery retry` };
+    }
+    try {
+      await this.#deliverCompletion(entry, pendingDelivery);
+      return { kind: "release", summary: "Change published for human review" };
+    } catch (error) {
+      if (entry.stopReason) return this.#outcomeForDeliveryStop(entry.stopReason, pendingDelivery);
+      return { kind: "delivery_failure", error, pendingDelivery };
+    }
+  }
+
+  async #deliverCompletion(entry: RunningEntry, pendingDelivery: PendingDelivery): Promise<void> {
+    const { completion, idempotencyKey } = pendingDelivery;
+    const delivery = requireValue(entry.workflow.config.delivery, "Host delivery is not configured");
+    const workspacePath = requireValue(entry.workspacePath, "Workspace is not initialized");
+    const publishIssueChange = entry.tracker.publishIssueChange?.bind(entry.tracker);
+    const mutateIssue = entry.tracker.mutateIssue?.bind(entry.tracker);
+    if (publishIssueChange === undefined || mutateIssue === undefined) {
+      throw new Error("Configured host delivery requires tracker publishing and mutation support");
+    }
+
+    let stage = "workspace_validation";
+    try {
+      const validatedPath = await this.#workspaceManager.validateForIssue(
+        workspacePath,
+        entry.issue,
+        entry.workflow.config,
+      );
+      stage = "tracker_publish";
+      const published = await publishIssueChange(
+        entry.issue,
+        validatedPath,
+        publishInputFor(entry.issue, completion),
+        entry.controller.signal,
+      );
+      stage = "handoff_comment";
+      await mutateIssue(
+        entry.issue,
+        {
+          kind: "comment",
+          idempotencyKey,
+          body: handoffComment(published.url, completion),
+        },
+        entry.controller.signal,
+      );
+      stage = "review_label";
+      await mutateIssue(
+        entry.issue,
+        { kind: "add_label", label: delivery.reviewLabel },
+        entry.controller.signal,
+      );
+      stage = "queue_release";
+      await mutateIssue(
+        entry.issue,
+        { kind: "remove_label", label: delivery.queueLabel },
+        entry.controller.signal,
+      );
+    } catch (error) {
+      this.#logger.error(
+        {
+          operation: "host_delivery",
+          delivery_stage: stage,
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+          error,
+        },
+        "Host delivery failed",
+      );
+      throw error;
+    }
+  }
+
   #addUsage(entry: RunningEntry, current: AgentUsage): void {
     for (const key of usageKeys) {
       const value = finiteNonNegative(current[key]);
@@ -724,7 +863,8 @@ export class Orchestrator {
         "Agent run blocked; manual retry required",
       );
     } else {
-      const isFailure = outcome.kind === "failure";
+      const isDeliveryFailure = outcome.kind === "delivery_failure";
+      const isFailure = outcome.kind === "failure" || isDeliveryFailure;
       const nextAttempt = (entry.attempt ?? 0) + 1;
       const delayMs = isFailure
         ? Math.min(
@@ -742,6 +882,7 @@ export class Orchestrator {
         sessionId: isFailure ? undefined : entry.sessionId,
         dueAtMs: this.#now() + delayMs,
         reason: isFailure ? "failure" : "continuation",
+        ...(outcome.kind === "delivery_failure" ? { pendingDelivery: outcome.pendingDelivery } : {}),
       });
       this.#wakeForRetry();
       this.#logger[isFailure ? "error" : "info"](
@@ -749,9 +890,16 @@ export class Orchestrator {
           issue_id: entry.issue.id,
           issue_identifier: entry.issue.identifier,
           delay_ms: delayMs,
-          error: outcome.kind === "failure" ? outcome.error : undefined,
+          error:
+            outcome.kind === "failure" || outcome.kind === "delivery_failure"
+              ? outcome.error
+              : undefined,
         },
-        isFailure ? "Agent run failed; retry scheduled" : "Continuation scheduled",
+        isDeliveryFailure
+          ? "Host delivery failed; retry scheduled"
+          : isFailure
+            ? "Agent run failed; retry scheduled"
+            : "Continuation scheduled",
       );
     }
     this.#assertClaimInvariant();
@@ -764,6 +912,13 @@ export class Orchestrator {
     }
     if (reason.kind === "blocked") return { kind: "blocked", summary: reason.summary };
     return { kind: "release", summary: reason.summary };
+  }
+
+  #outcomeForDeliveryStop(reason: StopReason, pendingDelivery: PendingDelivery): RunOutcome {
+    if (reason.kind === "stalled" || reason.kind === "turn_timeout") {
+      return { kind: "delivery_failure", error: new Error(reason.summary), pendingDelivery };
+    }
+    return this.#outcomeForStop(reason);
   }
 
   #requestStop(entry: RunningEntry, kind: StopKind, summary: string): void {
@@ -863,6 +1018,34 @@ function isRoutable(issue: Issue, config: WorkflowConfig): boolean {
   if (config.tracker.terminalStates.some((terminal) => normalizeState(terminal) === state)) return false;
   const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()).filter(Boolean));
   return config.tracker.requiredLabels.every((label) => labels.has(label));
+}
+
+function publishInputFor(issue: Issue, completion: AgentCompletion): PublishChangeInput {
+  const title = `${issue.identifier}: ${issue.title}`.replace(/[\0\s]+/gu, " ").trim();
+  const verification = completion.verification.map((item) => `- ${item}`).join("\n");
+  return {
+    commitMessage: truncate(title, 200),
+    pullRequestTitle: truncate(title, 256),
+    pullRequestBody: `## Summary\n\n${completion.summary}\n\n## Verification\n\n${verification}`,
+  };
+}
+
+function handoffComment(pullRequestUrl: string, completion: AgentCompletion): string {
+  const verification = completion.verification.map((item) => `- ${item}`).join("\n");
+  return `Pull request ready for human review: ${pullRequestUrl}\n\n${completion.summary}\n\nVerification:\n${verification}`;
+}
+
+function truncate(value: string, maxLength: number): string {
+  const trimmed = value.trim();
+  return trimmed.length <= maxLength ? trimmed : trimmed.slice(0, maxLength).trimEnd();
+}
+
+function deliveryCredentialNames(config: WorkflowConfig): string[] {
+  const tokenReference = config.tracker.provider.token;
+  const matched = typeof tokenReference === "string"
+    ? /^\$([A-Za-z_][A-Za-z0-9_]*)$/u.exec(tokenReference.trim())?.[1]
+    : undefined;
+  return matched === undefined ? ["GITHUB_TOKEN"] : ["GITHUB_TOKEN", matched];
 }
 
 function compareIssues(left: Issue, right: Issue): number {
