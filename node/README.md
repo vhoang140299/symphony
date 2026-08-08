@@ -134,13 +134,13 @@ outside the agent.
 
 The Codex SDK does not yet expose the CLI's `--ignore-user-config` switch. Symphony therefore runs
 the bundled CLI through a small wrapper that always adds `--ignore-user-config` and `--ignore-rules`,
-and disables apps, browser/computer use, image generation, hooks, plugins, and skill extensions at CLI precedence.
-`CODEX_HOME` must be an existing absolute, private, user-owned directory disjoint from every issue
-workspace. Create a profile dedicated to
-Symphony; do not point it at your normal `~/.codex`. Generated session, cache, system-skill, and
+and disables apps, browser/computer use, image generation, hooks, plugins, and skill extensions at
+CLI precedence. `CODEX_HOME` must be an existing absolute, private, user-owned directory disjoint
+from every issue workspace. Create a profile dedicated to Symphony; do not point it at your normal
+`~/.codex`. Generated session, cache, system-skill, and
 authentication state may remain there, but global `AGENTS` overrides, `hooks.json`, `.agents`, and
 user-installed Codex skills are rejected. Complete workspace-local `.codex` and `.agents` layers
-are also rejected, and skill discovery/dependency installation is disabled at CLI precedence.
+are also rejected, and skill search/dependency installation is disabled at CLI precedence.
 
 User-configured additional writable roots and broad `/tmp` writes are cleared for every turn.
 Commands receive one private per-run temporary directory as their only writable root outside the
