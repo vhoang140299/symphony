@@ -2,18 +2,18 @@
 
 This directory contains a small TypeScript implementation of
 [`SPEC.md`](../SPEC.md). It polls a tracker, creates an isolated workspace for each issue, and runs
-Claude Code through the Claude Agent SDK.
+Claude Code or Codex through their official SDKs.
 
 > [!WARNING]
-> This is a developer MVP for trusted local environments. It can let Claude edit files and, when
-> explicitly enabled, run shell commands. Review the workflow, repository instructions, hooks, and
+> This is a developer MVP for trusted local environments. It can let coding agents edit files and
+> run shell commands. Review the workflow, repository instructions, hooks, and
 > allowed tools before starting it. A workspace is a dedicated current working directory, not an
 > OS/container security sandbox.
 
 ## Current scope
 
 - Runtime: Node.js with strict TypeScript and ESM
-- Coding agent: Claude Code via `@anthropic-ai/claude-agent-sdk`
+- Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
 - Trackers: in-memory issues, or GitHub Issues polling with opt-in issue mutations and PR publishing
 - Operations: structured logs and an in-process runtime snapshot
 
@@ -27,10 +27,14 @@ issues may therefore be retried after a run.
   from `mise.toml`.
 - Claude Code authentication available to the child process, such as `ANTHROPIC_API_KEY` or an
   existing Claude Code login. Symphony does not store or refresh Claude credentials.
+- For the Codex runtime, set `CODEX_HOME` to a dedicated private profile and authenticate it with
+  `CODEX_HOME=/absolute/path codex login`. API-key variables are passed only when explicitly named
+  in `runtime.options.env_allowlist`.
+- The safe Codex adapter currently supports macOS and Linux. Claude remains available on Windows.
 - GitHub PR publishing currently requires macOS or Linux so an aborted token-authenticated push can
   terminate the complete Git process group.
 
-Keep credentials in the host environment. The Claude child receives a small system/auth allowlist,
+Keep credentials in the host environment. Agent children receive a small system/auth allowlist,
 not the complete host environment; add exceptional variable names with `runtime.options.env_allowlist`.
 Do not commit API keys in `WORKFLOW.md`, because the agent can read files in its workspace.
 
@@ -75,7 +79,7 @@ npm test
 ## Workflow configuration
 
 [`WORKFLOW.md`](WORKFLOW.md) is both configuration and prompt. YAML front matter controls the
-tracker, polling interval, workspace root, lifecycle hooks, concurrency, and Claude runtime. The
+tracker, polling interval, workspace root, lifecycle hooks, concurrency, and coding-agent runtime. The
 Markdown body is rendered with Liquid for every issue.
 
 Useful prompt values include `issue.identifier`, `issue.title`, `issue.description`,
@@ -85,7 +89,7 @@ invalid reload keeps the last known-good configuration.
 [`WORKFLOW.github.md`](WORKFLOW.github.md) is a GitHub issue-to-PR profile. Copy it before editing;
 the default `WORKFLOW.md` remains an inert local example.
 
-Claude-specific settings live under `runtime.options`:
+Claude-specific settings live under `runtime.options` when `runtime.kind` is `claude`:
 
 - `model`: optional model override; omission uses the account/default selection.
 - `max_agentic_turns` and `max_budget_usd`: per-SDK-query limits passed to Claude.
@@ -104,6 +108,48 @@ Claude-specific settings live under `runtime.options`:
 
 `agent.max_turns` separately limits how many completed SDK queries Symphony resumes for one issue
 before placing it on the short continuation retry queue.
+
+### Codex runtime
+
+Select Codex with a small runtime block:
+
+```yaml
+runtime:
+  kind: codex
+  options:
+    model_reasoning_effort: high
+```
+
+The Codex adapter starts or resumes an SDK thread in the issue workspace with `workspace-write`,
+approval policy `never`, login shells and subagents disabled, a minimal command environment, and
+network and web search disabled. Optional settings are `model`,
+`model_reasoning_effort`, `skip_git_repo_check`, `env_allowlist`, and `codex_executable`. The default
+environment preserves the local Codex login and basic process/TLS variables while stripping
+unrelated host secrets. Add `CODEX_API_KEY` or `OPENAI_API_KEY` to `env_allowlist` only when that
+credential mode is intentional.
+
+This first Codex adapter does not expose Symphony's host-side GitHub mutation or PR publishing
+tools. It is suitable for local/memory workflows and coding work whose tracker transition is handled
+outside the agent.
+
+The Codex SDK does not yet expose the CLI's `--ignore-user-config` switch. Symphony therefore runs
+the bundled CLI through a small wrapper that always adds `--ignore-user-config` and `--ignore-rules`,
+and disables apps, browser/computer use, image generation, hooks, plugins, and skill extensions at CLI precedence.
+`CODEX_HOME` must be an existing absolute, private, user-owned directory disjoint from every issue
+workspace. Create a profile dedicated to
+Symphony; do not point it at your normal `~/.codex`. Generated session, cache, system-skill, and
+authentication state may remain there, but global `AGENTS` overrides, `hooks.json`, `.agents`, and
+user-installed Codex skills are rejected. Complete workspace-local `.codex` and `.agents` layers
+are also rejected, and skill discovery/dependency installation is disabled at CLI precedence.
+
+User-configured additional writable roots and broad `/tmp` writes are cleared for every turn.
+Commands receive one private per-run temporary directory as their only writable root outside the
+issue workspace, and Symphony removes it after the SDK stream closes. The Codex process also sees
+the dedicated profile as its OS home, preventing host-user skills under `~/.agents/skills` from being
+loaded.
+
+The Codex SDK reports token usage but not a USD amount, so Symphony records `costUsd: 0` for Codex
+runs. That value means “unavailable,” not “free.”
 
 ### GitHub Issues tracker
 

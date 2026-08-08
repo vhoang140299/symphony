@@ -91,6 +91,14 @@ test("rejects unsupported tracker kinds and GitHub states while loading config",
   );
 });
 
+test("accepts supported coding-agent runtimes and rejects unknown kinds during config parsing", () => {
+  assert.equal(parseWorkflowConfig({ tracker: { kind: "memory" }, runtime: { kind: "codex" } }).runtime.kind, "codex");
+  assert.throws(
+    () => parseWorkflowConfig({ tracker: { kind: "memory" }, runtime: { kind: "unknown" } }),
+    /claude.*codex|codex.*claude/i,
+  );
+});
+
 test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   const workflow = await loadWorkflow(path.resolve("WORKFLOW.github.md"));
 

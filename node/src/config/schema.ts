@@ -75,7 +75,7 @@ const agentSchema = z
 
 const runtimeSchema = z
   .object({
-    kind: z.string().trim().min(1).default("claude"),
+    kind: z.enum(["claude", "codex"]).default("claude"),
     turn_timeout_ms: positiveInteger.default(3_600_000),
     stall_timeout_ms: z.number().int().nonnegative().default(300_000),
     options: z.record(z.string(), z.unknown()).default({}),

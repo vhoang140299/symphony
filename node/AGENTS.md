@@ -15,6 +15,8 @@ This directory is the Node.js/TypeScript Symphony implementation. Keep it aligne
   failure, timeout, and shutdown paths.
 - Do not enable Claude `bypassPermissions`. Treat hooks and expanded tool permissions as trusted
   code execution.
+- Keep Codex in `workspace-write` with network, web search, login shells, and subagents disabled
+  unless a reviewed deployment requirement explicitly changes that boundary.
 - Bind provider mutation tools to the current issue in the host process; never expose tracker
   tokens, arbitrary repository targets, or raw provider errors to the agent child.
 - Bind publishing to the current issue and owned workspace. Derive branch/base/remotes host-side,
