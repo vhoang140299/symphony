@@ -27,6 +27,100 @@ afterAll(() => {
   else process.env.RECOVERY_TRACKER_TOKEN = previousTrackerToken;
 });
 
+posixTest("reports a runtime checkpoint failure through readiness without dispatching work", async () => {
+  const root = await fixture("symphony-recovery-fatal-");
+  const raw = { ...rawIssue("fatal", "FATAL-1"), state: "Backlog" };
+  const memory = new MemoryTracker({ issues: [raw] });
+  const activeFetchStarted = deferred<void>();
+  let rejectActiveFetch!: (reason?: unknown) => void;
+  const activeFetch = new Promise<Issue[]>((_resolve, reject) => {
+    rejectActiveFetch = reject;
+  });
+  let failActiveFetch = true;
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      if (failActiveFetch && states.includes("Todo")) {
+        failActiveFetch = false;
+        activeFetchStarted.resolve();
+        return activeFetch;
+      }
+      return memory.fetchIssuesByStates(states);
+    },
+    async fetchIssuesByIds(ids) {
+      return memory.fetchIssuesByIds(ids);
+    },
+  };
+  let driverRuns = 0;
+  const workflowPath = await writeMemoryWorkflow(root, [raw]);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      driverRuns += 1;
+      yield event("turn_failed");
+    }),
+  });
+  const fatalError = orchestrator.waitForFatalError();
+
+  assert.equal(orchestrator.isReady(), false);
+  const starting = orchestrator.start();
+  await activeFetchStarted.promise;
+  assert.equal(orchestrator.isReady(), false);
+  rejectActiveFetch(new Error("transient tracker failure"));
+  await starting;
+  assert.equal(orchestrator.isReady(), true);
+
+  await writeFile(path.join(root, "runs.json"), "not json\n", { mode: 0o600 });
+  memory.setIssueState(raw.id, "Todo");
+  let pollError: Error | undefined;
+  await assert.rejects(orchestrator.pollOnce(), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    pollError = error;
+    return true;
+  });
+
+  assert.ok(pollError);
+  assert.strictEqual(await fatalError, pollError);
+  assert.strictEqual(await orchestrator.waitForFatalError(), pollError);
+  assert.equal(orchestrator.isReady(), false);
+  assert.equal(driverRuns, 0);
+
+  await orchestrator.stop();
+  assert.equal(orchestrator.isReady(), false);
+});
+
+posixTest("does not retain a fatal signal after a repaired checkpoint initialization failure", async () => {
+  const root = await fixture("symphony-recovery-repaired-");
+  const workflowPath = await writeMemoryWorkflow(root, []);
+  const statePath = path.join(root, "runs.json");
+  await writeFile(statePath, "not json\n", { mode: 0o600 });
+  let driverRuns = 0;
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker(),
+    driver: driverFrom(async function* () {
+      driverRuns += 1;
+      yield event("turn_failed");
+    }),
+  });
+  const fatalError = orchestrator.waitForFatalError();
+
+  await assert.rejects(orchestrator.start(), /Durable run state persistence failed/);
+  assert.equal(orchestrator.isReady(), false);
+
+  await rm(statePath);
+  await orchestrator.start();
+  assert.equal(orchestrator.isReady(), true);
+  assert.equal(driverRuns, 0);
+
+  let fatalResolved = false;
+  void fatalError.then(() => {
+    fatalResolved = true;
+  });
+  await Promise.resolve();
+  assert.equal(fatalResolved, false);
+
+  await orchestrator.stop();
+});
+
 posixTest("restores interrupted and exhausted model work as durable blocked claims", async () => {
   const root = await fixture("symphony-recovery-blocked-");
   const issues = [

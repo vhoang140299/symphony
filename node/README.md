@@ -126,10 +126,14 @@ node dist/src/cli.js --http-port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
 `--once`, `--preflight`, or `--doctor`. The read-only server exposes:
 
 - `GET /healthz`: reports that the HTTP process is responding.
-- `GET /readyz`: reports ready after the daemon has initialized and unavailable while it is
-  shutting down. It does not test tracker or coding-agent provider reachability.
+- `GET /readyz`: reports ready only while the scheduler is initialized and running and no local
+  fatal condition, such as a durable checkpoint failure, has stopped it. It does not test tracker
+  or coding-agent provider reachability.
 - `GET /status`: reports timestamps, aggregate run-state counts, and usage totals. It omits issue
   identifiers, workspace paths, agent session IDs, provider details, and raw errors.
+
+Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
+tracker polling errors remain retryable and do not make the scheduler unready.
 
 These endpoints have no authentication. Keep the default loopback binding; if you bind to a remote
 interface, add authentication and network access controls outside Symphony.
@@ -474,8 +478,8 @@ Additional trackers implement the `Tracker` contract under `src/trackers/` and r
 `kind` in the tracker registry. Additional coding agents follow the same pattern with the
 `AgentDriver` contract under `src/agents/`.
 
-The MVP deliberately has no database, durable queue, multi-node coordination, dashboard, or
-status API. Add those only when the target deployment requires them.
+The MVP deliberately has no database, durable queue, multi-node coordination, or dashboard. Add
+those only when the target deployment requires them.
 
 Approval or user-input requests fail closed and remain visible in `Orchestrator.snapshot()` until
 an embedding calls `retryBlocked()`, or the tracker moves the issue out of an active state. The CLI

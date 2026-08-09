@@ -167,11 +167,16 @@ export class Orchestrator {
   #statePath: string | undefined;
   #scopeHash: string | undefined;
   #persistenceFailure: Error | undefined;
+  #resolveFatalError: ((error: Error) => void) | undefined;
+  readonly #fatalErrorPromise = new Promise<Error>((resolve) => {
+    this.#resolveFatalError = resolve;
+  });
   #stateWritesFrozen = false;
   #timer: NodeJS.Timeout | undefined;
   #initializationPromise: Promise<void> | undefined;
   #pollPromise: Promise<void> | undefined;
   #started = false;
+  #startupComplete = false;
   #shuttingDown = false;
   #startedAtMs: number | undefined;
   #lastPollAtMs: number | undefined;
@@ -208,12 +213,31 @@ export class Orchestrator {
     if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
     if (this.#started) return;
     this.#started = true;
-    await this.pollOnce();
-    this.#scheduleNextPoll();
+    this.#startupComplete = false;
+    try {
+      await this.pollOnce();
+      this.#requirePersistenceHealthy();
+      if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
+      this.#startupComplete = true;
+      this.#scheduleNextPoll();
+    } catch (error) {
+      this.#started = false;
+      this.#startupComplete = false;
+      throw error;
+    }
+  }
+
+  isReady(): boolean {
+    return this.#started && this.#startupComplete && !this.#shuttingDown && this.#persistenceFailure === undefined;
+  }
+
+  waitForFatalError(): Promise<Error> {
+    return this.#fatalErrorPromise;
   }
 
   async stop(): Promise<void> {
     this.#started = false;
+    this.#startupComplete = false;
     this.#shuttingDown = true;
     this.#shutdownController.abort(new Error("Orchestrator is shutting down"));
     if (this.#timer) clearTimeout(this.#timer);
@@ -580,7 +604,12 @@ export class Orchestrator {
     if (this.#persistenceFailure !== undefined) return this.#persistenceFailure;
     const failure = new Error("Durable run state persistence failed", { cause: error });
     this.#persistenceFailure = failure;
+    if (this.#started) {
+      this.#resolveFatalError?.(failure);
+      this.#resolveFatalError = undefined;
+    }
     this.#started = false;
+    this.#startupComplete = false;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     for (const entry of this.#running.values()) {
@@ -855,6 +884,7 @@ export class Orchestrator {
     await this.#persistState();
     if (this.#shuttingDown || this.#running.get(entry.issue.id) !== entry) return;
     entry.done = this.#run(entry);
+    void entry.done.catch(() => undefined);
     this.#logger.info(
       {
         issue_id: entry.issue.id,

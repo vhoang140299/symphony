@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -172,6 +172,107 @@ The agent must not start.
       await waitForHttpStatus(`http://127.0.0.1:${operationsPort}/readyz`, 503, 2_000);
       assert.equal(child.kill("SIGTERM"), true);
       assert.deepEqual(await closed, { code: 0, signal: null });
+      await assert.rejects(
+        fetch(`http://127.0.0.1:${operationsPort}/healthz`, {
+          headers: { connection: "close" },
+          signal: AbortSignal.timeout(500),
+        }),
+      );
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closeServer(trackerServer);
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "CLI exits nonzero and closes operational HTTP after a fatal runtime error",
+  { skip: process.platform === "win32", timeout: 10_000 },
+  async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-http-fatal-"));
+    const workflowPath = path.join(directory, "WORKFLOW.md");
+    const statePath = path.join(await realpath(directory), "checkpoint.json");
+    let exposeIssue = false;
+    const issue = {
+      number: 1,
+      title: "Trigger a checkpoint write",
+      body: null,
+      state: "open",
+      html_url: "https://github.com/acme/widget/issues/1",
+      assignee: null,
+      labels: [{ name: "symphony" }],
+      created_at: "2026-08-09T00:00:00Z",
+      updated_at: "2026-08-09T00:00:00Z",
+    };
+    const trackerServer = createHttpServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      const payload =
+        exposeIssue && url.pathname.endsWith("/issues/1")
+          ? issue
+          : exposeIssue && url.pathname.endsWith("/issues") && url.searchParams.get("state") === "open"
+            ? [issue]
+            : [];
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(payload));
+    });
+    const trackerPort = await listenOnEphemeralPort(trackerServer);
+    const portReservation = createNetServer();
+    const operationsPort = await listenOnEphemeralPort(portReservation);
+    await closeServer(portReservation);
+    await writeFile(
+      workflowPath,
+      `---
+tracker:
+  kind: github
+  provider:
+    owner: acme
+    repo: widget
+    endpoint: http://127.0.0.1:${trackerPort}
+  required_labels: [symphony]
+  active_states: [open]
+  terminal_states: [closed]
+polling:
+  interval_ms: 50
+workspace:
+  root: ${JSON.stringify(path.join(directory, "workspaces"))}
+state:
+  path: ${JSON.stringify(statePath)}
+hooks:
+  before_run: |
+    rm ${JSON.stringify(statePath)} && mkdir ${JSON.stringify(statePath)}
+    exit 1
+runtime:
+  kind: claude
+  options:
+    permission_mode: default
+    claude_executable: ${JSON.stringify(path.join(directory, "missing-claude"))}
+---
+The hook fails before the agent can start, then checkpointing fails.
+`,
+    );
+
+    const child = spawn(
+      process.execPath,
+      [cliPath, "--http-port", String(operationsPort), workflowPath],
+      { env: { ...process.env, LOG_LEVEL: "silent" }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+
+    try {
+      await waitForHttpStatus(`http://127.0.0.1:${operationsPort}/readyz`, 200, 2_000);
+      exposeIssue = true;
+
+      assert.deepEqual(await closed, { code: 1, signal: null });
+      assert.equal(stderr.trim(), "symphony-node: Orchestrator stopped after a fatal runtime error");
       await assert.rejects(
         fetch(`http://127.0.0.1:${operationsPort}/healthz`, {
           headers: { connection: "close" },
