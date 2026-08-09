@@ -17,7 +17,8 @@ Claude Code or Codex through their official SDKs.
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
 - Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools, host-controlled PR
   delivery, and operator retry labels
-- Operations: structured logs and an in-process runtime snapshot
+- Operations: structured logs, an in-process runtime snapshot, and an optional single-process
+  checkpoint
 
 The in-memory tracker is for development and smoke tests. It does not persist state, synchronize
 with an issue service, or give Claude a tool for moving an issue to a new state. Active memory
@@ -172,8 +173,8 @@ cost amount.
 ## Workflow configuration
 
 [`WORKFLOW.md`](WORKFLOW.md) is both configuration and prompt. YAML front matter controls the
-tracker, polling interval, workspace root, lifecycle hooks, concurrency, and coding-agent runtime. The
-Markdown body is rendered with Liquid for every issue.
+tracker, polling interval, workspace root, lifecycle hooks, concurrency, optional checkpoint, and
+coding-agent runtime. The Markdown body is rendered with Liquid for every issue.
 
 Useful prompt values include `issue.identifier`, `issue.title`, `issue.description`,
 `issue.state`, `issue.labels`, and `attempt`. Configuration is reloaded when the file changes; an
@@ -205,9 +206,39 @@ Claude-specific settings live under `runtime.options` when `runtime.kind` is `cl
 before placing it on the short continuation retry queue. Optional `agent.max_attempts` limits
 dispatched agent run cycles per issue, including the initial run; omission means unlimited. Host-only
 delivery retries do not count. Exhaustion moves the issue to blocked/manual retry. Attempt counters
-belong to the in-memory claim lifecycle and reset when the claim is released or Symphony restarts.
-An explicit `retryBlocked()` grants one additional run before reapplying the limit. With
-`max_turns: 1`, `max_attempts: 3` caps a claimed issue at three SDK queries before manual retry.
+belong to the claim lifecycle and reset when the claim is released. Without a checkpoint they also
+reset when Symphony restarts. An explicit `retryBlocked()` grants one additional run before
+reapplying the limit. With `max_turns: 1`, `max_attempts: 3` caps a claimed issue at three SDK queries
+before manual retry.
+
+### Durable checkpoint preview
+
+Configure one local checkpoint file to preserve host orchestration state across restarts:
+
+```yaml
+state:
+  path: ~/.local/state/symphony/checkpoint.json
+```
+
+Omitting `state` preserves the current ephemeral behavior. `state.path` supports the same exact
+`$ENV_NAME`, `~`/`~/`, and workflow-relative forms as `workspace.root`. The resolved path must be
+outside `workspace.root` or name a direct file child of it; it cannot equal the root or sit deeper
+inside an issue workspace. The checked-in workflow profiles intentionally leave checkpointing off.
+
+This is a single-process POSIX preview, not a database or durable work queue. Symphony writes one
+atomic JSON checkpoint with mode `0600` inside a private `0700` directory. It persists retry budgets,
+ordinary scheduled retries, blocked claims, and pending host delivery. After restart, an ordinary
+retry resumes on schedule, a pending delivery resumes host-only without another model call, and an
+agent run dispatched before the crash becomes blocked for manual retry. It does store bounded
+blocked summaries plus pending-delivery summary and verification text; these fields are
+agent-generated and can quote issue or repository content, so treat the checkpoint as sensitive
+despite mode `0600`. The checkpoint never stores tracker credentials, model tokens, rendered
+prompts, raw provider events, or agent sessions.
+
+A corrupt checkpoint, tracker/workflow scope mismatch, or unsafe ownership or permissions fails
+startup rather than silently dispatching work. `state.path` cannot be changed by workflow hot reload;
+restart Symphony to change it. Do not share one checkpoint between processes or run multiple
+Symphony processes against it.
 
 ### Codex runtime
 
@@ -306,11 +337,10 @@ Adding `control.retry_label` to an issue requests one more run only when that is
 blocked in the current process and remains routable. Symphony removes the retry label before
 releasing the run; if removal fails, the issue stays blocked. After that one run, `max_attempts`
 applies again. This control is at-most-once: if the label disappears but the issue remains blocked
-after an ambiguous GitHub response, add the label again. Blocked claims are in memory: restarting
-Symphony loses them, leaves any retry label on GitHub, and may dispatch the still-routable issue as a
-fresh claim instead of consuming the label.
-The retry label therefore works only while the continuous daemon that owns the blocked claim remains
-running; it cannot resume a completed `--once` process.
+after an ambiguous GitHub response, add the label again. Without `state.path`, blocked claims are in
+memory: restarting Symphony loses them, leaves any retry label on GitHub, and may dispatch the
+still-routable issue as a fresh claim instead of consuming the label. A configured checkpoint
+restores the blocked claim so a later poll can consume the retry label.
 
 ```bash
 gh issue edit ISSUE_NUMBER --repo "$SYMPHONY_REPO" --add-label symphony-retry
@@ -335,8 +365,9 @@ removes the queue label last. A host-side delivery retry reuses the completed re
 branch, open pull request, and handoff comment without rerunning the agent. If an earlier step fails,
 the queue label remains for retry. Host delivery rejects `hooks.after_run` because running cleanup
 between host retries can change the pending commit, while delaying cleanup can leak resources.
-Pending delivery state is in memory; after a process restart, a still-routable issue can be dispatched
-to the agent again.
+Without `state.path`, pending delivery is in memory; after a process restart, a still-routable issue
+can be dispatched to the agent again. A configured checkpoint instead resumes host delivery without
+rerunning the agent.
 
 Host delivery and operator retry control require `tracker.provider.token` to be an explicit environment
 reference such as `$GITHUB_TOKEN`; set that variable in Symphony's host environment. The named

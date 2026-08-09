@@ -1,4 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import path from "node:path";
 import type { WorkflowConfig } from "./config/schema.js";
 import { WorkflowStore } from "./config/store.js";
 import { renderPrompt, type WorkflowDefinition } from "./config/workflow.js";
@@ -15,9 +17,10 @@ import type {
 import { isTerminalAgentEvent, normalizeState } from "./domain.js";
 import type { AppLogger } from "./log.js";
 import { classifyIssue, isRoutable, selectRoutableIssues } from "./routing.js";
+import { RunStateStore, type PersistedClaim } from "./state/store.js";
 import { createAgentDriver } from "./agents/registry.js";
 import { createTracker } from "./trackers/registry.js";
-import { WorkspaceManager } from "./workspace/manager.js";
+import { WorkspaceManager, workspaceKey } from "./workspace/manager.js";
 
 const continuationPrompt =
   "Continue working on the same issue. Inspect the current workspace, finish any remaining work, and verify the result.";
@@ -159,7 +162,13 @@ export class Orchestrator {
   #workflow: WorkflowDefinition | undefined;
   #tracker: Tracker | undefined;
   #driver: AgentDriver | undefined;
+  #stateStore: RunStateStore | undefined;
+  #statePath: string | undefined;
+  #scopeHash: string | undefined;
+  #persistenceFailure: Error | undefined;
+  #stateWritesFrozen = false;
   #timer: NodeJS.Timeout | undefined;
+  #initializationPromise: Promise<void> | undefined;
   #pollPromise: Promise<void> | undefined;
   #started = false;
   #shuttingDown = false;
@@ -181,16 +190,21 @@ export class Orchestrator {
   }
 
   async initialize(): Promise<void> {
+    if (this.#initializationPromise) return this.#initializationPromise;
     if (this.#workflow) return;
-    const workflow = await this.#workflowStore.initialize();
-    this.#applyWorkflow(workflow);
-    this.#startedAtMs = this.#now();
-    await this.#cleanupTerminalWorkspaces();
+    const initialization = this.#initializeWorkflow();
+    this.#initializationPromise = initialization;
+    try {
+      await initialization;
+    } finally {
+      if (this.#initializationPromise === initialization) this.#initializationPromise = undefined;
+    }
   }
 
   async start(): Promise<void> {
     if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
     await this.initialize();
+    if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
     if (this.#started) return;
     this.#started = true;
     await this.pollOnce();
@@ -210,7 +224,18 @@ export class Orchestrator {
     const graceMs =
       this.#shutdownGraceMs ?? Math.max(30_000, (this.#workflow?.config.hooks.timeoutMs ?? 0) + 1_000);
     const deadlineMs = Date.now() + graceMs;
-    if (this.#pollPromise && !(await settlesWithin(this.#pollPromise, graceMs))) {
+    let checkpointSafe = true;
+    const initialization = this.#initializationPromise;
+    if (initialization && !(await settlesWithin(initialization, graceMs))) {
+      checkpointSafe = false;
+      this.#stateWritesFrozen = true;
+      this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for initialization");
+    } else if (initialization && this.#workflow === undefined) {
+      checkpointSafe = false;
+      this.#stateWritesFrozen = true;
+    }
+    const pollWaitMs = Math.max(0, deadlineMs - Date.now());
+    if (this.#pollPromise && !(await settlesWithin(this.#pollPromise, pollWaitMs))) {
       this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for the active poll");
     }
     for (const entry of this.#running.values()) {
@@ -222,6 +247,37 @@ export class Orchestrator {
       this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for agent runs");
     }
 
+    if (checkpointSafe) await this.#checkpointInterruptedRuns();
+
+    this.#running.clear();
+    this.#retrying.clear();
+    this.#blocked.clear();
+    this.#claimed.clear();
+  }
+
+  async #initializeWorkflow(): Promise<void> {
+    try {
+      const workflow = await this.#workflowStore.initialize();
+      this.#applyWorkflow(workflow);
+      this.#startedAtMs = this.#now();
+      await this.#recoverState();
+      if (!this.#shuttingDown) await this.#cleanupTerminalWorkspaces();
+      if (this.#shuttingDown && this.#stateWritesFrozen) this.#clearClaims();
+    } catch (error) {
+      this.#clearClaims();
+      this.#workflow = undefined;
+      this.#tracker = undefined;
+      this.#driver = undefined;
+      this.#stateStore = undefined;
+      this.#statePath = undefined;
+      this.#scopeHash = undefined;
+      this.#startedAtMs = undefined;
+      this.#persistenceFailure = undefined;
+      throw error;
+    }
+  }
+
+  #clearClaims(): void {
     this.#running.clear();
     this.#retrying.clear();
     this.#blocked.clear();
@@ -245,7 +301,11 @@ export class Orchestrator {
     if (rejection) throw rejection.reason;
   }
 
-  retryBlocked(issueIdOrIdentifier: string): boolean {
+  async retryBlocked(issueIdOrIdentifier: string): Promise<boolean> {
+    this.#requirePersistenceHealthy();
+    if (this.#shuttingDown || this.#stateWritesFrozen) {
+      throw new Error("A stopped orchestrator cannot retry blocked work");
+    }
     const found = [...this.#blocked.entries()].find(
       ([issueId, entry]) => issueId === issueIdOrIdentifier || entry.issue.identifier === issueIdOrIdentifier,
     );
@@ -264,8 +324,9 @@ export class Orchestrator {
       dueAtMs: this.#now(),
       reason: "continuation",
     });
-    this.#wakeForRetry();
     this.#assertClaimInvariant();
+    await this.#persistState();
+    this.#wakeForRetry();
     return true;
   }
 
@@ -304,6 +365,7 @@ export class Orchestrator {
 
   async #poll(failOnTrackerError: boolean): Promise<void> {
     await this.initialize();
+    this.#requirePersistenceHealthy();
     if (this.#shuttingDown) return;
     const refreshed = await this.#workflowStore.refresh();
     if (refreshed !== this.#workflow) {
@@ -316,8 +378,10 @@ export class Orchestrator {
 
     if (this.#shuttingDown) return;
     await this.#reconcile();
+    this.#requirePersistenceHealthy();
     if (this.#shuttingDown) return;
     await this.#dispatchDueRetries();
+    this.#requirePersistenceHealthy();
     if (this.#shuttingDown) return;
     await this.#dispatchCandidates(failOnTrackerError);
     this.#lastPollAtMs = this.#now();
@@ -327,6 +391,8 @@ export class Orchestrator {
   #applyWorkflow(workflow: WorkflowDefinition): void {
     const tracker = this.#trackerOverride ?? createTracker(workflow.config.tracker.kind, workflow.config.tracker.provider);
     const driver = this.#driverOverride ?? createAgentDriver(workflow.config.runtime.kind);
+    const statePath = workflow.config.state?.path;
+    const scopeHash = statePath === undefined ? undefined : workflowScopeHash(workflow);
     if (driver.kind !== workflow.config.runtime.kind) {
       throw new Error(`Runtime driver ${driver.kind} does not match configured kind ${workflow.config.runtime.kind}`);
     }
@@ -339,9 +405,234 @@ export class Orchestrator {
     ) {
       throw new Error("Configured host delivery requires tracker publishing and mutation support");
     }
+    if (this.#workflow !== undefined) {
+      if (statePath !== this.#statePath) {
+        throw new Error("Workflow reload cannot change durable state.path");
+      }
+      if (scopeHash !== this.#scopeHash) {
+        throw new Error("Workflow reload cannot change the durable state scope");
+      }
+    }
     this.#workflow = workflow;
     this.#tracker = tracker;
     this.#driver = driver;
+    this.#statePath = statePath;
+    this.#scopeHash = scopeHash;
+    if (statePath !== undefined && scopeHash !== undefined && this.#stateStore === undefined) {
+      this.#stateStore = new RunStateStore(statePath, scopeHash);
+    }
+  }
+
+  async #recoverState(): Promise<void> {
+    const store = this.#stateStore;
+    if (store === undefined) return;
+
+    let claims: PersistedClaim[];
+    try {
+      claims = await store.load();
+    } catch (error) {
+      throw this.#failPersistence(error);
+    }
+    if (claims.length === 0) return;
+
+    const workflow = this.#requireWorkflow();
+    const tracker = this.#requireTracker();
+    const driver = this.#requireDriver();
+    let changed = false;
+    for (const claim of claims) {
+      if ("pendingDelivery" in claim && claim.pendingDelivery !== undefined) {
+        requireRecoveryDelivery(workflow, tracker);
+      }
+      let issue: Issue | undefined;
+      try {
+        [issue] = await tracker.fetchIssuesByIds([claim.issueId]);
+      } catch (error) {
+        throw new Error(`Unable to refresh persisted issue ${claim.issueId}`, { cause: error });
+      }
+      if (issue === undefined) {
+        changed = true;
+        continue;
+      }
+      if (issue.id !== claim.issueId) {
+        throw new Error(`Tracker returned issue ${issue.id} while refreshing persisted issue ${claim.issueId}`);
+      }
+
+      const classification = classifyIssue(issue, workflow.config);
+      if (classification === "terminal") {
+        await this.#removeWorkspace(issue, workflow.config);
+        changed = true;
+        continue;
+      }
+      if (classification !== "routable") {
+        changed = true;
+        continue;
+      }
+
+      if (claim.kind === "running") {
+        changed = true;
+        if (claim.pendingDelivery !== undefined) {
+          this.#retrying.set(issue.id, {
+            issue,
+            workflow,
+            tracker,
+            driver,
+            attempt: claim.attempt ?? 0,
+            continuation: claim.continuation,
+            sessionId: undefined,
+            dueAtMs: Math.max(0, this.#now()),
+            reason: "failure",
+            pendingDelivery: claim.pendingDelivery,
+          });
+        } else {
+          this.#blocked.set(issue.id, {
+            issue,
+            workflow,
+            tracker,
+            driver,
+            attempt: claim.attempt,
+            continuation: claim.continuation,
+            sessionId: undefined,
+            blockedAtMs: Math.max(0, this.#now()),
+            summary: "Recovered an interrupted agent run; manual retry required",
+          });
+        }
+      } else if (claim.kind === "retrying") {
+        this.#retrying.set(issue.id, {
+          issue,
+          workflow,
+          tracker,
+          driver,
+          attempt: claim.attempt,
+          continuation: claim.continuation,
+          sessionId: undefined,
+          dueAtMs: claim.dueAtMs,
+          reason: claim.reason,
+          ...(claim.pendingDelivery === undefined ? {} : { pendingDelivery: claim.pendingDelivery }),
+        });
+      } else {
+        this.#blocked.set(issue.id, {
+          issue,
+          workflow,
+          tracker,
+          driver,
+          attempt: claim.attempt,
+          continuation: claim.continuation,
+          sessionId: undefined,
+          blockedAtMs: claim.blockedAtMs,
+          summary: claim.summary,
+        });
+      }
+      this.#claimed.add(issue.id);
+    }
+
+    this.#assertClaimInvariant();
+    if (changed) await this.#persistState();
+  }
+
+  async #persistState(): Promise<void> {
+    const store = this.#stateStore;
+    if (store === undefined || this.#stateWritesFrozen) return;
+    this.#requirePersistenceHealthy();
+    try {
+      await store.save(this.#persistedClaims());
+    } catch (error) {
+      throw this.#failPersistence(error);
+    }
+  }
+
+  #persistedClaims(): PersistedClaim[] {
+    const claims: PersistedClaim[] = [];
+    for (const entry of this.#running.values()) {
+      claims.push({
+        kind: "running",
+        issueId: entry.issue.id,
+        attempt: entry.attempt,
+        continuation: entry.continuation,
+        ...(entry.pendingDelivery === undefined ? {} : { pendingDelivery: entry.pendingDelivery }),
+      });
+    }
+    for (const entry of this.#retrying.values()) {
+      claims.push({
+        kind: "retrying",
+        issueId: entry.issue.id,
+        attempt: entry.attempt,
+        continuation: entry.continuation,
+        dueAtMs: Math.max(0, entry.dueAtMs),
+        reason: entry.reason,
+        ...(entry.pendingDelivery === undefined ? {} : { pendingDelivery: entry.pendingDelivery }),
+      });
+    }
+    for (const entry of this.#blocked.values()) {
+      claims.push({
+        kind: "blocked",
+        issueId: entry.issue.id,
+        attempt: entry.attempt,
+        continuation: entry.continuation,
+        blockedAtMs: Math.max(0, entry.blockedAtMs),
+        summary: truncate(entry.summary, 2_000),
+      });
+    }
+    return claims.sort((left, right) => left.issueId.localeCompare(right.issueId));
+  }
+
+  #failPersistence(error: unknown): Error {
+    if (this.#persistenceFailure !== undefined) return this.#persistenceFailure;
+    const failure = new Error("Durable run state persistence failed", { cause: error });
+    this.#persistenceFailure = failure;
+    this.#started = false;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    for (const entry of this.#running.values()) {
+      this.#requestStop(entry, "blocked", "Durable run state persistence failed; manual recovery required");
+    }
+    this.#logger.error({ error }, "Durable run state persistence failed; scheduling stopped");
+    return failure;
+  }
+
+  #requirePersistenceHealthy(): void {
+    if (this.#persistenceFailure !== undefined) throw this.#persistenceFailure;
+  }
+
+  async #checkpointInterruptedRuns(): Promise<void> {
+    const store = this.#stateStore;
+    if (store === undefined || this.#stateWritesFrozen) return;
+    for (const [issueId, entry] of [...this.#running.entries()]) {
+      this.#running.delete(issueId);
+      if (entry.pendingDelivery !== undefined) {
+        this.#retrying.set(issueId, {
+          issue: entry.issue,
+          workflow: entry.workflow,
+          tracker: entry.tracker,
+          driver: entry.driver,
+          attempt: entry.attempt ?? 0,
+          continuation: entry.continuation,
+          sessionId: undefined,
+          dueAtMs: Math.max(0, this.#now()),
+          reason: "failure",
+          pendingDelivery: entry.pendingDelivery,
+        });
+      } else {
+        this.#blocked.set(issueId, {
+          issue: entry.issue,
+          workflow: entry.workflow,
+          tracker: entry.tracker,
+          driver: entry.driver,
+          attempt: entry.attempt,
+          continuation: entry.continuation,
+          sessionId: undefined,
+          blockedAtMs: Math.max(0, this.#now()),
+          summary: "Orchestrator stopped during an active run; manual retry required",
+        });
+      }
+    }
+    this.#assertClaimInvariant();
+    this.#stateWritesFrozen = true;
+    if (this.#persistenceFailure !== undefined) return;
+    try {
+      await store.save(this.#persistedClaims());
+    } catch (error) {
+      throw this.#failPersistence(error);
+    }
   }
 
   async #cleanupTerminalWorkspaces(): Promise<void> {
@@ -396,16 +687,16 @@ export class Orchestrator {
         continue;
       }
       if (!refreshed) {
-        this.#release(issueId);
+        await this.#release(issueId);
         continue;
       }
       entry.issue = refreshed;
       const classification = classifyIssue(refreshed, entry.workflow.config);
       if (classification === "terminal") {
         await this.#removeWorkspace(refreshed, entry.workflow.config);
-        this.#release(issueId);
+        await this.#release(issueId);
       } else if (classification !== "routable") {
-        this.#release(issueId);
+        await this.#release(issueId);
       } else {
         const retryLabel = entry.workflow.config.control?.retryLabel;
         if (retryLabel === undefined || !refreshed.labels.some((label) => sameLabel(label, retryLabel))) continue;
@@ -429,7 +720,7 @@ export class Orchestrator {
           continue;
         }
         if (this.#shuttingDown) return;
-        if (!this.retryBlocked(issueId)) {
+        if (!(await this.retryBlocked(issueId))) {
           this.#logger.warn(
             { issue_id: issueId, issue_identifier: refreshed.identifier },
             "Retry label was removed after the blocked claim changed; no retry scheduled",
@@ -455,32 +746,36 @@ export class Orchestrator {
       try {
         [issue] = await retry.tracker.fetchIssuesByIds([issueId]);
       } catch (error) {
+        if (this.#shuttingDown) return;
         this.#logger.warn({ error, issue_id: issueId }, "Retry refresh failed; retaining retry claim");
         retry.dueAtMs = this.#now() + retry.workflow.config.polling.intervalMs;
+        await this.#persistState();
         continue;
       }
+      if (this.#shuttingDown) return;
       if (!issue) {
-        this.#release(issueId);
+        await this.#release(issueId);
         continue;
       }
       retry.issue = issue;
       const classification = classifyIssue(issue, retry.workflow.config);
       if (classification === "terminal") {
         await this.#removeWorkspace(issue, retry.workflow.config);
-        this.#release(issueId);
+        await this.#release(issueId);
         continue;
       }
       if (classification !== "routable") {
-        this.#release(issueId);
+        await this.#release(issueId);
         continue;
       }
       if (!this.#hasCapacity(issue, retry.workflow.config)) {
         retry.dueAtMs = this.#now() + Math.min(1_000, retry.workflow.config.polling.intervalMs);
+        await this.#persistState();
         continue;
       }
 
       this.#retrying.delete(issueId);
-      this.#spawn({
+      await this.#spawn({
         ...retry,
         issue,
       });
@@ -516,8 +811,7 @@ export class Orchestrator {
       if (this.#shuttingDown) return;
       if (!issue || !isRoutable(issue, workflow.config) || !this.#hasCapacity(issue, workflow.config)) continue;
 
-      this.#claimed.add(issue.id);
-      this.#spawn({
+      await this.#spawn({
         issue,
         workflow,
         tracker,
@@ -531,9 +825,9 @@ export class Orchestrator {
     }
   }
 
-  #spawn(source: Omit<RetryEntry, "attempt"> & { attempt: number | null }): void {
+  async #spawn(source: Omit<RetryEntry, "attempt"> & { attempt: number | null }): Promise<void> {
     if (this.#shuttingDown) {
-      this.#release(source.issue.id);
+      await this.#release(source.issue.id);
       return;
     }
     const now = this.#now();
@@ -556,6 +850,9 @@ export class Orchestrator {
     };
     this.#running.set(entry.issue.id, entry);
     this.#claimed.add(entry.issue.id);
+    this.#assertClaimInvariant();
+    await this.#persistState();
+    if (this.#shuttingDown || this.#running.get(entry.issue.id) !== entry) return;
     entry.done = this.#run(entry);
     this.#logger.info(
       {
@@ -572,13 +869,13 @@ export class Orchestrator {
     let outcome: RunOutcome;
     const runLifecycleHooks = entry.pendingDelivery === undefined;
     try {
-      const workspace = await this.#workspaceManager.createForIssue(
-        entry.issue,
-        entry.workflow.config,
-        entry.controller.signal,
-      );
-      entry.workspacePath = workspace.path;
       if (entry.pendingDelivery === undefined) {
+        const workspace = await this.#workspaceManager.createForIssue(
+          entry.issue,
+          entry.workflow.config,
+          entry.controller.signal,
+        );
+        entry.workspacePath = workspace.path;
         await this.#workspaceManager.beforeRun(
           workspace.path,
           entry.issue,
@@ -628,6 +925,7 @@ export class Orchestrator {
       } catch (error) {
         return { kind: "failure", error };
       }
+      if (entry.stopReason) return this.#outcomeForStop(entry.stopReason);
       if (!refreshed) return { kind: "release", summary: "Issue disappeared after agent turn" };
       entry.issue = refreshed;
       const classification = classifyIssue(refreshed, entry.workflow.config);
@@ -643,6 +941,8 @@ export class Orchestrator {
           return { kind: "blocked", summary: completion.summary };
         }
         const pendingDelivery = { completion, idempotencyKey: randomUUID() };
+        entry.pendingDelivery = pendingDelivery;
+        await this.#persistState();
         try {
           await this.#deliverCompletion(entry, pendingDelivery);
         } catch (error) {
@@ -793,6 +1093,7 @@ export class Orchestrator {
     } catch (error) {
       return { kind: "delivery_failure", error, pendingDelivery };
     }
+    if (entry.stopReason) return this.#outcomeForDeliveryStop(entry.stopReason, pendingDelivery);
     if (!refreshed) return { kind: "release", summary: "Issue disappeared before delivery retry" };
     entry.issue = refreshed;
     const classification = classifyIssue(refreshed, entry.workflow.config);
@@ -801,6 +1102,8 @@ export class Orchestrator {
       return { kind: "release", summary: `Issue became ${classification} before delivery retry` };
     }
     try {
+      const workspaceRoot = await realpath(entry.workflow.config.workspace.root);
+      entry.workspacePath = path.join(workspaceRoot, workspaceKey(entry.issue.identifier));
       await this.#deliverCompletion(entry, pendingDelivery);
       return { kind: "release", summary: "Change published for human review" };
     } catch (error) {
@@ -827,6 +1130,7 @@ export class Orchestrator {
         entry.workflow.config,
       );
       stage = "tracker_publish";
+      entry.controller.signal.throwIfAborted();
       const published = await publishIssueChange(
         entry.issue,
         validatedPath,
@@ -834,6 +1138,7 @@ export class Orchestrator {
         entry.controller.signal,
       );
       stage = "handoff_comment";
+      entry.controller.signal.throwIfAborted();
       await mutateIssue(
         entry.issue,
         {
@@ -844,12 +1149,14 @@ export class Orchestrator {
         entry.controller.signal,
       );
       stage = "review_label";
+      entry.controller.signal.throwIfAborted();
       await mutateIssue(
         entry.issue,
         { kind: "add_label", label: delivery.reviewLabel },
         entry.controller.signal,
       );
       stage = "queue_release";
+      entry.controller.signal.throwIfAborted();
       await mutateIssue(
         entry.issue,
         { kind: "remove_label", label: delivery.queueLabel },
@@ -881,13 +1188,30 @@ export class Orchestrator {
 
   async #finish(entry: RunningEntry, outcome: RunOutcome): Promise<void> {
     if (this.#running.get(entry.issue.id) !== entry) return;
-    this.#running.delete(entry.issue.id);
 
-    if (this.#shuttingDown) outcome = { kind: "release", summary: "Orchestrator stopped" };
+    if (this.#shuttingDown) {
+      outcome = this.#stateStore === undefined
+        ? { kind: "release", summary: "Orchestrator stopped" }
+        : entry.pendingDelivery === undefined
+          ? { kind: "blocked", summary: "Orchestrator stopped during an active run; manual retry required" }
+          : {
+              kind: "delivery_failure",
+              error: new Error("Orchestrator stopped during host delivery"),
+              pendingDelivery: entry.pendingDelivery,
+            };
+    }
     if (outcome.kind === "terminal") {
       await this.#removeWorkspace(entry.issue, entry.workflow.config);
+      if (this.#running.get(entry.issue.id) !== entry) return;
+      this.#running.delete(entry.issue.id);
       this.#claimed.delete(entry.issue.id);
-    } else if (outcome.kind === "release") {
+      this.#assertClaimInvariant();
+      await this.#persistState();
+      return;
+    }
+
+    this.#running.delete(entry.issue.id);
+    if (outcome.kind === "release") {
       this.#claimed.delete(entry.issue.id);
       this.#logger.info(
         { issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, reason: outcome.summary },
@@ -901,7 +1225,7 @@ export class Orchestrator {
         driver: entry.driver,
         attempt: entry.attempt,
         continuation: entry.continuation,
-        sessionId: entry.sessionId,
+        sessionId: entry.stopReason?.kind === "shutdown" ? undefined : entry.sessionId,
         blockedAtMs: this.#now(),
         summary: outcome.summary,
       });
@@ -937,9 +1261,13 @@ export class Orchestrator {
           summary,
         });
         this.#assertClaimInvariant();
+        await this.#persistState();
         return;
       }
-      const delayMs = isFailure
+      const retryAttempt = isDeliveryFailure ? entry.attempt ?? 0 : nextAttempt;
+      const delayMs = isDeliveryFailure
+        ? this.#failureBaseDelayMs
+        : isFailure
         ? Math.min(
             this.#failureBaseDelayMs * 2 ** Math.max(0, nextAttempt - 1),
             entry.workflow.config.agent.maxRetryBackoffMs,
@@ -950,14 +1278,13 @@ export class Orchestrator {
         workflow: entry.workflow,
         tracker: entry.tracker,
         driver: entry.driver,
-        attempt: nextAttempt,
+        attempt: retryAttempt,
         continuation: entry.continuation,
         sessionId: isFailure ? undefined : entry.sessionId,
         dueAtMs: this.#now() + delayMs,
         reason: isFailure ? "failure" : "continuation",
         ...(outcome.kind === "delivery_failure" ? { pendingDelivery: outcome.pendingDelivery } : {}),
       });
-      this.#wakeForRetry();
       this.#logger[isFailure ? "error" : "info"](
         {
           issue_id: entry.issue.id,
@@ -976,6 +1303,8 @@ export class Orchestrator {
       );
     }
     this.#assertClaimInvariant();
+    await this.#persistState();
+    if (this.#retrying.has(entry.issue.id)) this.#wakeForRetry();
   }
 
   #outcomeForStop(reason: StopReason): RunOutcome {
@@ -1000,10 +1329,12 @@ export class Orchestrator {
     entry.controller.abort(new Error(summary));
   }
 
-  #release(issueId: string): void {
+  async #release(issueId: string): Promise<void> {
     this.#retrying.delete(issueId);
     this.#blocked.delete(issueId);
     this.#claimed.delete(issueId);
+    this.#assertClaimInvariant();
+    await this.#persistState();
   }
 
   async #removeWorkspace(issue: Issue, config: WorkflowConfig): Promise<void> {
@@ -1030,7 +1361,7 @@ export class Orchestrator {
   }
 
   #scheduleNextPoll(): void {
-    if (!this.#started || this.#shuttingDown) return;
+    if (!this.#started || this.#shuttingDown || this.#persistenceFailure !== undefined) return;
     if (this.#timer) clearTimeout(this.#timer);
     const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
     const nextRetryAt = Math.min(...[...this.#retrying.values()].map((entry) => entry.dueAtMs));
@@ -1107,6 +1438,57 @@ function deliveryCredentialNames(config: WorkflowConfig): string[] {
     ? /^\$([A-Za-z_][A-Za-z0-9_]*)$/u.exec(tokenReference.trim())?.[1]
     : undefined;
   return matched === undefined ? ["GITHUB_TOKEN"] : ["GITHUB_TOKEN", matched];
+}
+
+export function workflowScopeHash(workflow: WorkflowDefinition): string {
+  const provider = workflow.config.tracker.provider;
+  const github = workflow.config.tracker.kind === "github"
+    ? {
+        owner: scopeString(provider.owner),
+        repo: scopeString(provider.repo),
+        endpoint: scopeUrl(provider.endpoint, "https://api.github.com"),
+        baseBranch: scopeString(provider.base_branch),
+        gitUrl: scopeUrl(provider.git_url, null),
+      }
+    : null;
+  const memoryIssues = workflow.config.tracker.kind === "memory" && Array.isArray(provider.issues)
+    ? provider.issues
+        .flatMap((issue) => {
+          if (typeof issue !== "object" || issue === null) return [];
+          const { id, identifier } = issue as Record<string, unknown>;
+          return typeof id === "string" && typeof identifier === "string" ? [{ id, identifier }] : [];
+        })
+        .sort((left, right) => left.id.localeCompare(right.id) || left.identifier.localeCompare(right.identifier))
+    : null;
+  return createHash("sha256")
+    .update(JSON.stringify({
+      workflowPath: workflow.path,
+      trackerKind: workflow.config.tracker.kind,
+      workspaceRoot: workflow.config.workspace.root,
+      github,
+      memoryIssues,
+    }))
+    .digest("hex");
+}
+
+function scopeString(value: unknown): string | null {
+  return typeof value === "string" ? value.trim() : null;
+}
+
+function scopeUrl(value: unknown, fallback: string | null): string | null {
+  const candidate = scopeString(value) ?? fallback;
+  if (candidate === null) return null;
+  return new URL(candidate).toString().replace(/\/+$/u, "");
+}
+
+function requireRecoveryDelivery(workflow: WorkflowDefinition, tracker: Tracker): void {
+  if (
+    workflow.config.delivery === undefined ||
+    tracker.publishIssueChange === undefined ||
+    tracker.mutateIssue === undefined
+  ) {
+    throw new Error("Persisted pending delivery requires configured host delivery support");
+  }
 }
 
 function finiteNonNegative(value: number): number {
