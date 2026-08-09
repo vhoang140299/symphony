@@ -14,6 +14,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 import { agentCompletionOutputSchema, parseAgentCompletionJson } from "../completion.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, AgentUsage } from "../domain.js";
+import { resolveGitExecutable } from "../publish/git.js";
 import { pickEnvironment } from "./environment.js";
 
 const codexOptionsSchema = z
@@ -349,7 +350,8 @@ async function resolveSafeCodexWorkspace(
     const workspace = await realpath(workspacePath);
     await assertNoProjectExtensionLayers(workspace);
     try {
-      const { stdout } = await execFileAsync("git", ["-C", workspace, "rev-parse", "--show-toplevel"], {
+      const gitExecutable = await resolveGitExecutable(workspace);
+      const { stdout } = await execFileAsync(gitExecutable, ["-C", workspace, "rev-parse", "--show-toplevel"], {
         encoding: "utf8",
         timeout: 5_000,
         maxBuffer: 16_384,

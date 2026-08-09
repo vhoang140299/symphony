@@ -457,7 +457,7 @@ function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new Error("Git publish aborted");
 }
 
-async function resolveGitExecutable(workspacePath: string): Promise<string> {
+export async function resolveGitExecutable(workspacePath: string): Promise<string> {
   const names = process.platform === "win32" ? ["git.exe", "git.cmd", "git.bat"] : ["git"];
   for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
     if (!path.isAbsolute(directory)) continue;

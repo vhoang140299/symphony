@@ -17,6 +17,7 @@ import {
 import { createAgentDriver } from "../src/agents/registry.js";
 import { agentCompletionOutputSchema } from "../src/completion.js";
 import type { AgentEvent, AgentRunContext, Issue } from "../src/domain.js";
+import { resolveGitExecutable } from "../src/publish/git.js";
 
 const execFileAsync = promisify(execFile);
 const previousCodexHome = process.env.CODEX_HOME;
@@ -444,6 +445,48 @@ test("requires an isolated private CODEX_HOME and rejects local extension layers
   const parentDriver = new CodexAgentDriver(async () => eventStream([]));
   const parentEvents = await collect(parentDriver.run(context({ workspacePath: nestedWorkspaceInRepository })));
   assert.match(parentEvents[0]?.summary ?? "", /Git root must equal the issue workspace/);
+});
+
+test("Codex Git validation ignores workspace-relative PATH entries", async () => {
+  if (process.platform === "win32") return;
+
+  const workspacePath = await mkdtemp(path.join(tmpdir(), "symphony-codex-git-path-"));
+  onTestFinished(() => rm(workspacePath, { recursive: true, force: true }));
+  const trustedGit = await resolveGitExecutable(workspacePath);
+  await execFileAsync(trustedGit, ["init", "-q", "--initial-branch=main", workspacePath]);
+
+  const plantedDirectory = path.join(workspacePath, "node_modules", ".bin");
+  const plantedGit = path.join(plantedDirectory, "git");
+  const markerPath = path.join(workspacePath, "planted-git-ran");
+  await mkdir(plantedDirectory, { recursive: true });
+  await writeFile(
+    plantedGit,
+    '#!/bin/sh\n: > "$SYMPHONY_TEST_GIT_MARKER"\nexec "$SYMPHONY_TEST_TRUSTED_GIT" "$@"\n',
+    { mode: 0o700 },
+  );
+
+  const previousPath = process.env.PATH;
+  const previousMarker = process.env.SYMPHONY_TEST_GIT_MARKER;
+  const previousTrustedGit = process.env.SYMPHONY_TEST_TRUSTED_GIT;
+  process.env.PATH = `node_modules/.bin${path.delimiter}${path.dirname(trustedGit)}`;
+  process.env.SYMPHONY_TEST_GIT_MARKER = markerPath;
+  process.env.SYMPHONY_TEST_TRUSTED_GIT = trustedGit;
+
+  try {
+    let opened = false;
+    const driver = new CodexAgentDriver(async () => {
+      opened = true;
+      return eventStream([]);
+    });
+    await collect(driver.run(context({ workspacePath })));
+
+    assert.equal(opened, true);
+    await assert.rejects(readFile(markerPath), (error) => isErrorCode(error, "ENOENT"));
+  } finally {
+    restoreEnvironment("PATH", previousPath);
+    restoreEnvironment("SYMPHONY_TEST_GIT_MARKER", previousMarker);
+    restoreEnvironment("SYMPHONY_TEST_TRUSTED_GIT", previousTrustedGit);
+  }
 });
 
 test("Codex wrapper forces user config, rules, provider tools, and extension layers off", async () => {
