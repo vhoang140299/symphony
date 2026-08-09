@@ -68,14 +68,12 @@ async function main(args: string[]): Promise<void> {
     return;
   }
 
-  let operationsReady = false;
   const operationsServer =
     httpPort === undefined
       ? undefined
-      : createOperationsServer(() => orchestrator.snapshot(), () => operationsReady);
+      : createOperationsServer(() => orchestrator.snapshot(), () => orchestrator.isReady());
   let stopPromise: Promise<void> | undefined;
   const requestStop = () => {
-    operationsReady = false;
     stopPromise ??= stopServices(operationsServer, orchestrator);
     void stopPromise.catch(() => undefined);
     return stopPromise;
@@ -84,6 +82,7 @@ async function main(args: string[]): Promise<void> {
     logger.info({ signal }, "Shutdown requested");
     void requestStop();
   });
+  let fatalError: Error | undefined;
   try {
     if (operationsServer && httpPort !== undefined) {
       await operationsServer.listen({ host: httpHost, port: httpPort });
@@ -91,7 +90,6 @@ async function main(args: string[]): Promise<void> {
     if (stopPromise) return await stopPromise;
     await orchestrator.start();
     if (stopPromise) return await stopPromise;
-    operationsReady = true;
     logger.info(
       {
         workflow_path: workflowPath,
@@ -100,8 +98,16 @@ async function main(args: string[]): Promise<void> {
       "Symphony Node started",
     );
 
-    await shutdown.promise;
-    await requestStop();
+    const outcome = await Promise.race([
+      shutdown.promise.then(() => ({ kind: "shutdown" }) as const),
+      orchestrator.waitForFatalError().then((error) => ({ kind: "fatal", error }) as const),
+    ]);
+    if (outcome.kind === "fatal") {
+      fatalError = outcome.error;
+      await requestStop().catch(() => undefined);
+    } else {
+      await requestStop();
+    }
   } catch (error) {
     if (stopPromise) return await stopPromise;
     await requestStop().catch(() => undefined);
@@ -109,6 +115,7 @@ async function main(args: string[]): Promise<void> {
   } finally {
     shutdown.dispose();
   }
+  if (fatalError) throw new Error("Orchestrator stopped after a fatal runtime error");
 }
 
 async function stopServices(
