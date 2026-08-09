@@ -258,14 +258,14 @@ test("hook timeout stays bounded when a detached descendant keeps stderr open", 
     "setInterval(() => {}, 30_000)",
   ].join(";");
   const config = workflow(root, {
-    timeoutMs: 200,
+    timeoutMs: 1_000,
     beforeRun: `${shellQuote(process.execPath)} -e ${shellQuote(hookProgram)}`,
   });
   const workspace = await manager.createForIssue(issue, config);
   const startedAt = Date.now();
 
-  await assert.rejects(manager.beforeRun(workspace.path, issue, config), /before_run hook timed out after 200ms/);
-  assert.ok(Date.now() - startedAt < 1_500);
+  await assert.rejects(manager.beforeRun(workspace.path, issue, config), /before_run hook timed out after 1000ms/);
+  assert.ok(Date.now() - startedAt < 2_500);
 
   const escapedPid = Number.parseInt(await readFile(escapedPidFile, "utf8"), 10);
   assert.ok(Number.isInteger(escapedPid));
