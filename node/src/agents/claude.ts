@@ -20,6 +20,7 @@ import type {
   IssueMutation,
   PublishChangeInput,
 } from "../domain.js";
+import { pickEnvironment } from "./environment.js";
 
 const issueToolServerName = "symphony";
 
@@ -333,19 +334,9 @@ export function buildClaudeEnvironment(
   extraNames: string[],
   sensitiveEnvNames: string[] = [],
 ): Record<string, string> {
-  const names = new Set([...safeEnvironmentNames, ...extraNames]);
-  const excluded = new Set(sensitiveEnvNames.map((name) => name.toUpperCase()));
-
-  const environment: Record<string, string> = {};
-  for (const name of names) {
-    if (excluded.has(name.toUpperCase())) continue;
-    const value = process.env[name];
-    if (value !== undefined) environment[name] = value;
-  }
-  if (!excluded.has("CLAUDE_AGENT_SDK_CLIENT_APP")) {
-    environment.CLAUDE_AGENT_SDK_CLIENT_APP = "ai-symphony-node/0.1.0";
-  }
-  return environment;
+  return pickEnvironment([...safeEnvironmentNames, ...extraNames], sensitiveEnvNames, {
+    CLAUDE_AGENT_SDK_CLIENT_APP: "ai-symphony-node/0.1.0",
+  });
 }
 
 export function normalizeClaudeMessage(

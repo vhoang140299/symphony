@@ -1,7 +1,7 @@
 import type { WorkflowDefinition } from "./config/workflow.js";
 import { loadWorkflow } from "./config/workflow.js";
 import type { Issue } from "./domain.js";
-import { compareIssues, isRoutable } from "./orchestrator.js";
+import { selectRoutableIssues } from "./routing.js";
 import { createTracker } from "./trackers/registry.js";
 
 export interface PreflightResult {
@@ -21,16 +21,13 @@ export async function runPreflight(workflowPath: string): Promise<PreflightResul
 }
 
 export function summarizePreflight(workflow: WorkflowDefinition, fetched: Issue[]): PreflightResult {
-  const unique = new Map(fetched.map((issue) => [issue.id, issue]));
   return {
     tracker: workflow.config.tracker.kind,
     runtime: workflow.config.runtime.kind,
     delivery: workflow.config.delivery !== undefined,
     control: workflow.config.control !== undefined,
     fetched: fetched.length,
-    eligible: [...unique.values()]
-      .filter((issue) => isRoutable(issue, workflow.config))
-      .sort(compareIssues)
+    eligible: selectRoutableIssues(fetched, workflow.config)
       .map(({ id, identifier, state }) => ({ id, identifier, state })),
   };
 }

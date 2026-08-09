@@ -231,6 +231,10 @@ test("Claude sensitive environment names override defaults and explicit allowlis
     const safe = buildClaudeEnvironment(["GITHUB_TOKEN"], ["github_token", "path"]);
     assert.equal(safe.GITHUB_TOKEN, undefined);
     assert.equal(safe.PATH, undefined);
+    assert.equal(
+      buildClaudeEnvironment([], ["claude_agent_sdk_client_app"]).CLAUDE_AGENT_SDK_CLIENT_APP,
+      undefined,
+    );
   } finally {
     restoreEnvironment("GITHUB_TOKEN", previousGithub);
     restoreEnvironment("PATH", previousPath);
