@@ -265,7 +265,7 @@ test("host delivery is explicit, label-bound, and keeps tracker credentials out 
   );
 });
 
-test("operator retry control is strict, GitHub-only, label-bound, and keeps credentials host-side", () => {
+test("operator retry control supports GitHub and Linear while keeping credentials host-side", () => {
   const config = {
     tracker: {
       kind: "github",
@@ -299,7 +299,7 @@ test("operator retry control is strict, GitHub-only, label-bound, and keeps cred
   );
   assert.throws(
     () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, kind: "memory" } }),
-    /GitHub tracker/i,
+    /GitHub or Linear tracker/i,
   );
   assert.throws(
     () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, provider: { owner: "acme", repo: "widget" } } }),
@@ -308,6 +308,40 @@ test("operator retry control is strict, GitHub-only, label-bound, and keeps cred
   for (const name of ["TRACKER_TOKEN", "GITHUB_TOKEN"]) {
     assert.throws(
       () => parseWorkflowConfig({ ...config, runtime: { kind: "claude", options: { env_allowlist: [name] } } }),
+      /credentials must not be passed/i,
+    );
+  }
+
+  const linear = {
+    tracker: {
+      kind: "linear",
+      provider: { project_slug: "symphony", api_key: "$LINEAR_CONTROL_TOKEN" },
+      required_labels: ["Symphony"],
+    },
+    control: { retry_label: " Symphony-Retry " },
+    runtime: { kind: "claude", options: { env_allowlist: ["CI"] } },
+  };
+  assert.deepEqual(parseWorkflowConfig(linear).control, { retryLabel: "symphony-retry" });
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...linear,
+      tracker: { ...linear.tracker, provider: { project_slug: "symphony" } },
+    }),
+    /Linear retry control.*explicit tracker API key environment reference/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...linear,
+      tracker: { ...linear.tracker, provider: { project_slug: "symphony", api_key: "literal-key" } },
+    }),
+    /Linear retry control.*explicit tracker API key environment reference/i,
+  );
+  for (const name of ["LINEAR_CONTROL_TOKEN", "LINEAR_API_KEY"]) {
+    assert.throws(
+      () => parseWorkflowConfig({
+        ...linear,
+        runtime: { kind: "claude", options: { env_allowlist: [name] } },
+      }),
       /credentials must not be passed/i,
     );
   }

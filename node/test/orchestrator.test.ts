@@ -279,38 +279,66 @@ for (const runtimeKind of ["claude", "codex"] as const) {
   });
 }
 
-test("keeps Linear credentials out of a non-delivery agent child", async () => {
+test("keeps Linear credentials host-side while retry control admits one manual run", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-linear-credentials-"));
-  const issue = {
+  let issue: Issue = {
     ...githubIssue(),
     id: "linear-issue-1",
+    nativeRef: null,
     identifier: "LIN-1",
     state: "Todo",
-    labels: [],
+    labels: ["symphony"],
+    url: "https://linear.app/acme/issue/LIN-1",
   };
+  const operations: string[] = [];
   const tracker: Tracker = {
+    issueStateMutationMode: "named",
     async fetchIssuesByStates(states) {
-      return states.includes(issue.state) ? [issue] : [];
+      return states.includes(issue.state) ? [{ ...issue, labels: [...issue.labels] }] : [];
     },
     async fetchIssuesByIds(ids) {
-      return ids.includes(issue.id) ? [issue] : [];
+      return ids.includes(issue.id) ? [{ ...issue, labels: [...issue.labels] }] : [];
+    },
+    async mutateIssue(target, mutation, signal) {
+      assert.equal(signal.aborted, false);
+      assert.equal(target.id, issue.id);
+      assert.equal(target.identifier, issue.identifier);
+      assert.equal(mutation.kind, "remove_label");
+      if (mutation.kind !== "remove_label") throw new Error("unexpected mutation");
+      operations.push(`remove:${mutation.label}`);
+      issue = {
+        ...issue,
+        labels: issue.labels.filter((label) => label.toLowerCase() !== mutation.label.toLowerCase()),
+      };
     },
   };
   const driver = new FakeDriver(async function* (context) {
     assert.deepEqual(context.sensitiveEnvNames, ["LINEAR_API_KEY", "CUSTOM_LINEAR_TOKEN"]);
+    operations.push(`run:${context.attempt ?? "initial"}`);
     yield event("turn_failed", { summary: "expected test failure" });
   });
   const workflowPath = path.join(directory, "WORKFLOW.md");
   await writeFile(
     workflowPath,
-    `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: project\n    api_key: $CUSTOM_LINEAR_TOKEN\n  active_states: [Todo]\n  terminal_states: [Done]\nworkspace:\n  root: ./workspaces\nagent:\n  max_attempts: 1\nruntime:\n  kind: claude\n---\nWork on {{ issue.identifier }}.\n`,
+    `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: project\n    api_key: $CUSTOM_LINEAR_TOKEN\n  required_labels: [symphony]\n  active_states: [Todo]\n  terminal_states: [Done]\ncontrol:\n  retry_label: retry-me\nworkspace:\n  root: ./workspaces\nagent:\n  max_attempts: 1\nruntime:\n  kind: claude\n---\nWork on {{ issue.identifier }}.\n`,
   );
   const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
 
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
-
+  assert.deepEqual(operations, ["run:initial"]);
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+
+  issue = { ...issue, labels: [...issue.labels, "ReTrY-Me"] };
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(operations, ["run:initial", "remove:retry-me", "run:1"]);
+  assert.deepEqual(issue.labels, ["symphony"]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(operations, ["run:initial", "remove:retry-me", "run:1"]);
   await orchestrator.stop();
   await rm(directory, { recursive: true, force: true });
 });

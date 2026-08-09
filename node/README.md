@@ -16,9 +16,9 @@ Claude Code or Codex through their official SDKs.
 - CLI and tooling: Commander, Fastify for optional operational HTTP, pnpm, and Vitest
   (Vite-powered)
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
-- Trackers: in-memory issues, Linear polling with manual Claude tools through the official SDK, or
-  GitHub Issues polling with manual Claude tools, host-controlled PR delivery, and operator retry
-  labels
+- Trackers: in-memory issues; Linear polling with manual Claude tools and operator retry labels
+  through the official SDK; or GitHub Issues polling with manual Claude tools, host-controlled PR
+  delivery, and operator retry labels
 - Operations: structured logs, an in-process runtime snapshot, and an optional locally leased
   checkpoint
 
@@ -355,6 +355,8 @@ tracker:
   required_labels: [symphony]
   active_states: [Todo, In Progress]
   terminal_states: [Done, Closed, Cancelled, Canceled, Duplicate]
+control:
+  retry_label: symphony-retry
 agent:
   max_turns: 1
   max_attempts: 3
@@ -380,6 +382,10 @@ agent's environment. `assignee` is optional; `me` resolves to the authenticated 
 user ID matches that exact assignee. Custom endpoints must be HTTPS; configure one only when it is
 operator-controlled because Symphony sends the Linear API key to it.
 
+Enabling `control.retry_label` requires an explicit `tracker.provider.api_key: $ENV_NAME` reference.
+The named variable and `LINEAR_API_KEY` cannot be added to `runtime.options.env_allowlist`; Symphony
+keeps the credential in the host process for polling and retry-label consumption.
+
 The adapter preserves Linear state spelling, normalizes labels to lowercase, and includes inverse
 `blocks` relations. A `Todo` issue is dispatchable only when every known blocker is in a configured
 terminal state and the optional assignee matches. Candidate pages drop malformed records; an ID
@@ -391,11 +397,20 @@ and configured assignee. State names must uniquely match an existing state in th
 uniquely match an existing non-group team or workspace label. The model cannot supply an issue ID,
 project, team, API endpoint, or raw GraphQL request, and the Linear API key stays out of the coding
 agent environment. Omit the tool names to keep Linear read-only. Codex does not expose these
-in-process tools, and Linear still does not support host delivery or retry-label control.
+in-process tools, and Linear still does not support host delivery. `control.retry_label` must differ
+from every required label and is reserved for the operator; agent mutation tools cannot add or
+remove it.
 
 Linear workflows default to one turn per run and three total attempts; explicit
 `agent.max_turns` and `agent.max_attempts` override those defaults. A manual state tool can move the
 issue out of `active_states` after a verified handoff so the current claim is released immediately.
+
+Create the configured retry label in Linear before starting Symphony. Adding it to a blocked,
+still-routable issue requests at most one extra run with either runtime. Symphony removes the label
+before releasing the run; if removal fails, the claim stays blocked. After that run, `max_attempts`
+applies again. If an ambiguous provider response removes the label but the issue remains blocked,
+add the label again to request another retry. A configured `state.path` restores the blocked claim
+across restarts so a later poll can consume the label.
 
 ### GitHub Issues tracker
 
@@ -439,7 +454,7 @@ runtime:
     tools: [Read, Edit, Write, Glob, Grep]
 ```
 
-Host delivery and operator retry control currently require the GitHub tracker.
+Host delivery currently requires the GitHub tracker; operator retry control also supports Linear.
 `delivery.queue_label` must be one of `tracker.required_labels`; `delivery.review_label` and
 `control.retry_label` must differ from the required and delivery labels. Create all three labels in
 the repository before starting Symphony so their color and description are controlled and the
@@ -484,12 +499,12 @@ Without `state.path`, pending delivery is in memory; after a process restart, a 
 can be dispatched to the agent again. A configured checkpoint instead resumes host delivery without
 rerunning the agent.
 
-Host delivery and operator retry control require `tracker.provider.token` to be an explicit environment
-reference such as `$GITHUB_TOKEN`; set that variable in Symphony's host environment. The named
-variable and `GITHUB_TOKEN` must not appear in `runtime.options.env_allowlist`. Comment and label
-updates execute inside Symphony, so the tracker credential never needs to enter the coding-agent
-child. The checked-in profiles need repository `Issues: write`, `Contents: write`, and
-`Pull requests: write` permissions.
+For GitHub, host delivery and operator retry control require `tracker.provider.token` to be an
+explicit environment reference such as `$GITHUB_TOKEN`; set that variable in Symphony's host
+environment. The named variable and `GITHUB_TOKEN` must not appear in
+`runtime.options.env_allowlist`. Comment and label updates execute inside Symphony, so the tracker
+credential never needs to enter the coding-agent child. The checked-in profiles need repository
+`Issues: write`, `Contents: write`, and `Pull requests: write` permissions.
 
 Outside delivery mode, the implicit `GITHUB_TOKEN` fallback is limited to `https://api.github.com`.
 A custom endpoint must name its token environment variable explicitly, and authenticated endpoints

@@ -118,11 +118,22 @@ const rawWorkflowConfigSchema = z
   .passthrough()
   .superRefine((value, context) => {
     if (value.delivery === undefined && value.control === undefined) return;
-    if (value.tracker.kind !== "github") {
+    if (value.delivery !== undefined && value.tracker.kind !== "github") {
       context.addIssue({
         code: "custom",
-        path: [value.delivery === undefined ? "control" : "delivery"],
-        message: "Configured host controls require the GitHub tracker",
+        path: ["delivery"],
+        message: "Configured host delivery requires the GitHub tracker",
+      });
+    }
+    if (
+      value.control !== undefined &&
+      value.tracker.kind !== "github" &&
+      value.tracker.kind !== "linear"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["control"],
+        message: "Configured retry control requires the GitHub or Linear tracker",
       });
     }
     if (value.delivery !== undefined && value.hooks.after_run !== undefined) {
@@ -165,22 +176,37 @@ const rawWorkflowConfigSchema = z
       }
     }
 
-    const tokenReference = value.tracker.provider.token;
+    const credential = value.tracker.kind === "github"
+      ? {
+          key: "token",
+          defaultName: "GITHUB_TOKEN",
+          missingMessage: "Host-controlled GitHub features require an explicit tracker token environment reference",
+        }
+      : value.tracker.kind === "linear" && value.control !== undefined
+        ? {
+            key: "api_key",
+            defaultName: "LINEAR_API_KEY",
+            missingMessage: "Linear retry control requires an explicit tracker API key environment reference",
+          }
+        : undefined;
+    if (credential === undefined) return;
+
+    const tokenReference = value.tracker.provider[credential.key];
     const tokenMatch = typeof tokenReference === "string"
       ? /^\$([A-Za-z_][A-Za-z0-9_]*)$/u.exec(tokenReference.trim())
       : null;
     if (!tokenMatch?.[1]) {
       context.addIssue({
         code: "custom",
-        path: ["tracker", "provider", "token"],
-        message: "Host-controlled GitHub features require an explicit tracker token environment reference",
+        path: ["tracker", "provider", credential.key],
+        message: credential.missingMessage,
       });
       return;
     }
 
     const allowlist = value.runtime.options.env_allowlist;
     if (!Array.isArray(allowlist)) return;
-    const forbidden = new Set(["github_token", tokenMatch[1].toLowerCase()]);
+    const forbidden = new Set([credential.defaultName.toLowerCase(), tokenMatch[1].toLowerCase()]);
     const leakedIndex = allowlist.findIndex(
       (name) => typeof name === "string" && forbidden.has(name.toLowerCase()),
     );
