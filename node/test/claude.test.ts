@@ -271,6 +271,9 @@ test("current-issue tools are exact opt-ins and bind mutation targets outside mo
       "set_current_issue_state",
     ],
   );
+  assert.ok(definitions.every(({ description }) => !description.includes("GitHub")));
+  const defaultStateSchema = definitions[3]?.inputSchema.state;
+  assert.equal(defaultStateSchema?.safeParse("Human Review").success, false);
   const toolController = new AbortController();
   toolController.abort();
   const result = await definitions[3]?.handler({ state: "closed" }, { signal: toolController.signal });
@@ -280,6 +283,18 @@ test("current-issue tools are exact opt-ins and bind mutation targets outside mo
   ]);
   assert.equal(result?.isError, undefined);
   assert.deepEqual(result?.structuredContent, { identifier: "TEST-1", action: "set_state" });
+
+  const namedDefinitions = createIssueMutationTools({
+    ...context,
+    issueStateMutationMode: "named",
+  });
+  const namedStateSchema = namedDefinitions[3]?.inputSchema.state;
+  assert.equal(namedStateSchema?.safeParse(" Human Review ").success, true);
+  await namedDefinitions[3]?.handler({ state: "Human Review" }, {});
+  assert.deepEqual(mutations[1], {
+    mutation: { kind: "set_state", state: "Human Review" },
+    aborted: false,
+  });
 
   const publishResult = await createPublishChangeTools(context)[0]?.handler(
     {

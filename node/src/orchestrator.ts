@@ -1080,6 +1080,7 @@ export class Orchestrator {
         ...(hostDelivery || mutateIssue === undefined
           ? {}
           : {
+              issueStateMutationMode: entry.tracker.issueStateMutationMode ?? "open_closed",
               mutateCurrentIssue: (mutation, signal) => {
                 const retryLabel = entry.workflow.config.control?.retryLabel;
                 if (

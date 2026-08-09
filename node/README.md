@@ -16,8 +16,9 @@ Claude Code or Codex through their official SDKs.
 - CLI and tooling: Commander, Fastify for optional operational HTTP, pnpm, and Vitest
   (Vite-powered)
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
-- Trackers: in-memory issues, read-only Linear polling through the official SDK, or GitHub Issues
-  polling with manual Claude tools, host-controlled PR delivery, and operator retry labels
+- Trackers: in-memory issues, Linear polling with manual Claude tools through the official SDK, or
+  GitHub Issues polling with manual Claude tools, host-controlled PR delivery, and operator retry
+  labels
 - Operations: structured logs, an in-process runtime snapshot, and an optional locally leased
   checkpoint
 
@@ -357,6 +358,20 @@ tracker:
 agent:
   max_turns: 1
   max_attempts: 3
+runtime:
+  kind: claude
+  options:
+    allowed_tools:
+      - Read
+      - Edit
+      - Write
+      - Glob
+      - Grep
+      - mcp__symphony__comment_current_issue
+      - mcp__symphony__add_current_issue_label
+      - mcp__symphony__remove_current_issue_label
+      - mcp__symphony__set_current_issue_state
+    tools: [Read, Edit, Write, Glob, Grep]
 ```
 
 `project_slug` is required. `api_key` defaults to `$LINEAR_API_KEY`; any configured key must be an
@@ -370,11 +385,17 @@ The adapter preserves Linear state spelling, normalizes labels to lowercase, and
 terminal state and the optional assignee matches. Candidate pages drop malformed records; an ID
 refresh fails closed if a requested record is malformed. Empty state or ID lists make no request.
 
-This first Linear slice is intentionally read-only. It does not expose Linear mutation tools, host
-delivery, or retry-label control. Move an issue out of the active states through your existing Linear
-workflow when work is handed off. To keep that read-only handoff bounded, Linear workflows default to
-one turn per run and three total attempts; explicit `agent.max_turns` and `agent.max_attempts` override
-those defaults.
+The four optional Claude tools above are typed, host-side operations bound to the current Linear
+issue. Before each update Symphony refreshes the issue and verifies its identifier, project, team,
+and configured assignee. State names must uniquely match an existing state in that team; labels must
+uniquely match an existing non-group team or workspace label. The model cannot supply an issue ID,
+project, team, API endpoint, or raw GraphQL request, and the Linear API key stays out of the coding
+agent environment. Omit the tool names to keep Linear read-only. Codex does not expose these
+in-process tools, and Linear still does not support host delivery or retry-label control.
+
+Linear workflows default to one turn per run and three total attempts; explicit
+`agent.max_turns` and `agent.max_attempts` override those defaults. A manual state tool can move the
+issue out of `active_states` after a verified handoff so the current claim is released immediately.
 
 ### GitHub Issues tracker
 

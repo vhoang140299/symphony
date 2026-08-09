@@ -148,29 +148,32 @@ export function parseClaudeRuntimeOptions(options: Record<string, unknown>) {
 
 export function createIssueMutationTools(context: AgentRunContext): SdkMcpToolDefinition<any>[] {
   if (context.mutateCurrentIssue === undefined) return [];
+  const namedStates = context.issueStateMutationMode === "named";
   return [
     tool(
       "comment_current_issue",
-      "Post a concise comment to the GitHub issue bound to this Symphony run. Use it for verified progress, results, or blockers. It cannot target another issue.",
+      "Post a concise comment to the tracker issue bound to this Symphony run. Use it for verified progress, results, or blockers. It cannot target another issue.",
       { body: z.string().trim().min(1).max(65_536) },
       (input, extra) => runIssueMutation(context, { kind: "comment", body: input.body }, extra),
     ),
     tool(
       "add_current_issue_label",
-      "Add one existing label to the GitHub issue bound to this Symphony run. Use only when the workflow requires that label. It cannot target another issue.",
+      "Add one existing label to the tracker issue bound to this Symphony run. Use only when the workflow requires that label. It cannot target another issue.",
       { label: z.string().trim().min(1).max(50) },
       (input, extra) => runIssueMutation(context, { kind: "add_label", label: input.label }, extra),
     ),
     tool(
       "remove_current_issue_label",
-      "Remove one label from the GitHub issue bound to this Symphony run. Use only when the workflow requires removing that label. It cannot target another issue.",
+      "Remove one label from the tracker issue bound to this Symphony run. Use only when the workflow requires removing that label. It cannot target another issue.",
       { label: z.string().trim().min(1).max(50) },
       (input, extra) => runIssueMutation(context, { kind: "remove_label", label: input.label }, extra),
     ),
     tool(
       "set_current_issue_state",
-      "Set the GitHub issue bound to this Symphony run to open or closed. Close it only after the requested work is complete and verified. It cannot target another issue.",
-      { state: z.enum(["open", "closed"]) },
+      namedStates
+        ? "Set the tracker issue bound to this Symphony run to an existing workflow state by exact name. It cannot target another issue."
+        : "Set the tracker issue bound to this Symphony run to open or closed. Close it only after the requested work is complete and verified. It cannot target another issue.",
+      { state: namedStates ? z.string().trim().min(1).max(100) : z.enum(["open", "closed"]) },
       (input, extra) => runIssueMutation(context, { kind: "set_state", state: input.state }, extra),
     ),
   ];
