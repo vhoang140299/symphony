@@ -279,6 +279,252 @@ for (const runtimeKind of ["claude", "codex"] as const) {
   });
 }
 
+test("hands off one Linear Codex completion without exposing tracker tools", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-linear-delivery-"));
+  let current = linearIssue();
+  let modelRuns = 0;
+  const operations: string[] = [];
+  const tracker: Tracker = {
+    issueStateMutationMode: "named",
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async mutateIssue(target, mutation, signal) {
+      assert.equal(signal.aborted, false);
+      assert.equal(target.id, current.id);
+      if (mutation.kind === "comment") {
+        assert.match(
+          mutation.idempotencyKey ?? "",
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+        );
+        assert.match(mutation.body, /Implemented the Linear fix/);
+        assert.match(mutation.body, /pnpm test/);
+        operations.push("comment:uuid");
+        return;
+      }
+      if (mutation.kind === "set_state") {
+        operations.push(`state:${mutation.state}`);
+        current = { ...current, state: mutation.state };
+        return;
+      }
+      assert.fail(`Unexpected mutation ${mutation.kind}`);
+    },
+  };
+  const driver = new FakeDriver(async function* (context) {
+    modelRuns += 1;
+    assert.equal(context.completionMode, "publish_change");
+    assert.deepEqual(context.sensitiveEnvNames, ["LINEAR_API_KEY", "TRACKER_TOKEN"]);
+    assert.equal(context.publishCurrentChange, undefined);
+    assert.equal(context.mutateCurrentIssue, undefined);
+    assert.equal(context.issueStateMutationMode, undefined);
+    yield event("turn_completed", {
+      completion: {
+        status: "ready",
+        summary: "Implemented the Linear fix.",
+        verification: ["pnpm test"],
+      },
+    });
+  }, "codex");
+  const workflowPath = await writeLinearDeliveryWorkflow(directory);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(modelRuns, 1);
+  assert.deepEqual(operations, ["comment:uuid", "state:Human Review"]);
+  assert.equal(current.state, "Human Review");
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(modelRuns, 1);
+  assert.deepEqual(operations, ["comment:uuid", "state:Human Review"]);
+
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("does not write a Linear handoff for a blocked Codex completion", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-linear-blocked-"));
+  const issue = linearIssue();
+  let modelRuns = 0;
+  let writes = 0;
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(issue.state) ? [issue] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(issue.id) ? [issue] : [];
+    },
+    async mutateIssue() {
+      writes += 1;
+    },
+  };
+  const driver = new FakeDriver(async function* (context) {
+    modelRuns += 1;
+    assert.equal(context.publishCurrentChange, undefined);
+    assert.equal(context.mutateCurrentIssue, undefined);
+    yield event("turn_completed", {
+      completion: {
+        status: "blocked",
+        summary: "Needs a product decision.",
+        verification: ["pnpm test: blocked"],
+      },
+    });
+  }, "codex");
+  const workflowPath = await writeLinearDeliveryWorkflow(directory);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(modelRuns, 1);
+  assert.equal(writes, 0);
+  assert.equal(issue.state, "Todo");
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("does not overwrite a Linear issue that leaves active state after the handoff comment", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-linear-comment-refresh-"));
+  let current = linearIssue();
+  let modelRuns = 0;
+  const operations: string[] = [];
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [current] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(current.id) ? [current] : [];
+    },
+    async mutateIssue(_target, mutation) {
+      if (mutation.kind === "comment") {
+        operations.push("comment");
+        current = { ...current, state: "Paused" };
+        return;
+      }
+      if (mutation.kind === "set_state") operations.push(`state:${mutation.state}`);
+    },
+  };
+  const driver = new FakeDriver(async function* () {
+    modelRuns += 1;
+    yield event("turn_completed", {
+      completion: { status: "ready", summary: "Fixed.", verification: ["pnpm test"] },
+    });
+  }, "codex");
+  const workflowPath = await writeLinearDeliveryWorkflow(directory);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(modelRuns, 1);
+  assert.equal(current.state, "Paused");
+  assert.deepEqual(operations, ["comment"]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("retries or safely releases a Linear handoff after a lost state response", async () => {
+  const scenarios = [
+    { name: "before-commit", commitBeforeThrow: false, commentCalls: 2, stateCalls: 2 },
+    { name: "after-commit", commitBeforeThrow: true, commentCalls: 1, stateCalls: 1 },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const directory = await realpath(
+      await mkdtemp(path.join(tmpdir(), `symphony-linear-lost-state-${scenario.name}-`)),
+    );
+    let current = linearIssue();
+    let modelRuns = 0;
+    let loseStateResponse = true;
+    let stateCalls = 0;
+    const commentKeys: string[] = [];
+    const operations: string[] = [];
+    const tracker: Tracker = {
+      async fetchIssuesByStates(states) {
+        return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+      },
+      async fetchIssuesByIds(ids) {
+        return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+      },
+      async mutateIssue(_target, mutation) {
+        if (mutation.kind === "comment") {
+          const key = mutation.idempotencyKey ?? "missing";
+          commentKeys.push(key);
+          operations.push(`comment:${key}`);
+          return;
+        }
+        if (mutation.kind === "set_state") {
+          stateCalls += 1;
+          operations.push(`state:${mutation.state}`);
+          if (loseStateResponse) {
+            loseStateResponse = false;
+            if (scenario.commitBeforeThrow) current = { ...current, state: mutation.state };
+            throw new Error("simulated lost state response");
+          }
+          current = { ...current, state: mutation.state };
+          return;
+        }
+        assert.fail(`Unexpected mutation ${mutation.kind}`);
+      },
+    };
+    const driver = new FakeDriver(async function* () {
+      modelRuns += 1;
+      yield event("turn_completed", {
+        completion: { status: "ready", summary: "Fixed.", verification: ["pnpm test"] },
+      });
+    }, "codex");
+    const workflowPath = await writeLinearDeliveryWorkflow(directory, { durable: true });
+    let now = Date.UTC(2026, 0, 1);
+    const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+      tracker,
+      driver,
+      now: () => now,
+      failureBaseDelayMs: 60_000,
+    });
+
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+
+    const [commentKey] = commentKeys;
+    assert.match(
+      commentKey ?? "",
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+    );
+    assert.equal(modelRuns, 1, scenario.name);
+    assert.equal(current.state, scenario.commitBeforeThrow ? "Human Review" : "Todo", scenario.name);
+    assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 }, scenario.name);
+    const checkpoint = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as {
+      claims?: Array<{ pendingDelivery?: { idempotencyKey?: string } }>;
+    };
+    assert.equal(checkpoint.claims?.[0]?.pendingDelivery?.idempotencyKey, commentKey, scenario.name);
+
+    now += 60_000;
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+
+    assert.equal(modelRuns, 1, scenario.name);
+    assert.equal(commentKeys.length, scenario.commentCalls, scenario.name);
+    assert.ok(commentKeys.every((key) => key === commentKey), scenario.name);
+    assert.equal(stateCalls, scenario.stateCalls, scenario.name);
+    assert.equal(current.state, "Human Review", scenario.name);
+    assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 }, scenario.name);
+    const released = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as { claims?: unknown[] };
+    assert.deepEqual(released.claims, [], scenario.name);
+
+    await orchestrator.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("keeps Linear credentials host-side while retry control admits one manual run", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-linear-credentials-"));
   let issue: Issue = {
@@ -1264,6 +1510,42 @@ function githubIssue(): Issue {
     createdAt: "2025-01-01T00:00:00Z",
     updatedAt: "2025-01-01T00:00:00Z",
   };
+}
+
+function linearIssue(): Issue {
+  return {
+    ...githubIssue(),
+    id: "linear-issue-1",
+    nativeRef: null,
+    identifier: "LIN-1",
+    state: "Todo",
+    url: "https://linear.app/acme/issue/LIN-1",
+  };
+}
+
+async function writeLinearDeliveryWorkflow(
+  directory: string,
+  options: { durable?: boolean } = {},
+): Promise<string> {
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const config = {
+    tracker: {
+      kind: "linear",
+      provider: { project_slug: "project", api_key: "$TRACKER_TOKEN" },
+      required_labels: ["symphony"],
+      active_states: ["Todo"],
+      terminal_states: ["Done"],
+    },
+    delivery: { review_state: "Human Review" },
+    polling: { interval_ms: 60_000 },
+    workspace: { root: "./workspaces" },
+    hooks: { timeout_ms: 1_000 },
+    agent: { max_concurrent_agents: 1, max_turns: 1, max_attempts: 1, max_retry_backoff_ms: 1_000 },
+    runtime: { kind: "codex", turn_timeout_ms: 10_000, stall_timeout_ms: 0, options: {} },
+    ...(options.durable === true ? { state: { path: "./runs.json" } } : {}),
+  };
+  await writeFile(workflowPath, `---\n${stringifyYaml(config)}---\nWork on {{ issue.identifier }}.\n`);
+  return workflowPath;
 }
 
 async function writeDeliveryWorkflow(

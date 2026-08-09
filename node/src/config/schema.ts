@@ -84,12 +84,20 @@ const runtimeSchema = z
   })
   .prefault({});
 
-const deliverySchema = z
+const githubDeliverySchema = z
   .object({
     queue_label: githubLabel,
     review_label: githubLabel,
   })
   .strict();
+
+const linearDeliverySchema = z
+  .object({
+    review_state: z.string().trim().min(1).max(100),
+  })
+  .strict();
+
+const deliverySchema = z.union([githubDeliverySchema, linearDeliverySchema]);
 
 const controlSchema = z
   .object({
@@ -118,11 +126,25 @@ const rawWorkflowConfigSchema = z
   .passthrough()
   .superRefine((value, context) => {
     if (value.delivery === undefined && value.control === undefined) return;
-    if (value.delivery !== undefined && value.tracker.kind !== "github") {
+    const githubDelivery = value.delivery !== undefined && "queue_label" in value.delivery
+      ? value.delivery
+      : undefined;
+    const linearDelivery = value.delivery !== undefined && "review_state" in value.delivery
+      ? value.delivery
+      : undefined;
+
+    if (githubDelivery !== undefined && value.tracker.kind !== "github") {
       context.addIssue({
         code: "custom",
         path: ["delivery"],
-        message: "Configured host delivery requires the GitHub tracker",
+        message: "Configured GitHub pull-request delivery requires the GitHub tracker",
+      });
+    }
+    if (linearDelivery !== undefined && value.tracker.kind !== "linear") {
+      context.addIssue({
+        code: "custom",
+        path: ["delivery"],
+        message: "Configured Linear host handoff requires the Linear tracker",
       });
     }
     if (
@@ -146,9 +168,9 @@ const rawWorkflowConfigSchema = z
 
     const requiredLabels = value.tracker.required_labels.map((label) => label.trim().toLowerCase());
     const deliveryLabels: string[] = [];
-    if (value.delivery !== undefined) {
-      const queueLabel = value.delivery.queue_label.trim().toLowerCase();
-      const reviewLabel = value.delivery.review_label.trim().toLowerCase();
+    if (githubDelivery !== undefined) {
+      const queueLabel = githubDelivery.queue_label.trim().toLowerCase();
+      const reviewLabel = githubDelivery.review_label.trim().toLowerCase();
       deliveryLabels.push(queueLabel, reviewLabel);
       if (!requiredLabels.includes(queueLabel)) {
         context.addIssue({
@@ -162,6 +184,24 @@ const rawWorkflowConfigSchema = z
           code: "custom",
           path: ["delivery", "review_label"],
           message: "delivery.review_label must differ from every tracker.required_labels entry",
+        });
+      }
+    }
+    if (linearDelivery !== undefined && value.tracker.kind === "linear") {
+      const reviewState = linearDelivery.review_state.trim().toLowerCase();
+      const activeStates = value.tracker.active_states ?? ["Todo", "In Progress"];
+      const terminalStates = value.tracker.terminal_states ?? [
+        "Done",
+        "Closed",
+        "Cancelled",
+        "Canceled",
+        "Duplicate",
+      ];
+      if ([...activeStates, ...terminalStates].some((state) => state.trim().toLowerCase() === reviewState)) {
+        context.addIssue({
+          code: "custom",
+          path: ["delivery", "review_state"],
+          message: "delivery.review_state must differ from tracker active_states and terminal_states",
         });
       }
     }
@@ -188,6 +228,12 @@ const rawWorkflowConfigSchema = z
             defaultName: "LINEAR_API_KEY",
             missingMessage: "Linear retry control requires an explicit tracker API key environment reference",
           }
+        : value.tracker.kind === "linear" && linearDelivery !== undefined
+          ? {
+              key: "api_key",
+              defaultName: "LINEAR_API_KEY",
+              missingMessage: "Linear host handoff requires an explicit tracker API key environment reference",
+            }
         : undefined;
     if (credential === undefined) return;
 
@@ -249,10 +295,16 @@ export interface WorkflowConfig {
     stallTimeoutMs: number;
     options: Record<string, unknown>;
   };
-  delivery?: {
-    queueLabel: string;
-    reviewLabel: string;
-  };
+  delivery?:
+    | {
+        kind: "github_pr";
+        queueLabel: string;
+        reviewLabel: string;
+      }
+    | {
+        kind: "linear_handoff";
+        reviewState: string;
+      };
   control?: {
     retryLabel: string;
   };
@@ -306,10 +358,16 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
     ...(parsed.delivery === undefined
       ? {}
       : {
-          delivery: {
-            queueLabel: parsed.delivery.queue_label.trim().toLowerCase(),
-            reviewLabel: parsed.delivery.review_label.trim().toLowerCase(),
-          },
+          delivery: "review_state" in parsed.delivery
+            ? {
+                kind: "linear_handoff" as const,
+                reviewState: parsed.delivery.review_state.trim(),
+              }
+            : {
+                kind: "github_pr" as const,
+                queueLabel: parsed.delivery.queue_label.trim().toLowerCase(),
+                reviewLabel: parsed.delivery.review_label.trim().toLowerCase(),
+              },
         }),
     ...(parsed.control === undefined
       ? {}

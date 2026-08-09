@@ -476,9 +476,10 @@ export class Orchestrator {
     }
     if (
       workflow.config.delivery !== undefined &&
-      (tracker.publishIssueChange === undefined || tracker.mutateIssue === undefined)
+      (tracker.mutateIssue === undefined ||
+        (workflow.config.delivery.kind === "github_pr" && tracker.publishIssueChange === undefined))
     ) {
-      throw new Error("Configured host delivery requires tracker publishing and mutation support");
+      throw new Error("Configured host delivery requires the tracker capabilities for its delivery kind");
     }
     if (this.#workflow !== undefined) {
       if (statePath !== this.#statePath) {
@@ -1029,12 +1030,11 @@ export class Orchestrator {
         entry.pendingDelivery = pendingDelivery;
         await this.#persistState();
         try {
-          await this.#deliverCompletion(entry, pendingDelivery);
+          return await this.#deliverCompletion(entry, pendingDelivery);
         } catch (error) {
           if (entry.stopReason) return this.#outcomeForDeliveryStop(entry.stopReason, pendingDelivery);
           return { kind: "delivery_failure", error, pendingDelivery };
         }
-        return { kind: "release", summary: "Change published for human review" };
       }
       entry.continuation += 1;
     }
@@ -1191,31 +1191,59 @@ export class Orchestrator {
     try {
       const workspaceRoot = await realpath(entry.workflow.config.workspace.root);
       entry.workspacePath = path.join(workspaceRoot, workspaceKey(entry.issue.identifier));
-      await this.#deliverCompletion(entry, pendingDelivery);
-      return { kind: "release", summary: "Change published for human review" };
+      return await this.#deliverCompletion(entry, pendingDelivery);
     } catch (error) {
       if (entry.stopReason) return this.#outcomeForDeliveryStop(entry.stopReason, pendingDelivery);
       return { kind: "delivery_failure", error, pendingDelivery };
     }
   }
 
-  async #deliverCompletion(entry: RunningEntry, pendingDelivery: PendingDelivery): Promise<void> {
+  async #deliverCompletion(entry: RunningEntry, pendingDelivery: PendingDelivery): Promise<RunOutcome> {
     const { completion, idempotencyKey } = pendingDelivery;
     const delivery = requireValue(entry.workflow.config.delivery, "Host delivery is not configured");
-    const workspacePath = requireValue(entry.workspacePath, "Workspace is not initialized");
-    const publishIssueChange = entry.tracker.publishIssueChange?.bind(entry.tracker);
     const mutateIssue = entry.tracker.mutateIssue?.bind(entry.tracker);
-    if (publishIssueChange === undefined || mutateIssue === undefined) {
-      throw new Error("Configured host delivery requires tracker publishing and mutation support");
-    }
+    if (mutateIssue === undefined) throw new Error("Configured host delivery requires tracker mutation support");
 
     let stage = "workspace_validation";
     try {
+      const workspacePath = requireValue(entry.workspacePath, "Workspace is not initialized");
       const validatedPath = await this.#workspaceManager.validateForIssue(
         workspacePath,
         entry.issue,
         entry.workflow.config,
       );
+      if (delivery.kind === "linear_handoff") {
+        stage = "handoff_issue_refresh";
+        const handoffOutcome = await this.#refreshDeliveryIssue(entry);
+        if (handoffOutcome !== undefined) return handoffOutcome;
+        stage = "handoff_comment";
+        entry.controller.signal.throwIfAborted();
+        await mutateIssue(
+          entry.issue,
+          {
+            kind: "comment",
+            idempotencyKey,
+            body: linearHandoffComment(completion),
+          },
+          entry.controller.signal,
+        );
+        stage = "review_state_refresh";
+        const refreshedOutcome = await this.#refreshDeliveryIssue(entry);
+        if (refreshedOutcome !== undefined) return refreshedOutcome;
+        stage = "review_state";
+        entry.controller.signal.throwIfAborted();
+        await mutateIssue(
+          entry.issue,
+          { kind: "set_state", state: delivery.reviewState },
+          entry.controller.signal,
+        );
+        return { kind: "release", summary: "Issue handed off for human review" };
+      }
+
+      const publishIssueChange = entry.tracker.publishIssueChange?.bind(entry.tracker);
+      if (publishIssueChange === undefined) {
+        throw new Error("Configured GitHub delivery requires tracker publishing support");
+      }
       stage = "tracker_publish";
       entry.controller.signal.throwIfAborted();
       const published = await publishIssueChange(
@@ -1249,6 +1277,7 @@ export class Orchestrator {
         { kind: "remove_label", label: delivery.queueLabel },
         entry.controller.signal,
       );
+      return { kind: "release", summary: "Change published for human review" };
     } catch (error) {
       this.#logger.error(
         {
@@ -1262,6 +1291,26 @@ export class Orchestrator {
       );
       throw error;
     }
+  }
+
+  async #refreshDeliveryIssue(entry: RunningEntry): Promise<RunOutcome | undefined> {
+    const issueId = entry.issue.id;
+    const identifier = entry.issue.identifier;
+    const [refreshed] = await entry.tracker.fetchIssuesByIds([issueId]);
+    entry.controller.signal.throwIfAborted();
+    if (refreshed === undefined) {
+      return { kind: "release", summary: "Issue disappeared during host delivery" };
+    }
+    if (refreshed.id !== issueId || refreshed.identifier !== identifier) {
+      throw new Error("Tracker returned a different issue during host delivery");
+    }
+    entry.issue = refreshed;
+    const classification = classifyIssue(refreshed, entry.workflow.config);
+    if (classification === "terminal") return { kind: "terminal" };
+    if (classification !== "routable") {
+      return { kind: "release", summary: `Issue became ${classification} during host delivery` };
+    }
+    return undefined;
   }
 
   #addUsage(entry: RunningEntry, current: AgentUsage): void {
@@ -1514,6 +1563,11 @@ function handoffComment(pullRequestUrl: string, completion: AgentCompletion): st
   return `Pull request ready for human review: ${pullRequestUrl}\n\n${completion.summary}\n\nVerification:\n${verification}`;
 }
 
+function linearHandoffComment(completion: AgentCompletion): string {
+  const verification = completion.verification.map((item) => `- ${item}`).join("\n");
+  return `Ready for human review.\n\n${completion.summary}\n\nVerification:\n${verification}`;
+}
+
 function truncate(value: string, maxLength: number): string {
   const trimmed = value.trim();
   return trimmed.length <= maxLength ? trimmed : trimmed.slice(0, maxLength).trimEnd();
@@ -1539,10 +1593,11 @@ function trackerCredentialNames(config: WorkflowConfig): string[] {
 export { workflowScopeHash } from "./state/scope.js";
 
 function requireRecoveryDelivery(workflow: WorkflowDefinition, tracker: Tracker): void {
+  const delivery = workflow.config.delivery;
   if (
-    workflow.config.delivery === undefined ||
-    tracker.publishIssueChange === undefined ||
-    tracker.mutateIssue === undefined
+    delivery === undefined ||
+    tracker.mutateIssue === undefined ||
+    (delivery.kind === "github_pr" && tracker.publishIssueChange === undefined)
   ) {
     throw new Error("Persisted pending delivery requires configured host delivery support");
   }
