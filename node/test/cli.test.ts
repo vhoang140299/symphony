@@ -1,19 +1,22 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { test } from "vitest";
+import { loadWorkflow } from "../src/config/workflow.js";
+import type { Issue } from "../src/domain.js";
+import { summarizePreflight } from "../src/preflight.js";
 
 const execFileAsync = promisify(execFile);
-const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
-const exampleWorkflowPath = fileURLToPath(new URL("../../WORKFLOW.md", import.meta.url));
+const cliPath = fileURLToPath(new URL("../dist/src/cli.js", import.meta.url));
+const exampleWorkflowPath = fileURLToPath(new URL("../WORKFLOW.md", import.meta.url));
 
 test("CLI prints help and exits successfully", async () => {
   const result = await execFileAsync(process.execPath, [cliPath, "--help"]);
-  assert.match(result.stdout, /Usage: symphony-node \[--once\]/);
+  assert.match(result.stdout, /Usage: symphony-node \[--once \| --preflight\] \[WORKFLOW\]/);
   assert.equal(result.stderr, "");
 });
 
@@ -36,6 +39,179 @@ test("CLI --once polls once, prints a compact snapshot, and exits successfully w
     },
   });
   assert.equal(result.stderr, "");
+});
+
+test("CLI --preflight reports only sorted eligible issues without running hooks or an agent", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-preflight-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const workspaceRoot = path.join(directory, "workspaces");
+  const hookMarker = path.join(directory, "hook-ran");
+  await writeFile(
+    workflowPath,
+    `---
+tracker:
+  kind: memory
+  provider:
+    issues:
+      - id: later
+        identifier: LATER-1
+        title: Lower priority candidate
+        state: Todo
+        priority: 2
+        labels: [symphony]
+        dispatchable: true
+        created_at: 2025-01-01T00:00:00Z
+      - id: first
+        identifier: FIRST-1
+        title: Higher priority candidate
+        state: Todo
+        priority: 1
+        labels: [symphony]
+        dispatchable: true
+        created_at: 2025-02-01T00:00:00Z
+      - id: unlabeled
+        identifier: UNLABELED-1
+        title: Missing routing label
+        state: Todo
+        priority: 1
+        labels: []
+        dispatchable: true
+      - id: disabled
+        identifier: DISABLED-1
+        title: Explicitly disabled
+        state: Todo
+        priority: 1
+        labels: [symphony]
+        dispatchable: false
+      - id: terminal
+        identifier: TERMINAL-1
+        title: Already done
+        state: Done
+        priority: 1
+        labels: [symphony]
+        dispatchable: true
+  required_labels: [symphony]
+  active_states: [Todo]
+  terminal_states: [Done]
+workspace:
+  root: ${JSON.stringify(workspaceRoot)}
+hooks:
+  after_create: printf x > ${JSON.stringify(hookMarker)}
+  before_run: printf x > ${JSON.stringify(hookMarker)}
+runtime:
+  kind: codex
+  options:
+    codex_home: relative-and-invalid
+---
+This prompt must never reach an agent.
+`,
+  );
+
+  try {
+    const result = await execFileAsync(process.execPath, [cliPath, "--preflight", workflowPath], {
+      env: { ...process.env, LOG_LEVEL: "silent" },
+    });
+
+    assert.equal(result.stdout.trim().split("\n").length, 1);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      tracker: "memory",
+      runtime: "codex",
+      delivery: false,
+      control: false,
+      fetched: 4,
+      eligible: [
+        { id: "first", identifier: "FIRST-1", state: "Todo" },
+        { id: "later", identifier: "LATER-1", state: "Todo" },
+      ],
+    });
+    assert.equal(result.stderr, "");
+    await assert.rejects(access(hookMarker));
+    await assert.rejects(access(workspaceRoot));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("preflight deduplicates tracker results before exposing eligible issue fields", async () => {
+  const workflow = await loadWorkflow(exampleWorkflowPath);
+  const first: Issue = {
+    id: "duplicate",
+    nativeRef: null,
+    identifier: "DUPLICATE-1",
+    title: "First copy",
+    description: null,
+    priority: 1,
+    state: "Todo",
+    branchName: null,
+    url: null,
+    assigneeId: null,
+    labels: ["symphony"],
+    blockedBy: [],
+    dispatchable: true,
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: null,
+  };
+  const result = summarizePreflight(workflow, [first, { ...first, identifier: "DUPLICATE-2" }]);
+
+  assert.equal(result.fetched, 2);
+  assert.deepEqual(result.eligible, [{ id: "duplicate", identifier: "DUPLICATE-2", state: "Todo" }]);
+});
+
+test("CLI rejects mutually exclusive execution modes before loading the workflow", async () => {
+  await assert.rejects(
+    execFileAsync(process.execPath, [cliPath, "--once", "--preflight", exampleWorkflowPath]),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.ok("stdout" in error);
+      assert.ok("stderr" in error);
+      assert.equal(String(error.stdout), "");
+      assert.match(String(error.stderr), /cannot be used with option/);
+      return true;
+    },
+  );
+});
+
+test("CLI --preflight exits nonzero on configuration and tracker errors", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-preflight-errors-"));
+  const invalidConfigPath = path.join(directory, "invalid-WORKFLOW.md");
+  const invalidTrackerPath = path.join(directory, "duplicate-WORKFLOW.md");
+  await writeFile(invalidConfigPath, "---\ntracker: {}\n---\nInvalid.\n");
+  await writeFile(
+    invalidTrackerPath,
+    `---
+tracker:
+  kind: memory
+  provider:
+    issues:
+      - { id: duplicate, identifier: DUP-1, title: First, state: Todo }
+      - { id: duplicate, identifier: DUP-2, title: Second, state: Todo }
+  active_states: [Todo]
+  terminal_states: [Done]
+---
+Duplicate.
+`,
+  );
+
+  try {
+    for (const [workflowPath, expected] of [
+      [invalidConfigPath, /tracker[\s\S]*kind/],
+      [invalidTrackerPath, /Duplicate memory issue id/],
+    ] as const) {
+      await assert.rejects(
+        execFileAsync(process.execPath, [cliPath, "--preflight", workflowPath]),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok("stdout" in error);
+          assert.ok("stderr" in error);
+          assert.equal(String(error.stdout), "");
+          assert.match(String(error.stderr), expected);
+          return true;
+        },
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("CLI --once exits nonzero and preserves retry state in its final snapshot", async () => {

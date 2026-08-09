@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 import { MemoryTracker } from "../src/trackers/memory.js";
 
 function rawIssue(id: string, identifier: string = id, labels: string[] = []) {

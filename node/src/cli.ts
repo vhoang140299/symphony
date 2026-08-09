@@ -1,23 +1,20 @@
 #!/usr/bin/env node
 
 import path from "node:path";
+import { Command, Option } from "commander";
 import { WorkflowStore } from "./config/store.js";
 import { createLogger } from "./log.js";
 import { Orchestrator } from "./orchestrator.js";
+import { runPreflight } from "./preflight.js";
 
 async function main(args: string[]): Promise<void> {
-  const usage = "Usage: symphony-node [--once] [path-to-WORKFLOW.md]";
-  if (args.includes("--help") || args.includes("-h")) {
-    process.stdout.write(`${usage}\n`);
+  const parsed = parseArguments(args);
+  if (parsed === undefined) return;
+  const { once, preflight, workflowPath } = parsed;
+  if (preflight) {
+    process.stdout.write(`${JSON.stringify(await runPreflight(workflowPath))}\n`);
     return;
   }
-  const once = args[0] === "--once";
-  const positionalArgs = once ? args.slice(1) : args;
-  if (positionalArgs.length > 1 || positionalArgs[0]?.startsWith("-")) {
-    throw new Error(usage);
-  }
-
-  const workflowPath = path.resolve(positionalArgs[0] ?? "WORKFLOW.md");
   const logger = createLogger(undefined, once ? process.stderr : undefined);
   const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger);
   if (once) {
@@ -69,6 +66,32 @@ async function main(args: string[]): Promise<void> {
   const signal = await waitForShutdownSignal();
   logger.info({ signal }, "Shutdown requested");
   await orchestrator.stop();
+}
+
+function parseArguments(args: string[]):
+  | { once: boolean; preflight: boolean; workflowPath: string }
+  | undefined {
+  const command = new Command()
+    .name("symphony-node")
+    .usage("[--once | --preflight] [WORKFLOW]")
+    .argument("[WORKFLOW]", "workflow file", "WORKFLOW.md")
+    .addOption(new Option("--once", "poll once and exit").conflicts("preflight"))
+    .addOption(new Option("--preflight", "validate and inspect eligible issues without running agents").conflicts("once"))
+    .allowExcessArguments(false)
+    .configureOutput({ writeErr: () => undefined })
+    .exitOverride();
+  try {
+    command.parse(args, { from: "user" });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "commander.helpDisplayed") return undefined;
+    throw error;
+  }
+  const options = command.opts<{ once?: boolean; preflight?: boolean }>();
+  return {
+    once: options.once ?? false,
+    preflight: options.preflight ?? false,
+    workflowPath: path.resolve(String(command.processedArgs[0])),
+  };
 }
 
 function waitForShutdownSignal(): Promise<NodeJS.Signals> {

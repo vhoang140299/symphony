@@ -4,7 +4,7 @@ import { accessSync, constants as fsConstants, realpathSync } from "node:fs";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test, { type TestContext } from "node:test";
+import { describe, onTestFinished, test } from "vitest";
 import {
   publishGitBranch,
   type PublishGitBranchOptions,
@@ -16,8 +16,8 @@ interface Fixture {
   workspacePath: string;
 }
 
-test("publishes a fixed branch, skips hooks, and reruns without an empty commit", async (t) => {
-  const fixture = await createFixture(t);
+test("publishes a fixed branch, skips hooks, and reruns without an empty commit", async () => {
+  const fixture = await createFixture();
   const hookPath = path.join(fixture.workspacePath, ".git", "hooks", "pre-commit");
   await writeFile(hookPath, "#!/bin/sh\ntouch .hook-ran\nexit 91\n", { mode: 0o700 });
   await chmod(hookPath, 0o700);
@@ -41,8 +41,8 @@ test("publishes a fixed branch, skips hooks, and reruns without an empty commit"
   assert.equal(git(fixture.workspacePath, ["status", "--porcelain"]), "");
 });
 
-test("rejects an origin bound to another repository before committing", async (t) => {
-  const fixture = await createFixture(t);
+test("rejects an origin bound to another repository before committing", async () => {
+  const fixture = await createFixture();
   await writeFile(path.join(fixture.workspacePath, "unpublished.txt"), "do not publish\n");
   git(fixture.workspacePath, ["remote", "set-url", "origin", "git@git.example.test:other/widget.git"]);
 
@@ -51,8 +51,8 @@ test("rejects an origin bound to another repository before committing", async (t
   assert.notEqual(gitBareStatus(fixture.remotePath, ["show-ref", "--verify", "refs/heads/symphony/issue-7"]), 0);
 });
 
-test("rejects a publish with no commits ahead of the base branch", async (t) => {
-  const fixture = await createFixture(t);
+test("rejects a publish with no commits ahead of the base branch", async () => {
+  const fixture = await createFixture();
 
   await assert.rejects(
     publishGitBranch(optionsFor(fixture)),
@@ -61,8 +61,8 @@ test("rejects a publish with no commits ahead of the base branch", async (t) => 
   assert.notEqual(gitBareStatus(fixture.remotePath, ["show-ref", "--verify", "refs/heads/symphony/issue-7"]), 0);
 });
 
-test("rejects an existing publish branch with unrelated history", async (t) => {
-  const fixture = await createFixture(t);
+test("rejects an existing publish branch with unrelated history", async () => {
+  const fixture = await createFixture();
   git(fixture.workspacePath, ["switch", "--orphan", "symphony/issue-7"]);
   await writeFile(path.join(fixture.workspacePath, "unrelated.txt"), "unrelated\n");
   git(fixture.workspacePath, ["add", "unrelated.txt"]);
@@ -85,8 +85,8 @@ test("rejects an existing publish branch with unrelated history", async (t) => {
   assert.notEqual(gitBareStatus(fixture.remotePath, ["show-ref", "--verify", "refs/heads/symphony/issue-7"]), 0);
 });
 
-test("rejects executable clean filters before git add can run them", async (t) => {
-  const fixture = await createFixture(t);
+test("rejects executable clean filters before git add can run them", async () => {
+  const fixture = await createFixture();
   git(fixture.workspacePath, ["config", "--local", "filter.evil.clean", "touch filter-ran"]);
   await writeFile(path.join(fixture.workspacePath, ".gitattributes"), "*.txt filter=evil\n");
   await writeFile(path.join(fixture.workspacePath, "payload.txt"), "payload\n");
@@ -98,8 +98,8 @@ test("rejects executable clean filters before git add can run them", async (t) =
   await assert.rejects(access(path.join(fixture.workspacePath, "filter-ran")), isMissing);
 });
 
-test("does not execute a Git binary planted in the workspace", async (t) => {
-  const fixture = await createFixture(t);
+test("does not execute a Git binary planted in the workspace", async () => {
+  const fixture = await createFixture();
   const plantedGit = path.join(fixture.workspacePath, "git");
   const plantedMarker = path.join(fixture.workspacePath, "planted-git-ran");
   await writeFile(plantedGit, `#!/bin/sh\ntouch '${plantedMarker}'\nexit 99\n`, { mode: 0o700 });
@@ -116,9 +116,9 @@ test("does not execute a Git binary planted in the workspace", async (t) => {
   }
 });
 
-test("rejects repository-local URL rewrites and HTTP settings", async (t) => {
-  await t.test("URL rewrite", async (t) => {
-    const fixture = await createFixture(t);
+describe("rejects repository-local URL rewrites and HTTP settings", () => {
+  test("URL rewrite", async () => {
+    const fixture = await createFixture();
     git(fixture.workspacePath, [
       "config",
       "--local",
@@ -131,8 +131,8 @@ test("rejects repository-local URL rewrites and HTTP settings", async (t) => {
     );
   });
 
-  await t.test("HTTP proxy", async (t) => {
-    const fixture = await createFixture(t);
+  test("HTTP proxy", async () => {
+    const fixture = await createFixture();
     git(fixture.workspacePath, ["config", "--local", "http.proxy", "https://evil.example"]);
     await assert.rejects(
       publishGitBranch(optionsFor(fixture)),
@@ -141,14 +141,14 @@ test("rejects repository-local URL rewrites and HTTP settings", async (t) => {
   });
 });
 
-test("requires a Symphony ownership marker", async (t) => {
-  const fixture = await createFixture(t);
+test("requires a Symphony ownership marker", async () => {
+  const fixture = await createFixture();
   await rm(path.join(fixture.workspacePath, ".git", ".symphony-workspace.json"));
   await assert.rejects(publishGitBranch(optionsFor(fixture)), /Git workspace ownership marker is missing/u);
 });
 
-test("requires the ownership marker to match the bound issue", async (t) => {
-  const fixture = await createFixture(t);
+test("requires the ownership marker to match the bound issue", async () => {
+  const fixture = await createFixture();
   await writeFile(
     path.join(fixture.workspacePath, ".git", ".symphony-workspace.json"),
     `${JSON.stringify({ issueId: "8", issueIdentifier: "acme/widget#8" })}\n`,
@@ -179,8 +179,8 @@ test("honors a pre-aborted publish signal", async () => {
 test(
   "abort terminates the Git process group and its token-bearing descendant",
   { skip: process.platform === "win32" },
-  async (t) => {
-    const fixture = await createFixture(t);
+  async () => {
+    const fixture = await createFixture();
     const wrapperDirectory = path.join(fixture.root, "bin");
     const pidPath = path.join(fixture.root, "descendant.pid");
     await mkdir(wrapperDirectory);
@@ -226,9 +226,9 @@ exec ${shellQuote(hostGitExecutable())} "$@"
   },
 );
 
-async function createFixture(t: TestContext): Promise<Fixture> {
+async function createFixture(): Promise<Fixture> {
   const root = await mkdtemp(path.join(tmpdir(), "symphony-git-publisher-"));
-  t.after(async () => rm(root, { recursive: true, force: true }));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
   const remotePath = path.join(root, "remote.git");
   const seedPath = path.join(root, "seed");
   const workspacePath = path.join(root, "workspace");

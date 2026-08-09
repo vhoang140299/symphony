@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { onTestFinished, test } from "vitest";
 import type { WorkflowConfig } from "../src/config/schema.js";
 import type { Issue } from "../src/domain.js";
 import { createLogger } from "../src/log.js";
@@ -49,9 +49,9 @@ function workflow(root: string, hooks: Partial<WorkflowConfig["hooks"]> = {}): W
   };
 }
 
-async function tempRoot(t: test.TestContext): Promise<string> {
+async function tempRoot(): Promise<string> {
   const root = await mkdtemp(path.join(tmpdir(), "symphony-node-workspace-"));
-  t.after(async () => rm(root, { recursive: true, force: true }));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
   return root;
 }
 
@@ -68,8 +68,8 @@ test("workspace keys preserve safe identifiers and hash changed identifiers", ()
   assert.match(workspaceKey("APP/123"), /^[A-Za-z0-9._-]+$/);
 });
 
-test("creates, reuses, and removes workspaces with lifecycle hook semantics", async (t) => {
-  const root = await tempRoot(t);
+test("creates, reuses, and removes workspaces with lifecycle hook semantics", async () => {
+  const root = await tempRoot();
   const marker = path.join(root, "hooks.log");
   const target = shellQuote(marker);
   const config = workflow(root, {
@@ -101,8 +101,8 @@ test("creates, reuses, and removes workspaces with lifecycle hook semantics", as
   await assert.rejects(access(created.path));
 });
 
-test("creates private roots, leaves the clone target empty, and stores the marker in .git", async (t) => {
-  const parent = await tempRoot(t);
+test("creates private roots, leaves the clone target empty, and stores the marker in .git", async () => {
+  const parent = await tempRoot();
   const root = path.join(parent, "new-root");
   const manager = new WorkspaceManager(createLogger("silent"));
   const config = workflow(root, { afterCreate: 'test -z "$(ls -A)"; mkdir .git' });
@@ -118,8 +118,8 @@ test("creates private roots, leaves the clone target empty, and stores the marke
   assert.equal((await manager.createForIssue(issue, config)).createdNow, false);
 });
 
-test("cleans a new workspace when after_create fails", async (t) => {
-  const root = await tempRoot(t);
+test("cleans a new workspace when after_create fails", async () => {
+  const root = await tempRoot();
   const manager = new WorkspaceManager(createLogger("silent"));
   const config = workflow(root, { afterCreate: "exit 42" });
   const expectedPath = path.join(root, workspaceKey(issue.identifier));
@@ -128,8 +128,8 @@ test("cleans a new workspace when after_create fails", async (t) => {
   await assert.rejects(lstat(expectedPath), (error: unknown) => isErrno(error, "ENOENT"));
 });
 
-test("rejects files, symlinks, and mismatched run paths", async (t) => {
-  const root = await tempRoot(t);
+test("rejects files, symlinks, and mismatched run paths", async () => {
+  const root = await tempRoot();
   const manager = new WorkspaceManager(createLogger("silent"));
   const config = workflow(root);
   const expectedPath = path.join(root, workspaceKey(issue.identifier));
@@ -138,7 +138,7 @@ test("rejects files, symlinks, and mismatched run paths", async (t) => {
   await assert.rejects(manager.createForIssue(issue, config), /not a directory/);
   await rm(expectedPath);
 
-  const outside = await tempRoot(t);
+  const outside = await tempRoot();
   await symlink(outside, expectedPath, "dir");
   await assert.rejects(manager.createForIssue(issue, config), /symbolic link/);
   await assert.rejects(manager.removeForIssue(issue, config), /symbolic link/);
@@ -153,9 +153,9 @@ test("rejects files, symlinks, and mismatched run paths", async (t) => {
   await assert.rejects(manager.beforeRun(created.path, issue, config), /symbolic link/);
 });
 
-test("rejects symlinked or writable roots and insecure workspace leaves", async (t) => {
-  const container = await tempRoot(t);
-  const actualRoot = await tempRoot(t);
+test("rejects symlinked or writable roots and insecure workspace leaves", async () => {
+  const container = await tempRoot();
+  const actualRoot = await tempRoot();
   const rootLink = path.join(container, "root-link");
   const manager = new WorkspaceManager(createLogger("silent"));
 
@@ -174,8 +174,8 @@ test("rejects symlinked or writable roots and insecure workspace leaves", async 
   await chmod(created.path, 0o700);
 });
 
-test("never adopts or removes a pre-existing workspace without a matching marker", async (t) => {
-  const root = await tempRoot(t);
+test("never adopts or removes a pre-existing workspace without a matching marker", async () => {
+  const root = await tempRoot();
   const workspacePath = path.join(root, workspaceKey(issue.identifier));
   const sentinel = path.join(workspacePath, "keep.txt");
   const manager = new WorkspaceManager(createLogger("silent"));
@@ -197,8 +197,8 @@ test("never adopts or removes a pre-existing workspace without a matching marker
   assert.equal(await readFile(sentinel, "utf8"), "keep");
 });
 
-test("requires its marker around hooks and revalidates after after_create", async (t) => {
-  const root = await tempRoot(t);
+test("requires its marker around hooks and revalidates after after_create", async () => {
+  const root = await tempRoot();
   const hookLog = path.join(root, "hook.log");
   const manager = new WorkspaceManager(createLogger("silent"));
   const config = workflow(root, {
@@ -223,9 +223,9 @@ test("requires its marker around hooks and revalidates after after_create", asyn
   await assert.rejects(lstat(unsafePath), (error: unknown) => isErrno(error, "ENOENT"));
 });
 
-test("hook timeout escalates to the detached process group", async (t) => {
+test("hook timeout escalates to the detached process group", async () => {
   if (process.platform === "win32") return;
-  const root = await tempRoot(t);
+  const root = await tempRoot();
   const leaderFile = path.join(root, "leader.pid");
   const manager = new WorkspaceManager(createLogger("silent"));
   const config = workflow(root, {
@@ -243,9 +243,9 @@ test("hook timeout escalates to the detached process group", async (t) => {
   await waitForProcessGroupExit(leaderPid);
 });
 
-test("hook timeout stays bounded when a detached descendant keeps stderr open", async (t) => {
+test("hook timeout stays bounded when a detached descendant keeps stderr open", async () => {
   if (process.platform === "win32") return;
-  const root = await tempRoot(t);
+  const root = await tempRoot();
   const escapedPidFile = path.join(root, "escaped.pid");
   const manager = new WorkspaceManager(createLogger("silent"));
   const escapedProgram = "setInterval(() => {}, 30_000)";
