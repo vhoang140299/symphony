@@ -18,7 +18,7 @@ Claude Code or Codex through their official SDKs.
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
 - Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools, host-controlled PR
   delivery, and operator retry labels
-- Operations: structured logs, an in-process runtime snapshot, and an optional single-process
+- Operations: structured logs, an in-process runtime snapshot, and an optional locally leased
   checkpoint
 
 The in-memory tracker is for development and smoke tests. It does not persist state, synchronize
@@ -273,20 +273,27 @@ Omitting `state` preserves the current ephemeral behavior. `state.path` supports
 outside `workspace.root` or name a direct file child of it; it cannot equal the root or sit deeper
 inside an issue workspace. The checked-in workflow profiles intentionally leave checkpointing off.
 
-This is a single-process POSIX preview, not a database or durable work queue. Symphony writes one
-atomic JSON checkpoint with mode `0600` inside a private `0700` directory. It persists retry budgets,
-ordinary scheduled retries, blocked claims, and pending host delivery. After restart, an ordinary
-retry resumes on schedule, a pending delivery resumes host-only without another model call, and an
-agent run dispatched before the crash becomes blocked for manual retry. It does store bounded
-blocked summaries plus pending-delivery summary and verification text; these fields are
-agent-generated and can quote issue or repository content, so treat the checkpoint as sensitive
-despite mode `0600`. The checkpoint never stores tracker credentials, model tokens, rendered
-prompts, raw provider events, or agent sessions.
+This is a same-host POSIX preview, not a database or durable work queue. Symphony writes one atomic
+JSON checkpoint with mode `0600` inside a private `0700` directory. Configuring `state.path` also
+enforces one active Symphony process per checkpoint through an append-only lease chain under
+`${state.path}.lease`. A clean stop appends a release marker; after a crash, a successor
+automatically takes the lease once the recorded PID is dead. It persists retry budgets, ordinary
+scheduled retries, blocked claims, and pending host delivery. After restart, an ordinary retry
+resumes on schedule, a pending delivery resumes host-only without another model call, and an agent
+run dispatched before the crash becomes blocked for manual retry. It does store bounded blocked
+summaries plus pending-delivery summary and verification text; these fields are agent-generated and
+can quote issue or repository content, so treat the checkpoint as sensitive despite mode `0600`.
+The checkpoint never stores tracker credentials, model tokens, rendered prompts, raw provider
+events, or agent sessions.
 
-A corrupt checkpoint, tracker/workflow scope mismatch, or unsafe ownership or permissions fails
-startup rather than silently dispatching work. `state.path` cannot be changed by workflow hot reload;
-restart Symphony to change it. Do not share one checkpoint between processes or run multiple
-Symphony processes against it.
+A corrupt checkpoint, tracker/workflow scope mismatch, an active lease, or unsafe ownership or
+permissions fails startup rather than silently dispatching work. `state.path` cannot be changed by
+workflow hot reload; restart Symphony to change it. Lease ownership is local coordination and is
+valid only when contenders share the same host identity and PID namespace; it is not a multi-host,
+cross-container, or network-filesystem lock. The append-only lease chain is capped at 1,024 owners
+and is not compacted online. To reset it, first stop every process using that checkpoint, then remove
+only the exact `${state.path}.lease` directory; never reset a live lease. Without `state.path`, no
+lease exists and multiple Symphony processes remain uncoordinated.
 
 ### Codex runtime
 

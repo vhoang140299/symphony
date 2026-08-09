@@ -107,6 +107,15 @@ posixTest("does not retain a fatal signal after a repaired checkpoint initializa
   assert.equal(orchestrator.isReady(), false);
 
   await rm(statePath);
+  const replacement = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker(),
+    driver: driverFrom(async function* () {
+      yield event("turn_failed");
+    }),
+  });
+  await replacement.initialize();
+  await replacement.stop();
+
   await orchestrator.start();
   assert.equal(orchestrator.isReady(), true);
   assert.equal(driverRuns, 0);
@@ -121,6 +130,83 @@ posixTest("does not retain a fatal signal after a repaired checkpoint initializa
   await orchestrator.stop();
 });
 
+posixTest("holds one durable state lease until clean shutdown", async () => {
+  const root = await fixture("symphony-recovery-exclusive-lease-");
+  const workflowPath = await writeMemoryWorkflow(root, []);
+  const first = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker(),
+    driver: driverFrom(async function* () {
+      assert.fail("the driver must not run during initialization");
+    }),
+  });
+  await first.initialize();
+
+  let trackerCalls = 0;
+  let driverCalls = 0;
+  const second = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: {
+      async fetchIssuesByStates() {
+        trackerCalls += 1;
+        return [];
+      },
+      async fetchIssuesByIds() {
+        trackerCalls += 1;
+        return [];
+      },
+    },
+    driver: driverFrom(async function* () {
+      driverCalls += 1;
+      yield event("turn_failed");
+    }),
+  });
+
+  await assert.rejects(second.initialize(), /lease/i);
+  assert.equal(trackerCalls, 0);
+  assert.equal(driverCalls, 0);
+  await assert.rejects(access(path.join(root, "workspaces")), isMissing);
+
+  await Promise.all([first.stop(), first.stop()]);
+  await second.initialize();
+  assert.equal(trackerCalls, 1);
+  assert.equal(driverCalls, 0);
+  await second.stop();
+});
+
+posixTest("does not acquire a durable state lease from a poll after shutdown", async () => {
+  const root = await fixture("symphony-recovery-stopped-poll-");
+  const workflowPath = await writeMemoryWorkflow(root, []);
+  let trackerCalls = 0;
+  const stopped = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: {
+      async fetchIssuesByStates() {
+        trackerCalls += 1;
+        return [];
+      },
+      async fetchIssuesByIds() {
+        trackerCalls += 1;
+        return [];
+      },
+    },
+    driver: driverFrom(async function* () {
+      assert.fail("the driver must not run after shutdown");
+    }),
+  });
+
+  const stopping = stopped.stop();
+  await stopped.pollOnce();
+  await stopping;
+  assert.equal(trackerCalls, 0);
+
+  const next = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker(),
+    driver: driverFrom(async function* () {
+      yield event("turn_failed");
+    }),
+  });
+  await next.initialize();
+  await next.stop();
+});
+
 posixTest("restores interrupted and exhausted model work as durable blocked claims", async () => {
   const root = await fixture("symphony-recovery-blocked-");
   const issues = [
@@ -129,7 +215,7 @@ posixTest("restores interrupted and exhausted model work as durable blocked clai
   ];
   const workflowPath = await writeMemoryWorkflow(root, issues, { maxAttempts: 2 });
   const { workflowStore, store } = await durableStore(workflowPath);
-  await store.save([
+  await seedState(store, [
     { kind: "running", issueId: "crashed", attempt: 1, continuation: 0 },
     {
       kind: "blocked",
@@ -182,7 +268,7 @@ posixTest("restores an already-admitted manual retry even when its attempt is at
   const issue = rawIssue("manual", "MANUAL-1");
   const workflowPath = await writeMemoryWorkflow(root, [issue], { maxAttempts: 2 });
   const { workflowStore, store } = await durableStore(workflowPath);
-  await store.save([
+  await seedState(store, [
     {
       kind: "retrying",
       issueId: issue.id,
@@ -218,7 +304,7 @@ posixTest("retries recovery from the beginning after a transient later-claim ref
   const issues = await memory.fetchIssuesByIds(["first", "second"]);
   const workflowPath = await writeMemoryWorkflow(root, rawIssues);
   const { workflowStore, store } = await durableStore(workflowPath);
-  await store.save([
+  await seedState(store, [
     { kind: "running", issueId: "first", attempt: null, continuation: 0 },
     {
       kind: "blocked",
@@ -358,7 +444,7 @@ posixTest("does not create a workspace or invoke the model for an undeliverable 
   const issue = githubIssue();
   const workflowPath = await writeGithubWorkflow(root);
   const { workflowStore, definition, store } = await durableStore(workflowPath);
-  await store.save([
+  await seedState(store, [
     {
       kind: "running",
       issueId: issue.id,
@@ -410,7 +496,7 @@ posixTest("fails recovery when a persisted delivery no longer has host-delivery 
   const issue = githubIssue();
   const workflowPath = await writeGithubWorkflow(root);
   const { store } = await durableStore(workflowPath);
-  await store.save([
+  await seedState(store, [
     {
       kind: "running",
       issueId: issue.id,
@@ -456,7 +542,7 @@ posixTest("prunes terminal and unroutable persisted claims before scheduling", a
   const issues = [terminal, unroutable];
   const workflowPath = await writeMemoryWorkflow(root, issues);
   const { workflowStore, store } = await durableStore(workflowPath);
-  await store.save([
+  await seedState(store, [
     { kind: "running", issueId: terminal.id, attempt: null, continuation: 0 },
     {
       kind: "blocked",
@@ -500,7 +586,7 @@ posixTest("freezes state writes after the final shutdown checkpoint", async () =
     blockedAtMs: 1,
     summary: "operator input required",
   };
-  await store.save([persisted]);
+  await seedState(store, [persisted]);
 
   const refreshStarted = deferred<void>();
   const refreshResult = deferred<Issue[]>();
@@ -528,10 +614,19 @@ posixTest("freezes state writes after the final shutdown checkpoint", async () =
   const poll = orchestrator.pollOnce();
   await refreshStarted.promise;
   await orchestrator.stop();
+  const contender = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: memory,
+    driver: driverFrom(async function* () {
+      assert.fail("the driver must not run while shutdown retains the lease");
+    }),
+  });
+  await assert.rejects(contender.initialize(), /lease/i);
   refreshResult.resolve([]);
   await poll;
+  await initializeEventually(contender);
 
   assert.deepEqual(await store.load(), [persisted]);
+  await contender.stop();
 });
 
 posixTest("does not overwrite durable claims when shutdown times out during recovery", async () => {
@@ -550,7 +645,7 @@ posixTest("does not overwrite durable claims when shutdown times out during reco
     blockedAtMs: 1,
     summary: "operator input required",
   };
-  await store.save([persisted]);
+  await seedState(store, [persisted]);
   const refreshStarted = deferred<void>();
   const refreshResult = deferred<Issue[]>();
   const tracker: Tracker = {
@@ -576,11 +671,20 @@ posixTest("does not overwrite durable claims when shutdown times out during reco
   await refreshStarted.promise;
   await orchestrator.stop();
   assert.deepEqual(await store.load(), [persisted]);
+  const contender = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: memory,
+    driver: driverFrom(async function* () {
+      assert.fail("the driver must not run while recovery retains the lease");
+    }),
+  });
+  await assert.rejects(contender.initialize(), /lease/i);
   refreshResult.resolve([issue]);
   await assert.rejects(starting, /stopped orchestrator/);
+  await initializeEventually(contender);
 
   assert.equal(modelCalls, 0);
   assert.deepEqual(await store.load(), [persisted]);
+  await contender.stop();
 });
 
 posixTest("binds durable memory state to stable issue identities", async () => {
@@ -607,6 +711,15 @@ async function durableStore(workflowPath: string): Promise<{
     definition,
     store: new RunStateStore(statePath, workflowScopeHash(definition)),
   };
+}
+
+async function seedState(store: RunStateStore, claims: readonly PersistedClaim[]): Promise<void> {
+  await store.acquireLease();
+  try {
+    await store.save(claims);
+  } finally {
+    await store.releaseLease();
+  }
 }
 
 async function writeMemoryWorkflow(
@@ -717,6 +830,21 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<
     resolve = innerResolve;
   });
   return { promise, resolve };
+}
+
+async function initializeEventually(orchestrator: Orchestrator): Promise<void> {
+  let leaseError: unknown;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await orchestrator.initialize();
+      return;
+    } catch (error) {
+      if (!(error instanceof Error) || !/lease/iu.test(error.message)) throw error;
+      leaseError = error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  throw leaseError;
 }
 
 function isMissing(error: unknown): boolean {

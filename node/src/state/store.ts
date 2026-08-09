@@ -4,6 +4,7 @@ import { lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { agentCompletionSchema } from "../completion.js";
+import { RunStateLease } from "./lease.js";
 
 const MAX_FILE_BYTES = 1024 * 1024;
 const REQUIRED_DIRECTORY_MODE = 0o700;
@@ -69,7 +70,8 @@ export class RunStateStore {
   readonly #filePath: string;
   readonly #directory: string;
   readonly #scopeHash: string;
-  #writeTail: Promise<void> = Promise.resolve();
+  readonly #lease: RunStateLease;
+  #operationTail: Promise<void> = Promise.resolve();
 
   constructor(filePath: string, scopeHash: string) {
     requirePosix();
@@ -77,16 +79,30 @@ export class RunStateStore {
     this.#filePath = path.resolve(filePath);
     this.#directory = path.dirname(this.#filePath);
     this.#scopeHash = scopeHash;
+    this.#lease = new RunStateLease(this.#filePath);
+  }
+
+  async acquireLease(): Promise<void> {
+    await this.#enqueue(async () => {
+      await validateParent(this.#directory);
+      await this.#lease.acquire();
+    });
+  }
+
+  async releaseLease(): Promise<void> {
+    await this.#enqueue(() => this.#lease.release());
   }
 
   async load(): Promise<PersistedClaim[]> {
-    await this.#writeTail;
-    await validateParent(this.#directory);
-    return (await this.#readExisting()) ?? [];
+    return this.#enqueue(async () => {
+      await validateParent(this.#directory);
+      await this.#lease.assertOwnedIfAcquired();
+      return (await this.#readExisting()) ?? [];
+    });
   }
 
   async inspect(): Promise<"missing" | "valid"> {
-    await this.#writeTail;
+    await this.#operationTail;
     if (!(await inspectParent(this.#directory))) return "missing";
     return (await this.#readExisting()) === undefined ? "missing" : "valid";
   }
@@ -135,13 +151,12 @@ export class RunStateStore {
     const contents = `${JSON.stringify({ version: 1, scope: this.#scopeHash, claims: parsed.data })}\n`;
     if (Buffer.byteLength(contents) > MAX_FILE_BYTES) throw new Error("Run state file exceeds 1 MiB");
 
-    const write = this.#writeTail.then(() => this.#write(contents));
-    this.#writeTail = write.catch(() => undefined);
-    await write;
+    await this.#enqueue(() => this.#write(contents));
   }
 
   async #write(contents: string): Promise<void> {
     await validateParent(this.#directory);
+    await this.#lease.assertOwned();
     await this.#readExisting();
     const temporaryPath = path.join(this.#directory, `.symphony-state-${randomUUID()}.tmp`);
     let handle;
@@ -175,6 +190,15 @@ export class RunStateStore {
         if (!isNodeError(error, "ENOENT")) throw error;
       }
     }
+  }
+
+  async #enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#operationTail.then(operation);
+    this.#operationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 }
 

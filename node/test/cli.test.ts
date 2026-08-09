@@ -287,6 +287,131 @@ The hook fails before the agent can start, then checkpointing fails.
   },
 );
 
+test(
+  "CLI leases one durable checkpoint and permits clean and dead-process successors",
+  { skip: process.platform === "win32", timeout: 15_000 },
+  async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-state-lease-"));
+    const canonicalDirectory = await realpath(directory);
+    const workflowPath = path.join(directory, "WORKFLOW.md");
+    const statePath = path.join(canonicalDirectory, "state", "checkpoint.json");
+    const contenderHookMarker = path.join(directory, "contender-hook-ran");
+    const portReservation = createNetServer();
+    const operationsPort = await listenOnEphemeralPort(portReservation);
+    await closeServer(portReservation);
+    await writeFile(
+      workflowPath,
+      `---
+tracker:
+  kind: memory
+  provider:
+    issues:
+      - id: lease-1
+        identifier: LEASE-1
+        title: Never reach a coding agent
+        state: Todo
+        labels: [symphony]
+        dispatchable: true
+  required_labels: [symphony]
+  active_states: [Todo]
+  terminal_states: [Done]
+polling:
+  interval_ms: 60000
+workspace:
+  root: ${JSON.stringify(path.join(directory, "workspaces"))}
+state:
+  path: ${JSON.stringify(statePath)}
+hooks:
+  before_run: |
+    if [ -n "$LEASE_CONTENDER_MARKER" ]; then
+      printf x > "$LEASE_CONTENDER_MARKER"
+    fi
+    exit 1
+runtime:
+  kind: claude
+  options:
+    claude_executable: ${JSON.stringify(path.join(directory, "missing-claude"))}
+---
+The hook fails before the missing coding-agent executable can start.
+`,
+    );
+
+    const daemons: Array<{
+      child: ReturnType<typeof spawn>;
+      closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+      stderr(): string;
+    }> = [];
+    const spawnDaemon = () => {
+      const child = spawn(
+        process.execPath,
+        [cliPath, "--http-port", String(operationsPort), workflowPath],
+        { env: { ...process.env, LOG_LEVEL: "silent" }, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", (code, signal) => resolve({ code, signal }));
+        },
+      );
+      const daemon = { child, closed, stderr: () => stderr };
+      daemons.push(daemon);
+      return daemon;
+    };
+
+    try {
+      const first = spawnDaemon();
+      await waitForDaemonReady(first, operationsPort);
+
+      await assert.rejects(
+        execFileAsync(process.execPath, [cliPath, workflowPath], {
+          env: {
+            ...process.env,
+            LEASE_CONTENDER_MARKER: contenderHookMarker,
+            LOG_LEVEL: "silent",
+          },
+          timeout: 3_000,
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok("code" in error);
+          assert.ok("stdout" in error);
+          assert.ok("stderr" in error);
+          assert.equal(error.code, 1);
+          assert.equal(String(error.stdout), "");
+          assert.equal(String(error.stderr).trim(), "symphony-node: Durable run state lease is unavailable");
+          return true;
+        },
+      );
+      await assert.rejects(access(contenderHookMarker));
+
+      assert.equal(first.child.kill("SIGTERM"), true);
+      assert.deepEqual(await first.closed, { code: 0, signal: null });
+
+      const crashedSuccessor = spawnDaemon();
+      await waitForDaemonReady(crashedSuccessor, operationsPort);
+      assert.equal(crashedSuccessor.child.kill("SIGKILL"), true);
+      assert.deepEqual(await crashedSuccessor.closed, { code: null, signal: "SIGKILL" });
+
+      const finalSuccessor = spawnDaemon();
+      await waitForDaemonReady(finalSuccessor, operationsPort);
+      assert.equal(finalSuccessor.child.kill("SIGTERM"), true);
+      assert.deepEqual(await finalSuccessor.closed, { code: 0, signal: null });
+      await assert.rejects(access(contenderHookMarker));
+    } finally {
+      for (const daemon of daemons) {
+        if (daemon.child.exitCode === null && daemon.child.signalCode === null) daemon.child.kill("SIGKILL");
+      }
+      await Promise.allSettled(daemons.map(({ closed }) => closed));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
 test("CLI --once polls once, prints a compact snapshot, and exits successfully when idle", async () => {
   const result = await execFileAsync(process.execPath, [cliPath, "--once", exampleWorkflowPath], {
     env: { ...process.env, LOG_LEVEL: "silent" },
@@ -1061,6 +1186,21 @@ async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
+}
+
+async function waitForDaemonReady(
+  daemon: {
+    closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+    stderr(): string;
+  },
+  port: number,
+): Promise<void> {
+  await Promise.race([
+    waitForHttpStatus(`http://127.0.0.1:${port}/readyz`, 200, 3_000),
+    daemon.closed.then((outcome) => {
+      throw new Error(`Daemon exited before ready (${JSON.stringify(outcome)}): ${daemon.stderr().trim()}`);
+    }),
+  ]);
 }
 
 async function waitForHttpStatus(url: string, status: number, timeoutMs: number): Promise<void> {
