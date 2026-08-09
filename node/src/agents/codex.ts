@@ -14,6 +14,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 import { agentCompletionOutputSchema, parseAgentCompletionJson } from "../completion.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, AgentUsage } from "../domain.js";
+import { pickEnvironment } from "./environment.js";
 
 const codexOptionsSchema = z
   .object({
@@ -249,24 +250,19 @@ export function buildCodexEnvironment(
   codexHome = process.env.CODEX_HOME,
   sensitiveEnvNames: string[] = [],
 ): Record<string, string> {
-  const names = new Set([...safeEnvironmentNames, ...extraNames]);
-  const excluded = new Set(sensitiveEnvNames.map((name) => name.toUpperCase()));
-  const environment: Record<string, string> = {};
-  for (const name of names) {
-    if (excluded.has(name.toUpperCase())) continue;
-    const value = process.env[name];
-    if (value !== undefined) environment[name] = value;
-  }
-  if (codexHome !== undefined) {
-    if (!excluded.has("CODEX_HOME")) environment.CODEX_HOME = codexHome;
-    if (!excluded.has("HOME")) environment.HOME = codexHome;
-    if (process.platform === "win32") {
-      if (!excluded.has("USERPROFILE")) environment.USERPROFILE = codexHome;
-      if (!excluded.has("APPDATA")) environment.APPDATA = codexHome;
-      if (!excluded.has("LOCALAPPDATA")) environment.LOCALAPPDATA = codexHome;
-    }
-  }
-  return environment;
+  return pickEnvironment(
+    [...safeEnvironmentNames, ...extraNames],
+    sensitiveEnvNames,
+    codexHome === undefined
+      ? {}
+      : {
+          CODEX_HOME: codexHome,
+          HOME: codexHome,
+          ...(process.platform === "win32"
+            ? { USERPROFILE: codexHome, APPDATA: codexHome, LOCALAPPDATA: codexHome }
+            : {}),
+        },
+  );
 }
 
 export async function resolveSafeCodexHome(configuredPath: string | undefined): Promise<string> {
@@ -310,17 +306,11 @@ export function buildCodexShellEnvironment(
   commandTempPath: string,
   sensitiveEnvNames: string[] = [],
 ): Record<string, string> {
-  const excluded = new Set(sensitiveEnvNames.map((name) => name.toUpperCase()));
-  const environment: Record<string, string> = {};
-  for (const name of safeShellEnvironmentNames) {
-    if (excluded.has(name.toUpperCase())) continue;
-    const value = process.env[name];
-    if (value !== undefined) environment[name] = value;
-  }
-  if (!excluded.has("TEMP")) environment.TEMP = commandTempPath;
-  if (!excluded.has("TMP")) environment.TMP = commandTempPath;
-  if (!excluded.has("TMPDIR")) environment.TMPDIR = commandTempPath;
-  return environment;
+  return pickEnvironment(safeShellEnvironmentNames, sensitiveEnvNames, {
+    TEMP: commandTempPath,
+    TMP: commandTempPath,
+    TMPDIR: commandTempPath,
+  });
 }
 
 export function normalizeCodexUsage(usage: Usage): AgentUsage {

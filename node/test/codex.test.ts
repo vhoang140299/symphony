@@ -348,13 +348,15 @@ test("Codex sensitive environment names override defaults and explicit allowlist
     const client = buildCodexEnvironment(
       ["GITHUB_TOKEN"],
       testCodexHome,
-      ["github_token", "path"],
+      ["github_token", "path", "home"],
     );
-    const shell = buildCodexShellEnvironment("/private/symphony-command", ["GitHub_ToKeN", "Path"]);
+    const shell = buildCodexShellEnvironment("/private/symphony-command", ["GitHub_ToKeN", "Path", "temp"]);
     assert.equal(client.GITHUB_TOKEN, undefined);
     assert.equal(client.PATH, undefined);
+    assert.equal(client.HOME, undefined);
     assert.equal(shell.GITHUB_TOKEN, undefined);
     assert.equal(shell.PATH, undefined);
+    assert.equal(shell.TEMP, undefined);
   } finally {
     restoreEnvironment("GITHUB_TOKEN", previousGithub);
     restoreEnvironment("PATH", previousPath);
