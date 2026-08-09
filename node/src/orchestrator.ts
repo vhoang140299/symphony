@@ -460,7 +460,11 @@ export class Orchestrator {
   }
 
   #applyWorkflow(workflow: WorkflowDefinition): void {
-    const tracker = this.#trackerOverride ?? createTracker(workflow.config.tracker.kind, workflow.config.tracker.provider);
+    const tracker = this.#trackerOverride ?? createTracker(
+      workflow.config.tracker.kind,
+      workflow.config.tracker.provider,
+      { terminalStates: workflow.config.tracker.terminalStates },
+    );
     const driver = this.#driverOverride ?? createAgentDriver(workflow.config.runtime.kind);
     const statePath = workflow.config.state?.path;
     const scopeHash = statePath === undefined ? undefined : workflowScopeHash(workflow);
@@ -1056,6 +1060,7 @@ export class Orchestrator {
     const mutateIssue = entry.tracker.mutateIssue?.bind(entry.tracker);
     const publishIssueChange = entry.tracker.publishIssueChange?.bind(entry.tracker);
     const hostDelivery = entry.workflow.config.delivery !== undefined;
+    const sensitiveEnvNames = trackerCredentialNames(entry.workflow.config);
 
     try {
       for await (const event of entry.driver.run({
@@ -1066,10 +1071,10 @@ export class Orchestrator {
         continuation: entry.continuation,
         signal: entry.controller.signal,
         runtimeOptions: entry.workflow.config.runtime.options,
+        ...(sensitiveEnvNames.length === 0 ? {} : { sensitiveEnvNames }),
         ...(hostDelivery
           ? {
               completionMode: "publish_change" as const,
-              sensitiveEnvNames: deliveryCredentialNames(entry.workflow.config),
             }
           : {}),
         ...(hostDelivery || mutateIssue === undefined
@@ -1513,12 +1518,21 @@ function truncate(value: string, maxLength: number): string {
   return trimmed.length <= maxLength ? trimmed : trimmed.slice(0, maxLength).trimEnd();
 }
 
-function deliveryCredentialNames(config: WorkflowConfig): string[] {
-  const tokenReference = config.tracker.provider.token;
+function trackerCredentialNames(config: WorkflowConfig): string[] {
+  const defaultName = config.tracker.kind === "github"
+    ? "GITHUB_TOKEN"
+    : config.tracker.kind === "linear"
+      ? "LINEAR_API_KEY"
+      : undefined;
+  if (defaultName === undefined) return [];
+
+  const tokenReference = config.tracker.kind === "linear"
+    ? config.tracker.provider.api_key
+    : config.tracker.provider.token;
   const matched = typeof tokenReference === "string"
     ? /^\$([A-Za-z_][A-Za-z0-9_]*)$/u.exec(tokenReference.trim())?.[1]
     : undefined;
-  return matched === undefined ? ["GITHUB_TOKEN"] : ["GITHUB_TOKEN", matched];
+  return matched === undefined || matched === defaultName ? [defaultName] : [defaultName, matched];
 }
 
 export { workflowScopeHash } from "./state/scope.js";

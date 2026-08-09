@@ -277,6 +277,42 @@ for (const runtimeKind of ["claude", "codex"] as const) {
   });
 }
 
+test("keeps Linear credentials out of a non-delivery agent child", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-linear-credentials-"));
+  const issue = {
+    ...githubIssue(),
+    id: "linear-issue-1",
+    identifier: "LIN-1",
+    state: "Todo",
+    labels: [],
+  };
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(issue.state) ? [issue] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(issue.id) ? [issue] : [];
+    },
+  };
+  const driver = new FakeDriver(async function* (context) {
+    assert.deepEqual(context.sensitiveEnvNames, ["LINEAR_API_KEY", "CUSTOM_LINEAR_TOKEN"]);
+    yield event("turn_failed", { summary: "expected test failure" });
+  });
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  await writeFile(
+    workflowPath,
+    `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: project\n    api_key: $CUSTOM_LINEAR_TOKEN\n  active_states: [Todo]\n  terminal_states: [Done]\nworkspace:\n  root: ./workspaces\nagent:\n  max_attempts: 1\nruntime:\n  kind: claude\n---\nWork on {{ issue.identifier }}.\n`,
+  );
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
 test("a partial host-delivery failure retries host work at the agent-attempt limit without rerunning the agent", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-delivery-retry-"));
   let current = githubIssue();

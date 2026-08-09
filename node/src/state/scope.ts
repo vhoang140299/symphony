@@ -12,6 +12,13 @@ export function workflowScopeHash(workflow: WorkflowDefinition): string {
         gitUrl: scopeUrl(provider.git_url, null),
       }
     : null;
+  const linear = workflow.config.tracker.kind === "linear"
+    ? {
+        projectSlug: scopeString(provider.project_slug),
+        endpoint: scopeUrl(provider.endpoint, "https://api.linear.app/graphql"),
+        assignee: scopeString(provider.assignee),
+      }
+    : null;
   const memoryIssues = workflow.config.tracker.kind === "memory" && Array.isArray(provider.issues)
     ? provider.issues
         .flatMap((issue) => {
@@ -27,6 +34,7 @@ export function workflowScopeHash(workflow: WorkflowDefinition): string {
       trackerKind: workflow.config.tracker.kind,
       workspaceRoot: workflow.config.workspace.root,
       github,
+      linear,
       memoryIssues,
     }))
     .digest("hex");

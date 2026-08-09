@@ -16,8 +16,8 @@ Claude Code or Codex through their official SDKs.
 - CLI and tooling: Commander, Fastify for optional operational HTTP, pnpm, and Vitest
   (Vite-powered)
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
-- Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools, host-controlled PR
-  delivery, and operator retry labels
+- Trackers: in-memory issues, read-only Linear polling through the official SDK, or GitHub Issues
+  polling with manual Claude tools, host-controlled PR delivery, and operator retry labels
 - Operations: structured logs, an in-process runtime snapshot, and an optional locally leased
   checkpoint
 
@@ -30,8 +30,8 @@ issues may therefore be retried after a run.
 - Node.js 24 or newer; [`mise`](https://mise.jdx.dev/) can install the recommended Node version
   from `mise.toml`.
 - pnpm 11.20.0; `mise install` installs the pinned package manager from `mise.toml`.
-- Git and the [GitHub CLI](https://cli.github.com/) authenticated with access to the target
-  repository.
+- Git. The GitHub profiles also require the [GitHub CLI](https://cli.github.com/) authenticated with
+  access to the target repository.
 - Claude Code authentication available to the child process, such as `ANTHROPIC_API_KEY` or an
   existing Claude Code login. Symphony does not store or refresh Claude credentials.
 - For the Codex runtime, set `CODEX_HOME` to a dedicated private profile and authenticate it with
@@ -336,6 +336,45 @@ loaded.
 
 The Codex SDK reports token usage but not a USD amount, so Symphony records `costUsd: 0` for Codex
 runs. That value means “unavailable,” not “free.”
+
+### Linear tracker
+
+The Linear adapter implements the scheduler's read kernel through the official `@linear/sdk`. It
+scopes reads to one project, follows issue pages in batches of 50, and refreshes opaque Linear issue
+IDs in batches of 50:
+
+```yaml
+tracker:
+  kind: linear
+  provider:
+    project_slug: your-project-slug
+    api_key: $LINEAR_API_KEY
+    # assignee: me # or a Linear user ID
+    # endpoint: https://api.linear.app/graphql
+  required_labels: [symphony]
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Closed, Cancelled, Canceled, Duplicate]
+agent:
+  max_turns: 1
+  max_attempts: 3
+```
+
+`project_slug` is required. `api_key` defaults to `$LINEAR_API_KEY`; any configured key must be an
+environment reference, and Symphony removes both that variable and `LINEAR_API_KEY` from the coding
+agent's environment. `assignee` is optional; `me` resolves to the authenticated Linear viewer and a
+user ID matches that exact assignee. Custom endpoints must be HTTPS; configure one only when it is
+operator-controlled because Symphony sends the Linear API key to it.
+
+The adapter preserves Linear state spelling, normalizes labels to lowercase, and includes inverse
+`blocks` relations. A `Todo` issue is dispatchable only when every known blocker is in a configured
+terminal state and the optional assignee matches. Candidate pages drop malformed records; an ID
+refresh fails closed if a requested record is malformed. Empty state or ID lists make no request.
+
+This first Linear slice is intentionally read-only. It does not expose Linear mutation tools, host
+delivery, or retry-label control. Move an issue out of the active states through your existing Linear
+workflow when work is handed off. To keep that read-only handoff bounded, Linear workflows default to
+one turn per run and three total attempts; explicit `agent.max_turns` and `agent.max_attempts` override
+those defaults.
 
 ### GitHub Issues tracker
 

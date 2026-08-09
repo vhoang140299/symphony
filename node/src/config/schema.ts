@@ -9,7 +9,7 @@ const githubStates = new Set(["open", "closed", "all"]);
 
 const trackerSchema = z
   .object({
-    kind: z.enum(["memory", "github"]),
+    kind: z.enum(["memory", "github", "linear"]),
     provider: z.record(z.string(), z.unknown()).default({}),
     required_labels: z.array(z.string()).default([]),
     active_states: z.array(nonEmptyString).optional(),
@@ -263,8 +263,11 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
     },
     agent: {
       maxConcurrentAgents: parsed.agent.max_concurrent_agents,
-      maxTurns: parsed.agent.max_turns ?? parsed.agent.max_continuations ?? 20,
-      maxAttempts: parsed.agent.max_attempts ?? null,
+      maxTurns:
+        parsed.agent.max_turns ??
+        parsed.agent.max_continuations ??
+        (parsed.tracker.kind === "linear" ? 1 : 20),
+      maxAttempts: parsed.agent.max_attempts ?? (parsed.tracker.kind === "linear" ? 3 : null),
       maxRetryBackoffMs: parsed.agent.max_retry_backoff_ms,
       maxConcurrentAgentsByState: stateLimits,
     },

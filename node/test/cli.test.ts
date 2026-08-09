@@ -663,6 +663,30 @@ Doctor must not run Claude.
   }
 });
 
+test("doctor validates Linear provider syntax without resolving credentials or contacting Linear", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-linear-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const tokenName = "SYMPHONY_DOCTOR_LINEAR_SECRET";
+  const previousToken = process.env[tokenName];
+  delete process.env[tokenName];
+  await writeFile(
+    workflowPath,
+    `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: project\n    api_key: $${tokenName}\n    endpoint: https://127.0.0.1:1/graphql\nworkspace:\n  root: ./missing-workspaces\nruntime:\n  kind: claude\n---\nSecret-free doctor check.\n`,
+  );
+
+  try {
+    const report = await runDoctor(workflowPath);
+    const trackerCheck = report.checks.find((check) => check.id === "tracker.config");
+    assert.equal(trackerCheck?.status, "ok");
+    assert.equal(report.tracker, "linear");
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(tokenName, "u"));
+  } finally {
+    if (previousToken === undefined) delete process.env[tokenName];
+    else process.env[tokenName] = previousToken;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("doctor mirrors native Windows executable lookup without accepting shell scripts", () => {
   assert.deepEqual(
     configuredExecutableCandidates("agent.exe", "win32", "C:\\bin;D:\\tools"),
