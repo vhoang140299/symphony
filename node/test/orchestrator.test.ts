@@ -87,6 +87,7 @@ test("binds provider operations to the current issue and owned workspace", async
   const mutations: Array<{ issueId: string; label: string }> = [];
   const publications: Array<{ issueId: string; workspacePath: string; title: string }> = [];
   const tracker: Tracker = {
+    issueStateMutationMode: "named",
     async fetchIssuesByStates(states) {
       return (await backing.fetchIssuesByStates(states)).map((candidate) => ({ ...candidate, labels }));
     },
@@ -116,6 +117,7 @@ test("binds provider operations to the current issue and owned workspace", async
   const driver = new FakeDriver(async function* (context) {
     assert.ok(context.mutateCurrentIssue);
     assert.ok(context.publishCurrentChange);
+    assert.equal(context.issueStateMutationMode, "named");
     await context.publishCurrentChange(
       {
         commitMessage: "Fix BOUND-1",

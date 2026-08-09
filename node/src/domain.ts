@@ -28,6 +28,8 @@ export type IssueMutation =
   | { kind: "remove_label"; label: string }
   | { kind: "set_state"; state: string };
 
+export type IssueStateMutationMode = "open_closed" | "named";
+
 export interface AgentCompletion {
   status: "ready" | "blocked";
   summary: string;
@@ -47,6 +49,7 @@ export interface PublishedChange {
 }
 
 export interface Tracker {
+  readonly issueStateMutationMode?: IssueStateMutationMode;
   fetchIssuesByStates(states: string[]): Promise<Issue[]>;
   fetchIssuesByIds(ids: string[]): Promise<Issue[]>;
   mutateIssue?(issue: Issue, mutation: IssueMutation, signal: AbortSignal): Promise<void>;
@@ -98,6 +101,7 @@ export interface AgentRunContext {
   signal: AbortSignal;
   runtimeOptions: Record<string, unknown>;
   completionMode?: "publish_change";
+  issueStateMutationMode?: IssueStateMutationMode;
   sensitiveEnvNames?: string[];
   mutateCurrentIssue?: (mutation: IssueMutation, signal: AbortSignal) => Promise<void>;
   publishCurrentChange?: (input: PublishChangeInput, signal: AbortSignal) => Promise<PublishedChange>;

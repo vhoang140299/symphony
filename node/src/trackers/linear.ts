@@ -1,14 +1,38 @@
 import { LinearClient, type LinearClientOptions } from "@linear/sdk";
 import { z } from "zod";
-import type { BlockerRef, Issue, Tracker } from "../domain.js";
+import type { BlockerRef, Issue, IssueMutation, Tracker } from "../domain.js";
 
 const DEFAULT_ENDPOINT = "https://api.linear.app/graphql";
 const DEFAULT_API_KEY_REFERENCE = "$LINEAR_API_KEY";
 const PAGE_SIZE = 50;
 const MAX_PAGES = 1_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_COMMENT_LENGTH = 65_536;
+const MAX_LABEL_LENGTH = 50;
+const MAX_STATE_LENGTH = 100;
 const ENV_REFERENCE = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
+const IDEMPOTENCY_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_TERMINAL_STATES = ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"];
+
+const linearMutationSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("comment"),
+    body: z.string().max(MAX_COMMENT_LENGTH).refine((body) => body.trim() !== ""),
+    idempotencyKey: z.string().regex(IDEMPOTENCY_KEY).optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("add_label"),
+    label: z.string().trim().min(1).max(MAX_LABEL_LENGTH),
+  }).strict(),
+  z.object({
+    kind: z.literal("remove_label"),
+    label: z.string().trim().min(1).max(MAX_LABEL_LENGTH),
+  }).strict(),
+  z.object({
+    kind: z.literal("set_state"),
+    state: z.string().trim().min(1).max(MAX_STATE_LENGTH),
+  }).strict(),
+]);
 
 const ISSUE_FIELDS = `
   id
@@ -84,10 +108,84 @@ interface LinearSettings {
   assignee: string | null;
 }
 
+type CommentsQueryInput = NonNullable<Parameters<LinearClient["comments"]>[0]>;
+type WorkflowStatesQueryInput = NonNullable<Parameters<LinearClient["workflowStates"]>[0]>;
+type IssueLabelsQueryInput = NonNullable<Parameters<LinearClient["issueLabels"]>[0]>;
+type CommentCreateInput = Parameters<LinearClient["createComment"]>[0];
+type CommentUpdateInput = Parameters<LinearClient["updateComment"]>[1];
+type IssueUpdateInput = Parameters<LinearClient["updateIssue"]>[1];
+
 export interface LinearClientLike {
   client: {
     rawRequest(query: string, variables?: Record<string, unknown>): Promise<unknown>;
   };
+  issue(id: string): PromiseLike<LinearIssueLike>;
+  comments(variables: CommentsQueryInput): PromiseLike<LinearConnectionLike<LinearCommentLike>>;
+  workflowStates(
+    variables: WorkflowStatesQueryInput,
+  ): PromiseLike<LinearConnectionLike<LinearWorkflowStateLike>>;
+  issueLabels(
+    variables: IssueLabelsQueryInput,
+  ): PromiseLike<LinearConnectionLike<LinearIssueLabelLike>>;
+  createComment(input: CommentCreateInput): PromiseLike<LinearCommentPayloadLike>;
+  updateComment(id: string, input: CommentUpdateInput): PromiseLike<LinearCommentPayloadLike>;
+  updateIssue(id: string, input: IssueUpdateInput): PromiseLike<LinearIssuePayloadLike>;
+  issueAddLabel(id: string, labelId: string): PromiseLike<LinearIssuePayloadLike>;
+  issueRemoveLabel(id: string, labelId: string): PromiseLike<LinearIssuePayloadLike>;
+}
+
+interface LinearConnectionLike<T> {
+  nodes: T[];
+  pageInfo: { hasNextPage: boolean };
+}
+
+interface LinearIssueLike {
+  id: string;
+  identifier: string;
+  archivedAt?: Date | null | undefined;
+  trashed?: boolean | null | undefined;
+  assigneeId?: string | undefined;
+  labelIds: string[];
+  projectId?: string | undefined;
+  stateId?: string | undefined;
+  teamId?: string | undefined;
+  project?: PromiseLike<{
+    id: string;
+    slugId: string;
+    archivedAt?: Date | null | undefined;
+    trashed?: boolean | null | undefined;
+  }> | undefined;
+}
+
+interface LinearCommentLike {
+  id: string;
+  body: string;
+  issueId?: string | null | undefined;
+}
+
+interface LinearWorkflowStateLike {
+  id: string;
+  name: string;
+  archivedAt?: Date | null | undefined;
+  teamId?: string | undefined;
+}
+
+interface LinearIssueLabelLike {
+  id: string;
+  name: string;
+  archivedAt?: Date | null | undefined;
+  isGroup: boolean;
+  teamId?: string | undefined;
+}
+
+interface LinearCommentPayloadLike {
+  success: boolean;
+  commentId?: string | undefined;
+}
+
+interface LinearIssuePayloadLike {
+  success: boolean;
+  issueId?: string | undefined;
 }
 
 export type LinearClientFactory = (options: LinearClientOptions) => LinearClientLike;
@@ -98,6 +196,7 @@ export interface LinearTrackerDependencies {
 }
 
 export class LinearTracker implements Tracker {
+  readonly issueStateMutationMode = "named" as const;
   readonly #settings: LinearSettings;
   readonly #clientFactory: LinearClientFactory;
   readonly #terminalStates: ReadonlySet<string>;
@@ -190,6 +289,80 @@ export class LinearTracker implements Tracker {
     return issues;
   }
 
+  async mutateIssue(issue: Issue, mutation: IssueMutation, signal: AbortSignal): Promise<void> {
+    const validated = validateMutation(mutation);
+    const boundIssue = bindLinearIssue(issue);
+    if (signal.aborted) throw new Error("Linear issue mutation was aborted");
+
+    const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const operationSignal = AbortSignal.any([signal, timeoutSignal]);
+    try {
+      const client = this.#clientFactory({
+        apiKey: this.#settings.apiKey,
+        apiUrl: this.#settings.endpoint,
+        signal: operationSignal,
+      });
+      const current = await client.issue(boundIssue.id);
+      const context = await mutationContext(current, boundIssue, this.#settings);
+
+      if (validated.kind === "comment") {
+        await mutateComment(client, context.issueId, validated, operationSignal);
+        return;
+      }
+
+      if (validated.kind === "set_state") {
+        const stateId = workflowStateId(
+          await client.workflowStates({
+            first: 2,
+            includeArchived: false,
+            filter: {
+              name: { eqIgnoreCase: validated.state },
+              team: { id: { eq: context.teamId } },
+            },
+          }),
+          validated.state,
+          context.teamId,
+        );
+        if (current.stateId === stateId) return;
+        operationSignal.throwIfAborted();
+        assertIssuePayload(
+          await client.updateIssue(context.issueId, { stateId }),
+          context.issueId,
+        );
+        return;
+      }
+
+      const labelId = issueLabelId(
+        await client.issueLabels({
+          first: 2,
+          includeArchived: false,
+          filter: {
+            name: { eqIgnoreCase: validated.label },
+            isGroup: { eq: false },
+            or: [
+              { team: { id: { eq: context.teamId } } },
+              { team: { null: true } },
+            ],
+          },
+        }),
+        validated.label,
+        context.teamId,
+      );
+      const attached = current.labelIds.includes(labelId);
+      if (validated.kind === "add_label" && attached) return;
+      if (validated.kind === "remove_label" && !attached) return;
+      operationSignal.throwIfAborted();
+      const payload = validated.kind === "add_label"
+        ? await client.issueAddLabel(context.issueId, labelId)
+        : await client.issueRemoveLabel(context.issueId, labelId);
+      assertIssuePayload(payload, context.issueId);
+    } catch {
+      if (signal.aborted) throw new Error("Linear issue mutation was aborted");
+      if (timeoutSignal.aborted) throw new Error("Linear issue mutation timed out");
+      throw new Error("Linear issue mutation failed");
+    }
+  }
+
   async #request(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
     let response: unknown;
     try {
@@ -206,6 +379,183 @@ export class LinearTracker implements Tracker {
     if (!isRecord(response)) throw new Error("Linear GraphQL returned an invalid response");
     if (!isRecord(response.data)) throw new Error("Linear GraphQL response is missing data");
     return response.data;
+  }
+}
+
+type ValidMutation = z.infer<typeof linearMutationSchema>;
+
+function validateMutation(mutation: IssueMutation): ValidMutation {
+  const result = linearMutationSchema.safeParse(mutation);
+  if (!result.success) throw new Error("Invalid Linear issue mutation");
+  return result.data;
+}
+
+interface MutationContext {
+  issueId: string;
+  teamId: string;
+}
+
+interface BoundLinearIssue {
+  id: string;
+  identifier: string;
+  assigneeId: string | null;
+}
+
+function bindLinearIssue(issue: Issue): BoundLinearIssue {
+  const id = optionalString(issue.id);
+  const identifier = optionalString(issue.identifier);
+  if (issue.nativeRef !== null || id === null || identifier === null) {
+    throw new Error("Issue is not bound to this Linear tracker");
+  }
+  return { id, identifier, assigneeId: optionalString(issue.assigneeId) };
+}
+
+async function mutationContext(
+  current: LinearIssueLike,
+  issue: BoundLinearIssue,
+  settings: LinearSettings,
+): Promise<MutationContext> {
+  const teamId = optionalString(current.teamId);
+  const projectId = optionalString(current.projectId);
+  if (
+    optionalString(current.id) !== issue.id ||
+    optionalString(current.identifier) !== issue.identifier ||
+    teamId === null ||
+    projectId === null ||
+    current.archivedAt != null ||
+    current.trashed === true ||
+    !Array.isArray(current.labelIds) ||
+    current.labelIds.some((id) => optionalString(id) === null)
+  ) {
+    throw new Error("Linear issue is no longer safe to mutate");
+  }
+
+  const project = await current.project;
+  if (
+    project === undefined ||
+    optionalString(project.id) !== projectId ||
+    optionalString(project.slugId) !== settings.projectSlug ||
+    project.archivedAt != null ||
+    project.trashed === true
+  ) {
+    throw new Error("Linear issue is outside the configured project");
+  }
+
+  if (settings.assignee !== null) {
+    const expectedAssignee = settings.assignee === "me" ? issue.assigneeId : settings.assignee;
+    if (expectedAssignee === null || optionalString(current.assigneeId) !== expectedAssignee) {
+      throw new Error("Linear issue is no longer assigned to the configured user");
+    }
+  }
+  return { issueId: issue.id, teamId };
+}
+
+async function mutateComment(
+  client: LinearClientLike,
+  issueId: string,
+  mutation: Extract<ValidMutation, { kind: "comment" }>,
+  signal: AbortSignal,
+): Promise<void> {
+  const idempotencyKey = mutation.idempotencyKey;
+  if (idempotencyKey !== undefined) {
+    const existing = await client.comments({
+      first: 2,
+      includeArchived: true,
+      filter: { id: { eq: idempotencyKey } },
+    });
+    assertCompleteConnection(existing);
+    if (existing.nodes.length > 1) throw new Error("Linear comment lookup was ambiguous");
+    const comment = existing.nodes[0];
+    if (comment !== undefined) {
+      if (
+        optionalString(comment.id) !== idempotencyKey ||
+        optionalString(comment.issueId) !== issueId
+      ) {
+        throw new Error("Linear comment idempotency key is already in use");
+      }
+      if (comment.body === mutation.body) return;
+      signal.throwIfAborted();
+      assertCommentPayload(
+        await client.updateComment(idempotencyKey, { body: mutation.body }),
+        idempotencyKey,
+      );
+      return;
+    }
+  }
+
+  signal.throwIfAborted();
+  const input: CommentCreateInput = { issueId, body: mutation.body };
+  if (idempotencyKey !== undefined) input.id = idempotencyKey;
+  const payload = await client.createComment(input);
+  assertCommentPayload(payload, idempotencyKey);
+}
+
+function workflowStateId(
+  connection: LinearConnectionLike<LinearWorkflowStateLike>,
+  stateName: string,
+  teamId: string,
+): string {
+  assertCompleteConnection(connection);
+  if (connection.nodes.length !== 1) throw new Error("Linear workflow state lookup was not unique");
+  const [state] = connection.nodes;
+  if (
+    state === undefined ||
+    optionalString(state.id) === null ||
+    normalizeState(state.name) !== normalizeState(stateName) ||
+    optionalString(state.teamId) !== teamId ||
+    state.archivedAt != null
+  ) {
+    throw new Error("Linear returned an invalid workflow state");
+  }
+  return state.id;
+}
+
+function issueLabelId(
+  connection: LinearConnectionLike<LinearIssueLabelLike>,
+  labelName: string,
+  teamId: string,
+): string {
+  assertCompleteConnection(connection);
+  if (connection.nodes.length !== 1) throw new Error("Linear issue label lookup was not unique");
+  const [label] = connection.nodes;
+  if (
+    label === undefined ||
+    optionalString(label.id) === null ||
+    normalizeState(label.name) !== normalizeState(labelName) ||
+    label.isGroup !== false ||
+    label.archivedAt != null ||
+    (label.teamId !== undefined && optionalString(label.teamId) !== teamId)
+  ) {
+    throw new Error("Linear returned an invalid issue label");
+  }
+  return label.id;
+}
+
+function assertCompleteConnection<T>(connection: LinearConnectionLike<T>): void {
+  if (
+    !isRecord(connection) ||
+    !Array.isArray(connection.nodes) ||
+    !isRecord(connection.pageInfo) ||
+    connection.pageInfo.hasNextPage !== false
+  ) {
+    throw new Error("Linear lookup returned an incomplete result");
+  }
+}
+
+function assertCommentPayload(payload: LinearCommentPayloadLike, expectedId?: string): void {
+  if (
+    !isRecord(payload) ||
+    payload.success !== true ||
+    optionalString(payload.commentId) === null ||
+    (expectedId !== undefined && payload.commentId !== expectedId)
+  ) {
+    throw new Error("Linear comment mutation did not succeed");
+  }
+}
+
+function assertIssuePayload(payload: LinearIssuePayloadLike, issueId: string): void {
+  if (!isRecord(payload) || payload.success !== true || payload.issueId !== issueId) {
+    throw new Error("Linear issue mutation did not succeed");
   }
 }
 

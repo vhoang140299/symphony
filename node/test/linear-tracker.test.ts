@@ -3,9 +3,11 @@ import { test } from "vitest";
 import type { LinearClientOptions } from "@linear/sdk";
 import {
   LinearTracker,
+  type LinearClientLike,
   type LinearTrackerDependencies,
   validateLinearProvider,
 } from "../src/trackers/linear.js";
+import type { Issue, IssueMutation } from "../src/domain.js";
 import { createTracker as createRegisteredTracker, validateTrackerProvider } from "../src/trackers/registry.js";
 
 interface CapturedRequest {
@@ -20,12 +22,16 @@ function createTracker(
   handler: RequestHandler,
   provider: Record<string, unknown> = {},
   terminalStates?: string[],
+  mutationClient: Partial<Omit<LinearClientLike, "client">> = {},
 ) {
   const requests: CapturedRequest[] = [];
   const clientOptions: LinearClientOptions[] = [];
   const dependencies: LinearTrackerDependencies = {
     clientFactory: (options) => {
       clientOptions.push(options);
+      const unexpectedMutation = async (): Promise<never> => {
+        assert.fail("unexpected Linear mutation SDK call");
+      };
       return {
         client: {
           rawRequest: async (query, variables = {}) => {
@@ -33,6 +39,16 @@ function createTracker(
             return handler(query, variables);
           },
         },
+        issue: unexpectedMutation,
+        comments: unexpectedMutation,
+        workflowStates: unexpectedMutation,
+        issueLabels: unexpectedMutation,
+        createComment: unexpectedMutation,
+        updateComment: unexpectedMutation,
+        updateIssue: unexpectedMutation,
+        issueAddLabel: unexpectedMutation,
+        issueRemoveLabel: unexpectedMutation,
+        ...mutationClient,
       };
     },
   };
@@ -79,6 +95,43 @@ function issuePage(nodes: unknown[], hasNextPage = false, endCursor: string | nu
         pageInfo: { hasNextPage, endCursor },
       },
     },
+  };
+}
+
+function boundIssue(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: "issue-1",
+    nativeRef: null,
+    identifier: "SYM-1",
+    title: "Issue 1",
+    description: "Description 1",
+    priority: 2,
+    state: "Todo",
+    branchName: "sym-1",
+    url: "https://linear.app/acme/issue/SYM-1",
+    assigneeId: "worker-1",
+    labels: [],
+    blockedBy: [],
+    dispatchable: true,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-02T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function currentLinearIssue(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "issue-1",
+    identifier: "SYM-1",
+    archivedAt: null,
+    trashed: false,
+    assigneeId: "worker-1",
+    labelIds: ["label-existing"],
+    projectId: "project-1",
+    stateId: "state-todo",
+    teamId: "team-1",
+    project: Promise.resolve({ id: "project-1", slugId: "symphony" }),
+    ...overrides,
   };
 }
 
@@ -154,7 +207,9 @@ test("registers Linear tracker construction and offline provider validation", ()
   const provider = { api_key: `$${TEST_KEY_ENVIRONMENT}`, project_slug: "symphony" };
   try {
     assert.doesNotThrow(() => validateTrackerProvider("linear", provider));
-    assert.ok(createRegisteredTracker("linear", provider, { terminalStates: ["Released"] }) instanceof LinearTracker);
+    const tracker = createRegisteredTracker("linear", provider, { terminalStates: ["Released"] });
+    assert.ok(tracker instanceof LinearTracker);
+    assert.equal(tracker.issueStateMutationMode, "named");
   } finally {
     if (previous === undefined) delete process.env[TEST_KEY_ENVIRONMENT];
     else process.env[TEST_KEY_ENVIRONMENT] = previous;
@@ -295,6 +350,446 @@ test("batches opaque ID refreshes, deduplicates requests, and restores requested
     data: { issues: { nodes: [rawIssue("issue-1", { identifier: " " })] } },
   })).tracker;
   await assert.rejects(malformed.fetchIssuesByIds(["issue-1"]), /malformed issue during ID refresh/);
+});
+
+test("maps bound issue mutations to typed Linear SDK methods", async () => {
+  const calls: Array<{ name: string; args: unknown[] }> = [];
+  const commentKey = "018f5f1b-0d2e-4c3a-8b7d-9e6f5a4b3c2d";
+  const { tracker, clientOptions } = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async (id) => {
+        calls.push({ name: "issue", args: [id] });
+        return currentLinearIssue();
+      },
+      comments: async (variables) => {
+        calls.push({ name: "comments", args: [variables] });
+        return { nodes: [], pageInfo: { hasNextPage: false } };
+      },
+      workflowStates: async (variables) => {
+        calls.push({ name: "workflowStates", args: [variables] });
+        return {
+          nodes: [{ id: "state-review", name: "Human Review", teamId: "team-1", archivedAt: null }],
+          pageInfo: { hasNextPage: false },
+        };
+      },
+      issueLabels: async (variables) => {
+        calls.push({ name: "issueLabels", args: [variables] });
+        const filter = variables.filter as { name: { eqIgnoreCase: string } };
+        const suffix = filter.name.eqIgnoreCase.toLowerCase();
+        return {
+          nodes: [{ id: `label-${suffix}`, name: filter.name.eqIgnoreCase, isGroup: false }],
+          pageInfo: { hasNextPage: false },
+        };
+      },
+      createComment: async (input) => {
+        calls.push({ name: "createComment", args: [input] });
+        return { success: true, commentId: typeof input.id === "string" ? input.id : "comment-1" };
+      },
+      updateIssue: async (id, input) => {
+        calls.push({ name: "updateIssue", args: [id, input] });
+        return { success: true, issueId: id };
+      },
+      issueAddLabel: async (id, labelId) => {
+        calls.push({ name: "issueAddLabel", args: [id, labelId] });
+        return { success: true, issueId: id };
+      },
+      issueRemoveLabel: async (id, labelId) => {
+        calls.push({ name: "issueRemoveLabel", args: [id, labelId] });
+        return { success: true, issueId: id };
+      },
+    },
+  );
+  const issue = boundIssue();
+  const signal = new AbortController().signal;
+
+  await tracker.mutateIssue(issue, { kind: "comment", body: "Verified manually" }, signal);
+  await tracker.mutateIssue(
+    issue,
+    { kind: "comment", body: "Durable handoff", idempotencyKey: commentKey },
+    signal,
+  );
+  await tracker.mutateIssue(issue, { kind: "set_state", state: " Human Review " }, signal);
+  await tracker.mutateIssue(issue, { kind: "add_label", label: " Review " }, signal);
+  await tracker.mutateIssue(issue, { kind: "remove_label", label: " Existing " }, signal);
+
+  assert.equal(clientOptions.length, 5);
+  assert.ok(clientOptions.every(({ signal: operationSignal }) => operationSignal instanceof AbortSignal));
+  assert.deepEqual(calls.filter(({ name }) => name === "issue").map(({ args }) => args), [
+    ["issue-1"], ["issue-1"], ["issue-1"], ["issue-1"], ["issue-1"],
+  ]);
+  assert.deepEqual(calls.filter(({ name }) => name === "createComment").map(({ args }) => args), [
+    [{ issueId: "issue-1", body: "Verified manually" }],
+    [{ issueId: "issue-1", body: "Durable handoff", id: commentKey }],
+  ]);
+  assert.deepEqual(calls.find(({ name }) => name === "comments")?.args, [{
+    first: 2,
+    includeArchived: true,
+    filter: { id: { eq: commentKey } },
+  }]);
+  assert.deepEqual(calls.find(({ name }) => name === "workflowStates")?.args, [{
+    first: 2,
+    includeArchived: false,
+    filter: {
+      name: { eqIgnoreCase: "Human Review" },
+      team: { id: { eq: "team-1" } },
+    },
+  }]);
+  assert.deepEqual(calls.find(({ name }) => name === "updateIssue")?.args, [
+    "issue-1",
+    { stateId: "state-review" },
+  ]);
+  assert.deepEqual(calls.filter(({ name }) => name === "issueLabels").length, 2);
+  assert.deepEqual(calls.find(({ name }) => name === "issueAddLabel")?.args, ["issue-1", "label-review"]);
+  assert.deepEqual(calls.find(({ name }) => name === "issueRemoveLabel")?.args, ["issue-1", "label-existing"]);
+});
+
+test("rejects malformed Linear mutation payloads before creating an SDK client", async () => {
+  const { tracker, clientOptions } = createTracker(
+    () => assert.fail("invalid mutations must not make a Linear request"),
+  );
+  const invalid = [
+    { kind: "comment", body: "   " },
+    { kind: "comment", body: "safe", idempotencyKey: "not-a-uuid" },
+    { kind: "add_label", label: "x".repeat(51) },
+    { kind: "set_state", state: " " },
+    { kind: "comment", body: "safe", issueId: "issue-2" },
+  ] as unknown as IssueMutation[];
+  for (const mutation of invalid) {
+    await assert.rejects(
+      tracker.mutateIssue(boundIssue(), mutation, new AbortController().signal),
+      /Invalid Linear issue mutation/,
+    );
+  }
+  assert.equal(clientOptions.length, 0);
+});
+
+test("makes typed Linear mutations convergent and fails closed on ambiguous targets", async () => {
+  const commentKey = "018f5f1b-0d2e-4c3a-8b7d-9e6f5a4b3c2d";
+  const writes: string[] = [];
+  let existingBody = "already current";
+  const { tracker } = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue({ stateId: "state-review" }),
+      comments: async () => ({
+        nodes: [{ id: commentKey, issueId: "issue-1", body: existingBody }],
+        pageInfo: { hasNextPage: false },
+      }),
+      workflowStates: async () => ({
+        nodes: [{ id: "state-review", name: "Review", teamId: "team-1", archivedAt: null }],
+        pageInfo: { hasNextPage: false },
+      }),
+      issueLabels: async (variables) => {
+        const filter = variables.filter as { name: { eqIgnoreCase: string } };
+        const id = filter.name.eqIgnoreCase === "Existing" ? "label-existing" : "label-absent";
+        return {
+          nodes: [{ id, name: filter.name.eqIgnoreCase, isGroup: false, teamId: "team-1" }],
+          pageInfo: { hasNextPage: false },
+        };
+      },
+      updateComment: async (id, input) => {
+        writes.push(`comment:${String(input.body)}`);
+        return { success: true, commentId: id };
+      },
+      updateIssue: async () => {
+        writes.push("state");
+        return { success: true, issueId: "issue-1" };
+      },
+      issueAddLabel: async () => {
+        writes.push("add");
+        return { success: true, issueId: "issue-1" };
+      },
+      issueRemoveLabel: async () => {
+        writes.push("remove");
+        return { success: true, issueId: "issue-1" };
+      },
+    },
+  );
+  const signal = new AbortController().signal;
+  await tracker.mutateIssue(boundIssue(), {
+    kind: "comment",
+    body: "already current",
+    idempotencyKey: commentKey,
+  }, signal);
+  existingBody = "stale";
+  await tracker.mutateIssue(boundIssue(), {
+    kind: "comment",
+    body: "replacement",
+    idempotencyKey: commentKey,
+  }, signal);
+  await tracker.mutateIssue(boundIssue(), { kind: "set_state", state: "Review" }, signal);
+  await tracker.mutateIssue(boundIssue(), { kind: "add_label", label: "Existing" }, signal);
+  await tracker.mutateIssue(boundIssue(), { kind: "remove_label", label: "Absent" }, signal);
+  assert.deepEqual(writes, ["comment:replacement"]);
+
+  const ambiguous = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue(),
+      workflowStates: async () => ({
+        nodes: [
+          { id: "state-1", name: "Review", teamId: "team-1" },
+          { id: "state-2", name: "Review", teamId: "team-1" },
+        ],
+        pageInfo: { hasNextPage: false },
+      }),
+    },
+  ).tracker;
+  await assert.rejects(
+    ambiguous.mutateIssue(boundIssue(), { kind: "set_state", state: "Review" }, signal),
+    /Linear issue mutation failed/,
+  );
+});
+
+test("rejects stale, aborted, and invalid Linear mutation results without leaking provider data", async () => {
+  const secret = "linear-secret-body";
+  let writes = 0;
+  const moved = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue({
+        project: Promise.resolve({ id: "project-2", slugId: "other-project" }),
+      }),
+      createComment: async () => {
+        writes += 1;
+        return { success: true, commentId: "comment-1" };
+      },
+    },
+  ).tracker;
+  await assert.rejects(
+    moved.mutateIssue(boundIssue(), { kind: "comment", body: secret }, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "Linear issue mutation failed");
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      return true;
+    },
+  );
+  assert.equal(writes, 0);
+
+  const wrongTarget = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue({ id: "issue-2", identifier: "SYM-2" }),
+      createComment: async () => {
+        writes += 1;
+        return { success: true, commentId: "comment-2" };
+      },
+    },
+  ).tracker;
+  await assert.rejects(
+    wrongTarget.mutateIssue(boundIssue(), { kind: "comment", body: "safe" }, new AbortController().signal),
+    /Linear issue mutation failed/,
+  );
+  assert.equal(writes, 0, "a mismatched SDK issue must never reach a write");
+
+  const controller = new AbortController();
+  const aborted = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => {
+        controller.abort(new Error(secret));
+        throw new Error(secret);
+      },
+    },
+  ).tracker;
+  await assert.rejects(
+    aborted.mutateIssue(boundIssue(), { kind: "comment", body: "safe" }, controller.signal),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "Linear issue mutation was aborted");
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      return true;
+    },
+  );
+
+  const invalidPayload = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue(),
+      workflowStates: async () => ({
+        nodes: [{ id: "state-review", name: "Review", teamId: "team-1" }],
+        pageInfo: { hasNextPage: false },
+      }),
+      updateIssue: async () => ({ success: true, issueId: "issue-2" }),
+    },
+  ).tracker;
+  await assert.rejects(
+    invalidPayload.mutateIssue(boundIssue(), { kind: "set_state", state: "Review" }, new AbortController().signal),
+    /Linear issue mutation failed/,
+  );
+
+  const wrongTeam = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue(),
+      workflowStates: async () => ({
+        nodes: [{ id: "state-review", name: "Review", teamId: "team-2" }],
+        pageInfo: { hasNextPage: false },
+      }),
+      updateIssue: async () => {
+        writes += 1;
+        return { success: true, issueId: "issue-1" };
+      },
+    },
+  ).tracker;
+  await assert.rejects(
+    wrongTeam.mutateIssue(boundIssue(), { kind: "set_state", state: "Review" }, new AbortController().signal),
+    /Linear issue mutation failed/,
+  );
+  assert.equal(writes, 0, "a state from another team must never reach a write");
+
+  const lookupAbort = new AbortController();
+  const abortedAfterLookup = createTracker(
+    () => assert.fail("mutations must not use raw GraphQL"),
+    {},
+    undefined,
+    {
+      issue: async () => currentLinearIssue(),
+      workflowStates: async () => {
+        lookupAbort.abort(new Error(secret));
+        return {
+          nodes: [{ id: "state-review", name: "Review", teamId: "team-1" }],
+          pageInfo: { hasNextPage: false },
+        };
+      },
+      updateIssue: async () => {
+        writes += 1;
+        return { success: true, issueId: "issue-1" };
+      },
+    },
+  ).tracker;
+  await assert.rejects(
+    abortedAfterLookup.mutateIssue(boundIssue(), { kind: "set_state", state: "Review" }, lookupAbort.signal),
+    /Linear issue mutation was aborted/,
+  );
+  assert.equal(writes, 0, "an aborted lookup must never reach a write");
+
+  await assert.rejects(
+    moved.mutateIssue(
+      boundIssue({ nativeRef: { owner: "other" } }),
+      { kind: "comment", body: "safe" },
+      new AbortController().signal,
+    ),
+    /not bound to this Linear tracker/,
+  );
+});
+
+test("uses the real Linear SDK contract for typed state mutation payloads", async () => {
+  const environmentName = "SYMPHONY_LINEAR_MUTATION_SDK_TEST_KEY";
+  const previousApiKey = process.env[environmentName];
+  const originalFetch = globalThis.fetch;
+  const operations: string[] = [];
+  process.env[environmentName] = "test-secret";
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body)) as {
+      query: string;
+      variables: Record<string, unknown>;
+    };
+    const operation = /\b(?:query|mutation)\s+(\w+)/u.exec(request.query)?.[1];
+    assert.ok(operation);
+    operations.push(operation);
+    let data: Record<string, unknown>;
+    if (operation === "issue") {
+      data = {
+        issue: {
+          __typename: "Issue",
+          id: "issue-1",
+          identifier: "SYM-1",
+          labelIds: [],
+          archivedAt: null,
+          trashed: false,
+          team: { id: "team-1" },
+          project: { id: "project-1" },
+          assignee: { id: "worker-1" },
+          state: { id: "state-todo" },
+          sharedAccess: {
+            isShared: false,
+            sharedWithCount: 0,
+            viewerHasOnlySharedAccess: false,
+            disallowedIssueFields: [],
+            sharedWithUsers: [],
+          },
+          reactions: [],
+        },
+      };
+    } else if (operation === "project") {
+      data = { project: { __typename: "Project", id: "project-1", slugId: "symphony" } };
+    } else if (operation === "workflowStates") {
+      data = {
+        workflowStates: {
+          nodes: [{
+            __typename: "WorkflowState",
+            id: "state-review",
+            name: "Review",
+            team: { id: "team-1" },
+            archivedAt: null,
+          }],
+          pageInfo: {
+            hasNextPage: false,
+            hasPreviousPage: false,
+            startCursor: null,
+            endCursor: null,
+          },
+        },
+      };
+    } else if (operation === "updateIssue") {
+      assert.deepEqual(request.variables, {
+        id: "issue-1",
+        input: { stateId: "state-review" },
+      });
+      data = {
+        issueUpdate: {
+          __typename: "IssuePayload",
+          lastSyncId: 1,
+          success: true,
+          issue: { id: "issue-1" },
+        },
+      };
+    } else {
+      assert.fail(`unexpected Linear SDK operation ${operation}`);
+    }
+    return new Response(JSON.stringify({ data }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const tracker = new LinearTracker({
+      api_key: `$${environmentName}`,
+      endpoint: "https://linear.invalid/graphql",
+      project_slug: "symphony",
+      assignee: "worker-1",
+    });
+    await tracker.mutateIssue(
+      boundIssue(),
+      { kind: "set_state", state: "Review" },
+      new AbortController().signal,
+    );
+    assert.deepEqual(operations, ["issue", "project", "workflowStates", "updateIssue"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousApiKey === undefined) delete process.env[environmentName];
+    else process.env[environmentName] = previousApiKey;
+  }
 });
 
 test("rejects malformed or looping cursors and SDK failures without leaking the API key", async () => {
