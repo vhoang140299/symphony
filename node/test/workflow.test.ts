@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { test } from "vitest";
 import { parseWorkflowConfig } from "../src/config/schema.js";
 import { WorkflowStore } from "../src/config/store.js";
 import { loadWorkflow, renderPrompt } from "../src/config/workflow.js";

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import test from "node:test";
+import { test } from "vitest";
 import type { Issue, IssueMutation } from "../src/domain.js";
 import { GitHubTracker } from "../src/trackers/github.js";
 import { createTracker } from "../src/trackers/registry.js";

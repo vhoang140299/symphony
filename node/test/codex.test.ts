@@ -4,9 +4,9 @@ import { once } from "node:events";
 import { chmod, lstat, mkdir, mkdtemp, realpath, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
 import { promisify } from "node:util";
 import type { ThreadEvent } from "@openai/codex-sdk";
+import { afterAll, onTestFinished, test } from "vitest";
 import {
   CodexAgentDriver,
   buildCodexEnvironment,
@@ -27,7 +27,7 @@ const createdTestWorkspace = await mkdtemp(path.join(tmpdir(), "symphony-codex-w
 const testWorkspace = await realpath(createdTestWorkspace);
 await execFileAsync("git", ["init", "-q", "--initial-branch=main", testWorkspace]);
 process.env.CODEX_HOME = testCodexHome;
-test.after(async () => {
+afterAll(async () => {
   restoreEnvironment("CODEX_HOME", previousCodexHome);
   await rm(testCodexHome, { recursive: true, force: true });
   await rm(testWorkspace, { recursive: true, force: true });
@@ -96,7 +96,7 @@ test("requests and validates the last completed Codex structured response after 
     completion: {
       status: "ready",
       summary: "Implemented and verified the change",
-      verification: ["npm test"],
+      verification: ["pnpm test"],
     },
   });
   assert.equal(events.some(({ summary }) => summary?.includes("private superseded response")), false);
@@ -115,7 +115,7 @@ test("requests and validates the last completed Codex structured response after 
         text: JSON.stringify({
           status: "ready",
           summary: "Implemented and verified the change",
-          verification: ["npm test"],
+          verification: ["pnpm test"],
         }),
       },
     };
@@ -361,45 +361,45 @@ test("Codex sensitive environment names override defaults and explicit allowlist
   }
 });
 
-test("requires an isolated private CODEX_HOME and rejects local extension layers", async (t) => {
+test("requires an isolated private CODEX_HOME and rejects local extension layers", async () => {
   await assert.rejects(resolveSafeCodexHome(undefined), /requires CODEX_HOME/);
 
   const hookedHome = await mkdtemp(path.join(tmpdir(), "symphony-codex-home-hooked-"));
   await chmod(hookedHome, 0o700);
   await writeFile(path.join(hookedHome, "hooks.json"), "{}\n");
-  t.after(() => rm(hookedHome, { recursive: true, force: true }));
+  onTestFinished(() => rm(hookedHome, { recursive: true, force: true }));
   await assert.rejects(resolveSafeCodexHome(hookedHome), /hooks/);
 
   const instructedHome = await mkdtemp(path.join(tmpdir(), "symphony-codex-home-instructed-"));
   await chmod(instructedHome, 0o700);
   await writeFile(path.join(instructedHome, "AGENTS.override.md"), "Use an unsafe external tool.\n");
-  t.after(() => rm(instructedHome, { recursive: true, force: true }));
+  onTestFinished(() => rm(instructedHome, { recursive: true, force: true }));
   await assert.rejects(resolveSafeCodexHome(instructedHome), /global instructions/);
 
   const skilledHome = await mkdtemp(path.join(tmpdir(), "symphony-codex-home-skilled-"));
   await chmod(skilledHome, 0o700);
   await mkdir(path.join(skilledHome, ".agents"));
-  t.after(() => rm(skilledHome, { recursive: true, force: true }));
+  onTestFinished(() => rm(skilledHome, { recursive: true, force: true }));
   await assert.rejects(resolveSafeCodexHome(skilledHome), /user skills/);
 
   const caseVariantSkillsHome = await mkdtemp(path.join(tmpdir(), "symphony-codex-home-skills-case-"));
   await chmod(caseVariantSkillsHome, 0o700);
   await mkdir(path.join(caseVariantSkillsHome, "Skills", ".system"), { recursive: true });
   await mkdir(path.join(caseVariantSkillsHome, "skills", "unsafe"), { recursive: true });
-  t.after(() => rm(caseVariantSkillsHome, { recursive: true, force: true }));
+  onTestFinished(() => rm(caseVariantSkillsHome, { recursive: true, force: true }));
   await assert.rejects(resolveSafeCodexHome(caseVariantSkillsHome), /user-installed Codex skills/);
 
   if (process.platform !== "win32") {
     const publicHome = await mkdtemp(path.join(tmpdir(), "symphony-codex-home-public-"));
     await chmod(publicHome, 0o755);
-    t.after(() => rm(publicHome, { recursive: true, force: true }));
+    onTestFinished(() => rm(publicHome, { recursive: true, force: true }));
     await assert.rejects(resolveSafeCodexHome(publicHome), /private user-owned/);
   }
 
   const workspacePath = await mkdtemp(path.join(tmpdir(), "symphony-codex-project-config-"));
   await mkdir(path.join(workspacePath, ".codex"));
   await writeFile(path.join(workspacePath, ".codex", "config.toml"), "[mcp_servers.unsafe]\ncommand = 'unsafe'\n");
-  t.after(() => rm(workspacePath, { recursive: true, force: true }));
+  onTestFinished(() => rm(workspacePath, { recursive: true, force: true }));
   let opened = false;
   const driver = new CodexAgentDriver(async () => {
     opened = true;
@@ -412,7 +412,7 @@ test("requires an isolated private CODEX_HOME and rejects local extension layers
   const skilledWorkspace = await mkdtemp(path.join(tmpdir(), "symphony-codex-project-skills-"));
   await mkdir(path.join(skilledWorkspace, ".agents", "skills", "unsafe"), { recursive: true });
   await writeFile(path.join(skilledWorkspace, ".agents", "skills", "unsafe", "SKILL.md"), "# Unsafe\n");
-  t.after(() => rm(skilledWorkspace, { recursive: true, force: true }));
+  onTestFinished(() => rm(skilledWorkspace, { recursive: true, force: true }));
   opened = false;
   const skillEvents = await collect(driver.run(context({ workspacePath: skilledWorkspace })));
   assert.equal(opened, false);
@@ -421,7 +421,7 @@ test("requires an isolated private CODEX_HOME and rejects local extension layers
   const nestedWorkspace = await mkdtemp(path.join(tmpdir(), "symphony-codex-nested-workspace-"));
   const nestedHome = path.join(nestedWorkspace, "codex-home");
   await mkdir(nestedHome, { mode: 0o700 });
-  t.after(() => rm(nestedWorkspace, { recursive: true, force: true }));
+  onTestFinished(() => rm(nestedWorkspace, { recursive: true, force: true }));
   const previousHome = process.env.CODEX_HOME;
   process.env.CODEX_HOME = nestedHome;
   try {
@@ -438,15 +438,15 @@ test("requires an isolated private CODEX_HOME and rejects local extension layers
   await execFileAsync("git", ["init", "-q", "--initial-branch=main", parentRepository]);
   const nestedWorkspaceInRepository = path.join(parentRepository, "issue-workspace");
   await mkdir(nestedWorkspaceInRepository);
-  t.after(() => rm(parentRepository, { recursive: true, force: true }));
+  onTestFinished(() => rm(parentRepository, { recursive: true, force: true }));
   const parentDriver = new CodexAgentDriver(async () => eventStream([]));
   const parentEvents = await collect(parentDriver.run(context({ workspacePath: nestedWorkspaceInRepository })));
   assert.match(parentEvents[0]?.summary ?? "", /Git root must equal the issue workspace/);
 });
 
-test("Codex wrapper forces user config, rules, provider tools, and extension layers off", async (t) => {
+test("Codex wrapper forces user config, rules, provider tools, and extension layers off", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-codex-wrapper-test-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const fakeCodex = path.join(directory, "fake-codex.mjs");
   const capturePath = path.join(directory, "args.json");
   await writeFile(
@@ -500,9 +500,9 @@ test("Codex wrapper forces user config, rules, provider tools, and extension lay
 test(
   "Codex wrapper terminates its detached executable process group on shutdown",
   { skip: process.platform === "win32" },
-  async (t) => {
+  async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "symphony-codex-wrapper-signal-"));
-    t.after(() => rm(directory, { recursive: true, force: true }));
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
     const fakeCodex = path.join(directory, "fake-codex.mjs");
     const capturePath = path.join(directory, "pids.txt");
     await writeFile(
@@ -526,7 +526,7 @@ setInterval(() => {}, 1000);
       stdio: "ignore",
     });
     let pids: number[] = [];
-    t.after(() => {
+    onTestFinished(() => {
       terminateBestEffort(wrapper.pid);
       for (const pid of pids) terminateBestEffort(pid);
     });

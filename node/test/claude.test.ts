@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { test } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildClaudeEnvironment,
@@ -62,7 +62,7 @@ test("validates Claude structured completion without exposing the raw result", (
       structured_output: {
         status: "ready",
         summary: "Implemented and verified the change",
-        verification: ["npm test"],
+        verification: ["pnpm test"],
       },
       permission_denials: [],
       modelUsage: {},
@@ -74,7 +74,7 @@ test("validates Claude structured completion without exposing the raw result", (
   assert.deepEqual(events[1]?.completion, {
     status: "ready",
     summary: "Implemented and verified the change",
-    verification: ["npm test"],
+    verification: ["pnpm test"],
   });
   assert.equal(events[1]?.summary, "Implemented and verified the change");
   assert.equal(events.some(({ summary }) => summary?.includes("private raw result")), false);
@@ -281,7 +281,7 @@ test("current-issue tools are exact opt-ins and bind mutation targets outside mo
     {
       commit_message: "Fix TEST-1",
       pull_request_title: "Fix TEST-1",
-      pull_request_body: "Verified with npm test.",
+      pull_request_body: "Verified with pnpm test.",
     },
     {},
   );
@@ -289,7 +289,7 @@ test("current-issue tools are exact opt-ins and bind mutation targets outside mo
     {
       commitMessage: "Fix TEST-1",
       pullRequestTitle: "Fix TEST-1",
-      pullRequestBody: "Verified with npm test.",
+      pullRequestBody: "Verified with pnpm test.",
     },
   ]);
   assert.deepEqual(publishResult?.structuredContent, {

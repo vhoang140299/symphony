@@ -1084,7 +1084,7 @@ function classifyIssue(issue: Issue, config: WorkflowConfig): "routable" | "term
   return isRoutable(issue, config) ? "routable" : "unroutable";
 }
 
-function isRoutable(issue: Issue, config: WorkflowConfig): boolean {
+export function isRoutable(issue: Issue, config: WorkflowConfig): boolean {
   if (!issue.id || !issue.identifier || !issue.title || !issue.state || !issue.dispatchable) return false;
   const state = normalizeState(issue.state);
   if (!config.tracker.activeStates.some((active) => normalizeState(active) === state)) return false;
@@ -1125,7 +1125,7 @@ function deliveryCredentialNames(config: WorkflowConfig): string[] {
   return matched === undefined ? ["GITHUB_TOKEN"] : ["GITHUB_TOKEN", matched];
 }
 
-function compareIssues(left: Issue, right: Issue): number {
+export function compareIssues(left: Issue, right: Issue): number {
   const priorityDifference = priorityRank(left.priority) - priorityRank(right.priority);
   if (priorityDifference !== 0) return priorityDifference;
   const createdDifference = dateRank(left.createdAt) - dateRank(right.createdAt);

@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node
+      - name: Set up toolchain
         uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
           install: true
@@ -30,10 +30,10 @@ jobs:
           working_directory: node
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Type-check
-        run: npm run check
+        run: pnpm run check
 
       - name: Test
-        run: npm test
+        run: pnpm test

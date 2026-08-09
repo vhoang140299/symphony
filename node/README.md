@@ -13,6 +13,7 @@ Claude Code or Codex through their official SDKs.
 ## Current scope
 
 - Runtime: Node.js with strict TypeScript and ESM
+- CLI and tooling: Commander, pnpm, and Vitest (Vite-powered)
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
 - Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools, host-controlled PR
   delivery, and operator retry labels
@@ -26,6 +27,7 @@ issues may therefore be retried after a run.
 
 - Node.js 24 or newer; [`mise`](https://mise.jdx.dev/) can install the recommended Node version
   from `mise.toml`.
+- pnpm 11.20.0; `mise install` installs the pinned package manager from `mise.toml`.
 - Git and the [GitHub CLI](https://cli.github.com/) authenticated with access to the target
   repository.
 - Claude Code authentication available to the child process, such as `ANTHROPIC_API_KEY` or an
@@ -50,15 +52,15 @@ customize the issue, configure the clone hook, and set `dispatchable: true`.
 cd node
 mise trust
 mise install
-npm ci
-npm run build
-npm start -- ./WORKFLOW.md
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm start ./WORKFLOW.md
 ```
 
-Without `mise`, install a supported Node release and run the three `npm` commands directly. The
-workflow path defaults to `./WORKFLOW.md`.
+Without `mise`, install a supported Node release and pnpm 11.20.0, then run the three `pnpm`
+commands directly. The workflow path defaults to `./WORKFLOW.md`.
 
-For one supervised or CI cycle, bypass npm's banner so stdout remains machine-readable:
+For one supervised or CI cycle, invoke the built CLI directly so stdout remains machine-readable:
 
 ```bash
 node dist/src/cli.js --once ./WORKFLOW.md
@@ -72,12 +74,30 @@ queue is drained. `SIGINT` and `SIGTERM` request graceful shutdown before exitin
 conventional signal status. On macOS and Linux, Symphony also terminates the complete hook process
 group; Windows child cleanup is best-effort. Omit `--once` for the continuous daemon.
 
+To validate routing without creating a workspace or starting an agent, run:
+
+```bash
+node dist/src/cli.js --preflight ./WORKFLOW.md
+```
+
+`--preflight` validates the workflow, performs one read-only tracker fetch, and prints one JSON
+document containing the tracker/runtime kinds, enabled delivery/control flags, fetched count, and
+the sorted eligible issue snapshot (IDs, identifiers, and states). This snapshot does not account
+for live claims, concurrency capacity, or the final per-issue refresh before dispatch. It does not
+run hooks, create workspaces, start an agent, mutate issues, or publish changes. It also does not
+validate coding-agent login, model access, or the configured runtime executable. Configuration and
+tracker-read failures exit nonzero; an empty or nonempty eligible list is a successful preflight.
+`--preflight` and `--once` cannot be combined.
+
 For development:
 
 ```bash
-npm run check
-npm test
+pnpm run check
+pnpm test
+pnpm test:watch
 ```
+
+Tests run with Vitest, the Vite-powered test runner.
 
 ## GitHub preview quickstart
 
@@ -139,8 +159,8 @@ normal `~/.codex`:
 cp WORKFLOW.codex.github.md WORKFLOW.preview.codex.md
 SYMPHONY_CODEX_HOME="$HOME/.symphony-codex"
 install -d -m 700 "$SYMPHONY_CODEX_HOME"
-CODEX_HOME="$SYMPHONY_CODEX_HOME" npm exec -- codex login
-CODEX_HOME="$SYMPHONY_CODEX_HOME" npm exec -- codex login status
+CODEX_HOME="$SYMPHONY_CODEX_HOME" pnpm exec codex login
+CODEX_HOME="$SYMPHONY_CODEX_HOME" pnpm exec codex login status
 GITHUB_TOKEN="$(gh auth token)" CODEX_HOME="$SYMPHONY_CODEX_HOME" \
   node dist/src/cli.js --once ./WORKFLOW.preview.codex.md
 ```
@@ -302,7 +322,7 @@ In delivery mode, Claude and Codex return a constrained result with this shape:
 {
   "status": "ready",
   "summary": "Implemented the requested change.",
-  "verification": ["npm test — passed"]
+  "verification": ["pnpm test — passed"]
 }
 ```
 

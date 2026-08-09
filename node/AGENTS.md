@@ -29,8 +29,8 @@ This directory is the Node.js/TypeScript Symphony implementation. Keep it aligne
 Run focused tests while editing, then finish with:
 
 ```bash
-npm run check
-npm test
+pnpm run check
+pnpm test
 ```
 
 Update `README.md` and `WORKFLOW.md` whenever public configuration or runtime behavior changes.

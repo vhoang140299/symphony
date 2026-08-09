@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdtemp, readFile, realpath, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test, { after } from "node:test";
+import { afterAll, test } from "vitest";
 import { stringify as stringifyYaml } from "yaml";
 import { WorkflowStore } from "../src/config/store.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, Issue, Tracker } from "../src/domain.js";
@@ -14,7 +14,7 @@ import { workspaceKey } from "../src/workspace/manager.js";
 const logger = createLogger("silent");
 const previousTrackerToken = process.env.TRACKER_TOKEN;
 process.env.TRACKER_TOKEN = "orchestrator-test-token";
-after(() => {
+afterAll(() => {
   if (previousTrackerToken === undefined) delete process.env.TRACKER_TOKEN;
   else process.env.TRACKER_TOKEN = previousTrackerToken;
 });
@@ -205,7 +205,7 @@ for (const runtimeKind of ["claude", "codex"] as const) {
         assert.equal(target.id, current.id);
         assert.equal(workspacePath, path.join(await realpath(directory), "workspaces", workspaceKey(current.identifier)));
         assert.equal(input.commitMessage, "acme/widget#7: Fix the widget");
-        assert.match(input.pullRequestBody, /npm test/);
+        assert.match(input.pullRequestBody, /pnpm test/);
         operations.push("publish");
         return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
       },
@@ -222,7 +222,7 @@ for (const runtimeKind of ["claude", "codex"] as const) {
           );
           operations.push("comment:uuid");
           assert.match(mutation.body, /https:\/\/github\.com\/acme\/widget\/pull\/11/);
-          assert.match(mutation.body, /npm test/);
+          assert.match(mutation.body, /pnpm test/);
         } else if (mutation.kind === "remove_label") {
           operations.push(`remove:${mutation.label}`);
           current = { ...current, labels: current.labels.filter((label) => label !== mutation.label) };
@@ -243,7 +243,7 @@ for (const runtimeKind of ["claude", "codex"] as const) {
           completion: {
             status: "ready",
             summary: "Implemented the requested fix.",
-            verification: ["npm test"],
+            verification: ["pnpm test"],
           },
         });
       } finally {
@@ -323,7 +323,7 @@ test("a partial host-delivery failure retries host work at the agent-attempt lim
   const driver = new FakeDriver(async function* () {
     driverRuns += 1;
     yield event("turn_completed", {
-      completion: { status: "ready", summary: "Fixed.", verification: ["npm test"] },
+      completion: { status: "ready", summary: "Fixed.", verification: ["pnpm test"] },
     });
   });
   const workflowPath = await writeDeliveryWorkflow(directory, "claude", { maxAttempts: 1 });
@@ -398,7 +398,7 @@ test("a stalled host delivery preserves its completion for a host-only retry", a
   const driver = new FakeDriver(async function* () {
     driverRuns += 1;
     yield event("turn_completed", {
-      completion: { status: "ready", summary: "Fixed.", verification: ["npm test"] },
+      completion: { status: "ready", summary: "Fixed.", verification: ["pnpm test"] },
     });
   });
   const workflowPath = await writeDeliveryWorkflow(directory, "claude", { stallTimeoutMs: 10 });
@@ -436,7 +436,7 @@ test("host delivery does not publish blocked, stale, or failed completions", asy
       name: "blocked",
       mutateBeforeTerminal: false,
       terminal: event("turn_completed", {
-        completion: { status: "blocked", summary: "Needs an API fixture.", verification: ["npm test: blocked"] },
+        completion: { status: "blocked", summary: "Needs an API fixture.", verification: ["pnpm test: blocked"] },
       }),
       expected: { running: 0, retrying: 0, blocked: 1 },
     },
@@ -444,7 +444,7 @@ test("host delivery does not publish blocked, stale, or failed completions", asy
       name: "stale",
       mutateBeforeTerminal: true,
       terminal: event("turn_completed", {
-        completion: { status: "ready", summary: "Done.", verification: ["npm test"] },
+        completion: { status: "ready", summary: "Done.", verification: ["pnpm test"] },
       }),
       expected: { running: 0, retrying: 0, blocked: 0 },
     },
