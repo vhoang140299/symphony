@@ -271,7 +271,7 @@ for (const runtimeKind of ["claude", "codex"] as const) {
   });
 }
 
-test("a partial host-delivery failure retries host work without rerunning the agent", async () => {
+test("a partial host-delivery failure retries host work at the agent-attempt limit without rerunning the agent", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-delivery-retry-"));
   let current = githubIssue();
   let driverRuns = 0;
@@ -320,7 +320,7 @@ test("a partial host-delivery failure retries host work without rerunning the ag
       completion: { status: "ready", summary: "Fixed.", verification: ["npm test"] },
     });
   });
-  const workflowPath = await writeDeliveryWorkflow(directory, "claude");
+  const workflowPath = await writeDeliveryWorkflow(directory, "claude", { maxAttempts: 1 });
   let now = Date.UTC(2026, 0, 1);
   const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
     tracker,
@@ -545,6 +545,95 @@ test("refreshes before exponential retries and starts fresh sessions after failu
   assert.equal(contexts[2]?.attempt, 2);
   assert.equal(contexts[2]?.sessionId, undefined);
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+  await orchestrator.stop();
+});
+
+test("blocks after exactly max_attempts dispatched runs and starts a fresh session on manual retry", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-max-attempts-"));
+  const issue = rawIssue("limited", "LIMITED-1", 1, "2025-01-01T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [issue] });
+  const contexts: AgentRunContext[] = [];
+  const errors: Array<{ bindings: Record<string, unknown>; message: string }> = [];
+  const retryLogger = {
+    debug() {},
+    info() {},
+    warn() {},
+    error(bindings: Record<string, unknown>, message: string) {
+      errors.push({ bindings, message });
+    },
+  } as unknown as AppLogger;
+  const driver = new FakeDriver(async function* (context) {
+    contexts.push(context);
+    yield event("session_started", { sessionId: `limited-session-${contexts.length}` });
+    yield event("turn_failed", { summary: `transient-${contexts.length}` });
+  });
+  const workflowPath = await writeWorkflow(directory, [issue], { maxAttempts: 2 });
+  let now = Date.UTC(2026, 0, 1);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, retryLogger), retryLogger, {
+    tracker,
+    driver,
+    now: () => now,
+    failureBaseDelayMs: 10,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
+
+  now += 10;
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.deepEqual(contexts.map(({ attempt }) => attempt), [null, 1]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+  assert.match(orchestrator.snapshot().blocked[0]?.summary ?? "", /after 2 dispatched runs \(max_attempts=2\)/);
+  const exhaustion = errors.find(({ message }) => message === "Agent run failed; retry budget exhausted");
+  assert.equal((exhaustion?.bindings.error as Error | undefined)?.message, "transient-2");
+
+  assert.equal(orchestrator.retryBlocked(issue.id), true);
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(contexts.length, 3);
+  assert.equal(contexts[2]?.sessionId, undefined);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(contexts.length, 3);
+  await orchestrator.stop();
+});
+
+test("max_attempts blocks continuations while manual retry preserves the session", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-max-continuations-"));
+  const issue = rawIssue("continued", "CONTINUED-1", 1, "2025-01-01T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [issue] });
+  const contexts: AgentRunContext[] = [];
+  const driver = new FakeDriver(async function* (context) {
+    contexts.push(context);
+    yield event("session_started", { sessionId: "continued-session" });
+    yield event("turn_completed", { sessionId: "continued-session" });
+  });
+  const workflowPath = await writeWorkflow(directory, [issue], { maxAttempts: 2 });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    continuationDelayMs: 0,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.deepEqual(contexts.map(({ attempt }) => attempt), [null, 1]);
+  assert.equal(contexts[1]?.sessionId, "continued-session");
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+
+  assert.equal(orchestrator.retryBlocked(issue.id), true);
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(contexts[2]?.sessionId, "continued-session");
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
   await orchestrator.stop();
 });
 
@@ -881,7 +970,7 @@ function githubIssue(): Issue {
 async function writeDeliveryWorkflow(
   directory: string,
   runtimeKind: "claude" | "codex",
-  options: { stallTimeoutMs?: number } = {},
+  options: { maxAttempts?: number; stallTimeoutMs?: number } = {},
 ): Promise<string> {
   const workflowPath = path.join(directory, "WORKFLOW.md");
   const config = {
@@ -896,7 +985,12 @@ async function writeDeliveryWorkflow(
     polling: { interval_ms: 60_000 },
     workspace: { root: "./workspaces" },
     hooks: { timeout_ms: 1_000 },
-    agent: { max_concurrent_agents: 1, max_turns: 1, max_retry_backoff_ms: 1_000 },
+    agent: {
+      max_concurrent_agents: 1,
+      max_turns: 1,
+      ...(options.maxAttempts === undefined ? {} : { max_attempts: options.maxAttempts }),
+      max_retry_backoff_ms: 1_000,
+    },
     runtime: {
       kind: runtimeKind,
       turn_timeout_ms: 10_000,
@@ -913,6 +1007,7 @@ async function writeWorkflow(
   issues: Array<Record<string, unknown>>,
   options: {
     maxConcurrentAgents?: number;
+    maxAttempts?: number;
     hooks?: Record<string, string>;
     maxTurns?: number;
     pollIntervalMs?: number;
@@ -935,6 +1030,7 @@ async function writeWorkflow(
     agent: {
       max_concurrent_agents: options.maxConcurrentAgents ?? 1,
       max_turns: options.maxTurns ?? 1,
+      ...(options.maxAttempts === undefined ? {} : { max_attempts: options.maxAttempts }),
       max_retry_backoff_ms: 1_000,
     },
     runtime: {

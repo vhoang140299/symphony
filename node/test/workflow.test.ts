@@ -65,6 +65,16 @@ test("uses SPEC agent defaults and accepts max_turns as the canonical turn limit
   const workflow = await loadWorkflow(workflowPath);
   assert.equal(workflow.config.agent.maxTurns, 1);
   assert.equal(workflow.config.agent.maxConcurrentAgents, 10);
+  assert.equal(workflow.config.agent.maxAttempts, null);
+});
+
+test("accepts a positive max_attempts limit and rejects invalid limits", () => {
+  assert.equal(
+    parseWorkflowConfig({ tracker: { kind: "memory" }, agent: { max_attempts: 3 } }).agent.maxAttempts,
+    3,
+  );
+  assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, agent: { max_attempts: 0 } }));
+  assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, agent: { max_attempts: 1.5 } }));
 });
 
 test("uses tracker-specific state defaults and preserves explicit states", () => {
@@ -172,6 +182,7 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   });
   assert.deepEqual(workflow.config.delivery, { queueLabel: "symphony", reviewLabel: "human-review" });
   assert.equal(workflow.config.agent.maxTurns, 1);
+  assert.equal(workflow.config.agent.maxAttempts, 3);
   assert.deepEqual(workflow.config.runtime.options.allowed_tools, [
     "Read",
     "Edit",
@@ -181,6 +192,7 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   ]);
   assert.equal(codexWorkflow.config.runtime.kind, "codex");
   assert.equal(codexWorkflow.config.agent.maxTurns, 1);
+  assert.equal(codexWorkflow.config.agent.maxAttempts, 3);
   assert.deepEqual(codexWorkflow.config.delivery, workflow.config.delivery);
 });
 

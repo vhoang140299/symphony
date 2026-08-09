@@ -57,6 +57,7 @@ const agentSchema = z
     max_concurrent_agents: positiveInteger.default(10),
     max_turns: positiveInteger.optional(),
     max_continuations: positiveInteger.optional(),
+    max_attempts: positiveInteger.optional(),
     max_retry_backoff_ms: positiveInteger.default(300_000),
     max_concurrent_agents_by_state: z.record(z.string(), positiveInteger).default({}),
   })
@@ -184,6 +185,7 @@ export interface WorkflowConfig {
   agent: {
     maxConcurrentAgents: number;
     maxTurns: number;
+    maxAttempts: number | null;
     maxRetryBackoffMs: number;
     maxConcurrentAgentsByState: Record<string, number>;
   };
@@ -228,6 +230,7 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
     agent: {
       maxConcurrentAgents: parsed.agent.max_concurrent_agents,
       maxTurns: parsed.agent.max_turns ?? parsed.agent.max_continuations ?? 20,
+      maxAttempts: parsed.agent.max_attempts ?? null,
       maxRetryBackoffMs: parsed.agent.max_retry_backoff_ms,
       maxConcurrentAgentsByState: stateLimits,
     },

@@ -41,6 +41,7 @@ function workflow(root: string, hooks: Partial<WorkflowConfig["hooks"]> = {}): W
     agent: {
       maxConcurrentAgents: 1,
       maxTurns: 1,
+      maxAttempts: null,
       maxRetryBackoffMs: 1_000,
       maxConcurrentAgentsByState: {},
     },
