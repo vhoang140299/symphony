@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "vitest";
 import { parseWorkflowConfig } from "../src/config/schema.js";
@@ -32,6 +32,51 @@ Work on {{ issue.identifier }} (attempt {{ attempt }}).
 
   workflow.promptTemplate = "{{ issue.missing_field }}";
   await assert.rejects(renderPrompt(workflow, sampleIssue, null));
+});
+
+test("resolves optional state paths with the workspace path rules", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-state-resolve-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const environmentName = "SYMPHONY_TEST_CHECKPOINT_PATH";
+  const previousEnvironmentValue = process.env[environmentName];
+  const environmentPath = path.join(directory, "environment-state.json");
+  process.env[environmentName] = environmentPath;
+
+  try {
+    for (const [configuredPath, expectedPath] of [
+      ["./relative-state.json", path.join(directory, "relative-state.json")],
+      [`$${environmentName}`, environmentPath],
+      ["~/.symphony-test-state.json", path.join(homedir(), ".symphony-test-state.json")],
+    ]) {
+      await writeFile(
+        workflowPath,
+        `---\ntracker:\n  kind: memory\nworkspace:\n  root: ./workspaces\nstate:\n  path: ${JSON.stringify(configuredPath)}\n---\nDo work.\n`,
+      );
+      assert.equal((await loadWorkflow(workflowPath)).config.state?.path, expectedPath);
+    }
+  } finally {
+    if (previousEnvironmentValue === undefined) delete process.env[environmentName];
+    else process.env[environmentName] = previousEnvironmentValue;
+  }
+});
+
+test("keeps checkpoint files out of issue workspace descendants", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-state-containment-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+
+  for (const [configuredPath, accepted] of [
+    ["./workspaces/state.json", true],
+    ["./state/checkpoint.json", true],
+    ["./workspaces", false],
+    ["./workspaces/ISSUE-1/state.json", false],
+  ] as const) {
+    await writeFile(
+      workflowPath,
+      `---\ntracker:\n  kind: memory\nworkspace:\n  root: ./workspaces\nstate:\n  path: ${JSON.stringify(configuredPath)}\n---\nDo work.\n`,
+    );
+    if (accepted) await loadWorkflow(workflowPath);
+    else await assert.rejects(loadWorkflow(workflowPath), /state\.path.*workspace\.root.*direct file child/i);
+  }
 });
 
 test("rejects a workflow without tracker.kind", async () => {
@@ -75,6 +120,19 @@ test("accepts a positive max_attempts limit and rejects invalid limits", () => {
   );
   assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, agent: { max_attempts: 0 } }));
   assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, agent: { max_attempts: 1.5 } }));
+});
+
+test("keeps state optional and validates its strict shape", () => {
+  assert.equal(parseWorkflowConfig({ tracker: { kind: "memory" } }).state, undefined);
+  assert.deepEqual(
+    parseWorkflowConfig({ tracker: { kind: "memory" }, state: { path: " checkpoint.json " } }).state,
+    { path: "checkpoint.json" },
+  );
+  assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, state: { path: " " } }));
+  assert.throws(() => parseWorkflowConfig({
+    tracker: { kind: "memory" },
+    state: { path: "checkpoint.json", extra: true },
+  }), /unrecognized|extra/i);
 });
 
 test("uses tracker-specific state defaults and preserves explicit states", () => {
@@ -230,6 +288,7 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   });
   assert.deepEqual(workflow.config.delivery, { queueLabel: "symphony", reviewLabel: "human-review" });
   assert.deepEqual(workflow.config.control, { retryLabel: "symphony-retry" });
+  assert.equal(workflow.config.state, undefined);
   assert.equal(workflow.config.agent.maxTurns, 1);
   assert.equal(workflow.config.agent.maxAttempts, 3);
   assert.deepEqual(workflow.config.runtime.options.allowed_tools, [
@@ -244,6 +303,7 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   assert.equal(codexWorkflow.config.agent.maxAttempts, 3);
   assert.deepEqual(codexWorkflow.config.delivery, workflow.config.delivery);
   assert.deepEqual(codexWorkflow.config.control, workflow.config.control);
+  assert.equal(codexWorkflow.config.state, undefined);
 });
 
 const sampleIssue: Issue = {

@@ -5,7 +5,7 @@ const maxSummaryLength = 2_000;
 const maxVerificationItems = 20;
 const maxVerificationItemLength = 500;
 
-const agentCompletionSchema = z
+export const agentCompletionSchema = z
   .object({
     status: z.enum(["ready", "blocked"]),
     summary: z.string().trim().min(1).max(maxSummaryLength),

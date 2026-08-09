@@ -1,0 +1,630 @@
+import assert from "node:assert/strict";
+import { access, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterAll, onTestFinished, test } from "vitest";
+import { stringify as stringifyYaml } from "yaml";
+import { WorkflowStore } from "../src/config/store.js";
+import type { WorkflowDefinition } from "../src/config/workflow.js";
+import type { AgentDriver, AgentEvent, AgentRunContext, Issue, Tracker } from "../src/domain.js";
+import { createLogger } from "../src/log.js";
+import { Orchestrator, workflowScopeHash } from "../src/orchestrator.js";
+import { RunStateStore, type PersistedClaim } from "../src/state/store.js";
+import { MemoryTracker } from "../src/trackers/memory.js";
+
+const logger = createLogger("silent");
+const idempotencyKey = "123e4567-e89b-42d3-a456-426614174000";
+const completion = {
+  status: "ready" as const,
+  summary: "Implemented the requested fix.",
+  verification: ["pnpm test"],
+};
+const posixTest = process.platform === "win32" ? test.skip : test;
+const previousTrackerToken = process.env.RECOVERY_TRACKER_TOKEN;
+process.env.RECOVERY_TRACKER_TOKEN = "recovery-test-token";
+afterAll(() => {
+  if (previousTrackerToken === undefined) delete process.env.RECOVERY_TRACKER_TOKEN;
+  else process.env.RECOVERY_TRACKER_TOKEN = previousTrackerToken;
+});
+
+posixTest("restores interrupted and exhausted model work as durable blocked claims", async () => {
+  const root = await fixture("symphony-recovery-blocked-");
+  const issues = [
+    rawIssue("crashed", "CRASHED-1"),
+    rawIssue("exhausted", "EXHAUSTED-1"),
+  ];
+  const workflowPath = await writeMemoryWorkflow(root, issues, { maxAttempts: 2 });
+  const { workflowStore, store } = await durableStore(workflowPath);
+  await store.save([
+    { kind: "running", issueId: "crashed", attempt: 1, continuation: 0 },
+    {
+      kind: "blocked",
+      issueId: "exhausted",
+      attempt: 1,
+      continuation: 0,
+      blockedAtMs: 1,
+      summary: "Agent retry budget exhausted after 2 dispatched runs (max_attempts=2); manual retry required",
+    },
+  ]);
+
+  const contexts: AgentRunContext[] = [];
+  const driver = driverFrom(async function* (context) {
+    contexts.push(context);
+    yield event("turn_failed", { summary: "still failing" });
+  });
+  const tracker = new MemoryTracker({ issues });
+  const orchestrator = new Orchestrator(workflowStore, logger, { tracker, driver, failureBaseDelayMs: 0 });
+
+  await orchestrator.initialize();
+  assert.equal(contexts.length, 0);
+  assert.deepEqual(orchestrator.snapshot().blocked.map(({ issueId }) => issueId).sort(), ["crashed", "exhausted"]);
+  assert.deepEqual((await store.load()).map(({ kind }) => kind), ["blocked", "blocked"]);
+
+  await orchestrator.pollOnce();
+  assert.equal(contexts.length, 0);
+  assert.equal(await orchestrator.retryBlocked("crashed"), true);
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0]?.sessionId, undefined);
+  await orchestrator.stop();
+
+  const restartedRuns: AgentRunContext[] = [];
+  const restarted = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver: driverFrom(async function* (context) {
+      restartedRuns.push(context);
+      yield event("turn_failed");
+    }),
+  });
+  await restarted.initialize();
+  assert.equal(restartedRuns.length, 0);
+  assert.deepEqual(restarted.snapshot().blocked.map(({ issueId }) => issueId).sort(), ["crashed", "exhausted"]);
+  await restarted.stop();
+});
+
+posixTest("restores an already-admitted manual retry even when its attempt is at the current limit", async () => {
+  const root = await fixture("symphony-recovery-admitted-retry-");
+  const issue = rawIssue("manual", "MANUAL-1");
+  const workflowPath = await writeMemoryWorkflow(root, [issue], { maxAttempts: 2 });
+  const { workflowStore, store } = await durableStore(workflowPath);
+  await store.save([
+    {
+      kind: "retrying",
+      issueId: issue.id,
+      attempt: 2,
+      continuation: 0,
+      dueAtMs: 0,
+      reason: "continuation",
+    },
+  ]);
+  const contexts: AgentRunContext[] = [];
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker: new MemoryTracker({ issues: [issue] }),
+    driver: driverFrom(async function* (context) {
+      contexts.push(context);
+      yield event("turn_failed", { summary: "manual run failed" });
+    }),
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0]?.attempt, 2);
+  assert.equal(contexts[0]?.sessionId, undefined);
+  assert.equal(orchestrator.snapshot().blocked.length, 1);
+  await orchestrator.stop();
+});
+
+posixTest("retries recovery from the beginning after a transient later-claim refresh failure", async () => {
+  const root = await fixture("symphony-recovery-retry-init-");
+  const rawIssues = [rawIssue("first", "FIRST-1"), rawIssue("second", "SECOND-1")];
+  const memory = new MemoryTracker({ issues: rawIssues });
+  const issues = await memory.fetchIssuesByIds(["first", "second"]);
+  const workflowPath = await writeMemoryWorkflow(root, rawIssues);
+  const { workflowStore, store } = await durableStore(workflowPath);
+  await store.save([
+    { kind: "running", issueId: "first", attempt: null, continuation: 0 },
+    {
+      kind: "blocked",
+      issueId: "second",
+      attempt: 1,
+      continuation: 0,
+      blockedAtMs: 1,
+      summary: "waiting",
+    },
+  ]);
+  let failSecondRefresh = true;
+  const tracker: Tracker = {
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssuesByIds(ids) {
+      if (ids[0] === "second" && failSecondRefresh) {
+        failSecondRefresh = false;
+        throw new Error("transient tracker failure");
+      }
+      return issues.filter((issue) => ids.includes(issue.id));
+    },
+  };
+  let modelCalls = 0;
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+  });
+
+  await assert.rejects(orchestrator.initialize(), /Unable to refresh persisted issue second/);
+  await orchestrator.initialize();
+
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(orchestrator.snapshot().blocked.map(({ issueId }) => issueId).sort(), ["first", "second"]);
+  assert.deepEqual((await store.load()).map(({ kind }) => kind), ["blocked", "blocked"]);
+  await orchestrator.stop();
+});
+
+posixTest("persists a partial delivery and resumes it with the same comment key without rerunning the model", async () => {
+  const root = await fixture("symphony-recovery-delivery-");
+  const issue = githubIssue();
+  const workflowPath = await writeGithubWorkflow(root);
+  const { workflowStore, store } = await durableStore(workflowPath);
+
+  let current = issue;
+  let modelCalls = 0;
+  let publishCalls = 0;
+  let loseFirstCommentResponse = true;
+  const commentKeys: string[] = [];
+  const checkpointKeys: string[] = [];
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.some((state) => state.toLowerCase() === current.state) ? [current] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(current.id) ? [current] : [];
+    },
+    async publishIssueChange() {
+      publishCalls += 1;
+      const [checkpoint] = await store.load();
+      assert.equal(checkpoint?.kind, "running");
+      const checkpointKey = checkpoint !== undefined && "pendingDelivery" in checkpoint
+        ? checkpoint.pendingDelivery?.idempotencyKey
+        : undefined;
+      assert.ok(checkpointKey);
+      checkpointKeys.push(checkpointKey);
+      return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
+    },
+    async mutateIssue(_target, mutation) {
+      if (mutation.kind === "comment") {
+        commentKeys.push(mutation.idempotencyKey ?? "missing");
+        if (loseFirstCommentResponse) {
+          loseFirstCommentResponse = false;
+          throw new Error("simulated lost comment response");
+        }
+      }
+      if (mutation.kind === "add_label") {
+        current = { ...current, labels: [...new Set([...current.labels, mutation.label])] };
+      }
+      if (mutation.kind === "remove_label") {
+        current = { ...current, labels: current.labels.filter((label) => label !== mutation.label) };
+      }
+    },
+  };
+  const driver = driverFrom(async function* () {
+    modelCalls += 1;
+    yield event("turn_completed", { completion });
+  });
+  let now = Date.UTC(2026, 0, 1);
+  const first = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver,
+    now: () => now,
+    failureBaseDelayMs: 10,
+  });
+
+  await first.pollOnce();
+  await first.waitForCurrentRuns();
+
+  assert.equal(modelCalls, 1);
+  assert.equal(publishCalls, 1);
+  assert.equal(commentKeys.length, 1);
+  assert.deepEqual(checkpointKeys, commentKeys);
+  const [pendingRetry] = await store.load();
+  assert.equal(pendingRetry?.kind, "retrying");
+  assert.equal(
+    pendingRetry !== undefined && "pendingDelivery" in pendingRetry
+      ? pendingRetry.pendingDelivery?.idempotencyKey
+      : undefined,
+    commentKeys[0],
+  );
+  await first.stop();
+
+  now += 10;
+  const restarted = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    now: () => now,
+    failureBaseDelayMs: 10,
+  });
+  await restarted.pollOnce();
+  await restarted.waitForCurrentRuns();
+
+  assert.equal(modelCalls, 1);
+  assert.equal(publishCalls, 2);
+  assert.deepEqual(commentKeys, [commentKeys[0], commentKeys[0]]);
+  assert.deepEqual(checkpointKeys, [commentKeys[0], commentKeys[0]]);
+  assert.deepEqual(await store.load(), []);
+  await restarted.stop();
+});
+
+posixTest("does not create a workspace or invoke the model for an undeliverable recovered result", async () => {
+  const root = await fixture("symphony-recovery-missing-workspace-");
+  const issue = githubIssue();
+  const workflowPath = await writeGithubWorkflow(root);
+  const { workflowStore, definition, store } = await durableStore(workflowPath);
+  await store.save([
+    {
+      kind: "running",
+      issueId: issue.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+  ]);
+
+  let modelCalls = 0;
+  let publishCalls = 0;
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(issue.state) ? [issue] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(issue.id) ? [issue] : [];
+    },
+    async publishIssueChange() {
+      publishCalls += 1;
+      return { url: "https://github.com/acme/widget/pull/11", number: 11, branch: "symphony/issue-7" };
+    },
+    async mutateIssue() {},
+  };
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+    failureBaseDelayMs: 10,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(modelCalls, 0);
+  assert.equal(publishCalls, 0);
+  await assert.rejects(access(definition.config.workspace.root), isMissing);
+  const [retry] = await store.load();
+  assert.equal(retry?.kind, "retrying");
+  assert.equal(retry?.attempt, 0);
+  assert.equal(retry !== undefined && "pendingDelivery" in retry ? retry.pendingDelivery?.idempotencyKey : undefined, idempotencyKey);
+  await orchestrator.stop();
+});
+
+posixTest("fails recovery when a persisted delivery no longer has host-delivery support", async () => {
+  const root = await fixture("symphony-recovery-delivery-disabled-");
+  const issue = githubIssue();
+  const workflowPath = await writeGithubWorkflow(root);
+  const { store } = await durableStore(workflowPath);
+  await store.save([
+    {
+      kind: "running",
+      issueId: issue.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+  ]);
+  await writeGithubWorkflow(root, { delivery: false });
+  let modelCalls = 0;
+  const tracker: Tracker = {
+    async fetchIssuesByStates() {
+      return [issue];
+    },
+    async fetchIssuesByIds() {
+      return [issue];
+    },
+    async publishIssueChange() {
+      throw new Error("must not publish");
+    },
+    async mutateIssue() {},
+  };
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+  });
+
+  await assert.rejects(
+    orchestrator.initialize(),
+    /Persisted pending delivery requires configured host delivery support/,
+  );
+  assert.equal(modelCalls, 0);
+  assert.equal((await store.load()).length, 1);
+});
+
+posixTest("prunes terminal and unroutable persisted claims before scheduling", async () => {
+  const root = await fixture("symphony-recovery-prune-");
+  const terminal = { ...rawIssue("terminal", "TERMINAL-1"), state: "Done" };
+  const unroutable = { ...rawIssue("unroutable", "UNROUTABLE-1"), dispatchable: false };
+  const issues = [terminal, unroutable];
+  const workflowPath = await writeMemoryWorkflow(root, issues);
+  const { workflowStore, store } = await durableStore(workflowPath);
+  await store.save([
+    { kind: "running", issueId: terminal.id, attempt: null, continuation: 0 },
+    {
+      kind: "blocked",
+      issueId: unroutable.id,
+      attempt: 1,
+      continuation: 0,
+      blockedAtMs: 1,
+      summary: "waiting",
+    },
+  ]);
+  let modelCalls = 0;
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker: new MemoryTracker({ issues }),
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+  });
+
+  await orchestrator.initialize();
+
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(orchestrator.snapshot().blocked, []);
+  assert.deepEqual(await store.load(), []);
+  await orchestrator.stop();
+});
+
+posixTest("freezes state writes after the final shutdown checkpoint", async () => {
+  const root = await fixture("symphony-recovery-shutdown-race-");
+  const raw = rawIssue("blocked", "BLOCKED-1");
+  const memory = new MemoryTracker({ issues: [raw] });
+  const [issue] = await memory.fetchIssuesByIds([raw.id]);
+  assert.ok(issue);
+  const workflowPath = await writeMemoryWorkflow(root, [raw]);
+  const { workflowStore, store } = await durableStore(workflowPath);
+  const persisted: PersistedClaim = {
+    kind: "blocked",
+    issueId: issue.id,
+    attempt: null,
+    continuation: 0,
+    blockedAtMs: 1,
+    summary: "operator input required",
+  };
+  await store.save([persisted]);
+
+  const refreshStarted = deferred<void>();
+  const refreshResult = deferred<Issue[]>();
+  let fetchCount = 0;
+  const tracker: Tracker = {
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssuesByIds() {
+      fetchCount += 1;
+      if (fetchCount === 1) return [issue];
+      refreshStarted.resolve();
+      return refreshResult.promise;
+    },
+  };
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      yield event("turn_failed");
+    }),
+    shutdownGraceMs: 1,
+  });
+  await orchestrator.initialize();
+
+  const poll = orchestrator.pollOnce();
+  await refreshStarted.promise;
+  await orchestrator.stop();
+  refreshResult.resolve([]);
+  await poll;
+
+  assert.deepEqual(await store.load(), [persisted]);
+});
+
+posixTest("does not overwrite durable claims when shutdown times out during recovery", async () => {
+  const root = await fixture("symphony-recovery-init-shutdown-");
+  const raw = rawIssue("blocked", "BLOCKED-1");
+  const memory = new MemoryTracker({ issues: [raw] });
+  const [issue] = await memory.fetchIssuesByIds([raw.id]);
+  assert.ok(issue);
+  const workflowPath = await writeMemoryWorkflow(root, [raw]);
+  const { workflowStore, store } = await durableStore(workflowPath);
+  const persisted: PersistedClaim = {
+    kind: "blocked",
+    issueId: issue.id,
+    attempt: null,
+    continuation: 0,
+    blockedAtMs: 1,
+    summary: "operator input required",
+  };
+  await store.save([persisted]);
+  const refreshStarted = deferred<void>();
+  const refreshResult = deferred<Issue[]>();
+  const tracker: Tracker = {
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssuesByIds() {
+      refreshStarted.resolve();
+      return refreshResult.promise;
+    },
+  };
+  let modelCalls = 0;
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+    shutdownGraceMs: 1,
+  });
+
+  const starting = orchestrator.start();
+  await refreshStarted.promise;
+  await orchestrator.stop();
+  assert.deepEqual(await store.load(), [persisted]);
+  refreshResult.resolve([issue]);
+  await assert.rejects(starting, /stopped orchestrator/);
+
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(await store.load(), [persisted]);
+});
+
+posixTest("binds durable memory state to stable issue identities", async () => {
+  const root = await fixture("symphony-recovery-memory-scope-");
+  const workflowPath = await writeMemoryWorkflow(root, [rawIssue("shared", "OLD-1")]);
+  const oldDefinition = await new WorkflowStore(workflowPath, logger).initialize();
+  await writeMemoryWorkflow(root, [rawIssue("shared", "NEW-1")]);
+  const newDefinition = await new WorkflowStore(workflowPath, logger).initialize();
+
+  assert.notEqual(workflowScopeHash(oldDefinition), workflowScopeHash(newDefinition));
+});
+
+async function durableStore(workflowPath: string): Promise<{
+  workflowStore: WorkflowStore;
+  definition: WorkflowDefinition;
+  store: RunStateStore;
+}> {
+  const workflowStore = new WorkflowStore(workflowPath, logger);
+  const definition = await workflowStore.initialize();
+  const statePath = definition.config.state?.path;
+  assert.ok(statePath);
+  return {
+    workflowStore,
+    definition,
+    store: new RunStateStore(statePath, workflowScopeHash(definition)),
+  };
+}
+
+async function writeMemoryWorkflow(
+  root: string,
+  issues: Array<Record<string, unknown> & { id: string; identifier: string }>,
+  options: { maxAttempts?: number } = {},
+): Promise<string> {
+  return writeWorkflow(root, {
+    tracker: {
+      kind: "memory",
+      provider: { issues },
+      required_labels: ["symphony"],
+      active_states: ["Todo", "In Progress"],
+      terminal_states: ["Done"],
+    },
+    polling: { interval_ms: 60_000 },
+    workspace: { root: "./workspaces" },
+    hooks: { timeout_ms: 1_000 },
+    agent: {
+      max_concurrent_agents: 1,
+      max_turns: 1,
+      ...(options.maxAttempts === undefined ? {} : { max_attempts: options.maxAttempts }),
+      max_retry_backoff_ms: 1_000,
+    },
+    runtime: { kind: "claude", turn_timeout_ms: 10_000, stall_timeout_ms: 0, options: {} },
+    state: { path: "./runs.json" },
+  });
+}
+
+async function writeGithubWorkflow(root: string, options: { delivery?: boolean } = {}): Promise<string> {
+  return writeWorkflow(root, {
+    tracker: {
+      kind: "github",
+      provider: { owner: "acme", repo: "widget", token: "$RECOVERY_TRACKER_TOKEN" },
+      required_labels: ["symphony"],
+      active_states: ["open"],
+      terminal_states: ["closed"],
+    },
+    ...(options.delivery === false
+      ? {}
+      : { delivery: { queue_label: "symphony", review_label: "human-review" } }),
+    polling: { interval_ms: 60_000 },
+    workspace: { root: "./workspaces" },
+    hooks: { timeout_ms: 1_000 },
+    agent: { max_concurrent_agents: 1, max_turns: 1, max_retry_backoff_ms: 1_000 },
+    runtime: { kind: "claude", turn_timeout_ms: 10_000, stall_timeout_ms: 0, options: {} },
+    state: { path: "./runs.json" },
+  });
+}
+
+async function writeWorkflow(root: string, config: Record<string, unknown>): Promise<string> {
+  const workflowPath = path.join(root, "WORKFLOW.md");
+  await writeFile(workflowPath, `---\n${stringifyYaml(config)}---\nWork on {{ issue.identifier }}.\n`);
+  return workflowPath;
+}
+
+function rawIssue(id: string, identifier: string): Record<string, unknown> & { id: string; identifier: string } {
+  return {
+    id,
+    identifier,
+    title: `Issue ${identifier}`,
+    description: "Test issue",
+    state: "Todo",
+    priority: 1,
+    labels: ["symphony"],
+    dispatchable: true,
+    created_at: "2025-01-01T00:00:00Z",
+  };
+}
+
+function githubIssue(): Issue {
+  return {
+    id: "7",
+    nativeRef: { owner: "acme", repo: "widget", number: 7 },
+    identifier: "acme/widget#7",
+    title: "Fix the widget",
+    description: "Test issue",
+    priority: 1,
+    state: "open",
+    branchName: null,
+    url: "https://github.com/acme/widget/issues/7",
+    assigneeId: null,
+    labels: ["symphony"],
+    blockedBy: [],
+    dispatchable: true,
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-01T00:00:00Z",
+  };
+}
+
+function driverFrom(script: (context: AgentRunContext) => AsyncIterable<AgentEvent>): AgentDriver {
+  return { kind: "claude", run: script };
+}
+
+function event(type: AgentEvent["type"], fields: Omit<AgentEvent, "type" | "timestamp"> = {}): AgentEvent {
+  return { type, timestamp: new Date().toISOString(), ...fields };
+}
+
+async function fixture(prefix: string): Promise<string> {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), prefix)));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
+}
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}

@@ -97,6 +97,12 @@ const controlSchema = z
   })
   .strict();
 
+const stateSchema = z
+  .object({
+    path: nonEmptyString,
+  })
+  .strict();
+
 const rawWorkflowConfigSchema = z
   .object({
     tracker: trackerSchema,
@@ -107,6 +113,7 @@ const rawWorkflowConfigSchema = z
     runtime: runtimeSchema,
     delivery: deliverySchema.optional(),
     control: controlSchema.optional(),
+    state: stateSchema.optional(),
   })
   .passthrough()
   .superRefine((value, context) => {
@@ -223,6 +230,9 @@ export interface WorkflowConfig {
   control?: {
     retryLabel: string;
   };
+  state?: {
+    path: string;
+  };
 }
 
 export function parseWorkflowConfig(input: unknown): WorkflowConfig {
@@ -277,6 +287,13 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
       : {
           control: {
             retryLabel: parsed.control.retry_label.trim().toLowerCase(),
+          },
+        }),
+    ...(parsed.state === undefined
+      ? {}
+      : {
+          state: {
+            path: parsed.state.path,
           },
         }),
   };

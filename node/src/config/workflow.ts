@@ -18,14 +18,19 @@ const liquid = new Liquid({ strictVariables: true, strictFilters: true });
 
 export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefinition> {
   const absolutePath = path.resolve(workflowPath);
+  const workflowDirectory = path.dirname(absolutePath);
   const content = await readFile(absolutePath, "utf8");
   const { config: rawConfig, promptTemplate } = parseWorkflowDocument(content);
   const config = parseWorkflowConfig(rawConfig);
-  config.workspace.root = resolvePath(config.workspace.root, path.dirname(absolutePath));
+  config.workspace.root = resolvePath(config.workspace.root, workflowDirectory);
+  if (config.state !== undefined) {
+    config.state.path = resolvePath(config.state.path, workflowDirectory);
+    assertSafeStatePath(config.state.path, config.workspace.root);
+  }
 
   return {
     path: absolutePath,
-    directory: path.dirname(absolutePath),
+    directory: workflowDirectory,
     config,
     promptTemplate: promptTemplate || defaultPrompt,
   };
@@ -71,6 +76,15 @@ function resolvePath(value: string, workflowDirectory: string): string {
   }
 
   return path.resolve(workflowDirectory, resolved);
+}
+
+function assertSafeStatePath(statePath: string, workspaceRoot: string): void {
+  const relative = path.relative(workspaceRoot, statePath);
+  const insideWorkspaceRoot =
+    relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  if (relative === "" || (insideWorkspaceRoot && path.dirname(relative) !== ".")) {
+    throw new Error("state.path must be outside workspace.root or a direct file child of it");
+  }
 }
 
 function issueForTemplate(issue: Issue): Record<string, unknown> {

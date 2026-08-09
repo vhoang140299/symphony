@@ -596,7 +596,7 @@ test("blocks after exactly max_attempts dispatched runs and starts a fresh sessi
   const exhaustion = errors.find(({ message }) => message === "Agent run failed; retry budget exhausted");
   assert.equal((exhaustion?.bindings.error as Error | undefined)?.message, "transient-2");
 
-  assert.equal(orchestrator.retryBlocked(issue.id), true);
+  assert.equal(await orchestrator.retryBlocked(issue.id), true);
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
   assert.equal(contexts.length, 3);
@@ -635,7 +635,7 @@ test("max_attempts blocks continuations while manual retry preserves the session
   assert.equal(contexts[1]?.sessionId, "continued-session");
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
 
-  assert.equal(orchestrator.retryBlocked(issue.id), true);
+  assert.equal(await orchestrator.retryBlocked(issue.id), true);
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
   assert.equal(contexts[2]?.sessionId, "continued-session");
@@ -1134,7 +1134,7 @@ test("tracker reload cannot retarget running, blocked, or retried work with a re
   await orchestrator.pollOnce();
   assert.equal(orchestrator.snapshot().blocked[0]?.identifier, "OLD-1");
 
-  assert.equal(orchestrator.retryBlocked("OLD-1"), true);
+  assert.equal(await orchestrator.retryBlocked("OLD-1"), true);
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
 
