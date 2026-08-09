@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { test } from "vitest";
 import type { Issue, IssueMutation } from "../src/domain.js";
 import { GitHubTracker } from "../src/trackers/github.js";
-import { createTracker } from "../src/trackers/registry.js";
+import { createTracker, validateTrackerProvider } from "../src/trackers/registry.js";
 
 const TEST_IDEMPOTENCY_KEY = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -220,6 +220,28 @@ test("validates configuration, states, ids, payloads, and redacts tokens from er
     async () => Response.json([{ number: 1, title: "", state: "open" }]),
   );
   await assert.rejects(malformed.fetchIssuesByStates(["open"]), /returned an invalid issue: title:/);
+});
+
+test("validates GitHub provider syntax without resolving authentication", () => {
+  const variable = "SYMPHONY_GITHUB_UNSET_VALIDATION_TOKEN";
+  const previous = process.env[variable];
+  delete process.env[variable];
+  const provider = { owner: "acme", repo: "widget", token: `$${variable}` };
+  try {
+    assert.doesNotThrow(() => validateTrackerProvider("github", provider));
+    assert.throws(() => new GitHubTracker(provider), /token environment variable .* is not set/);
+    assert.throws(
+      () => validateTrackerProvider("github", { ...provider, token: "literal-secret" }),
+      /provider\.token must be an environment reference/,
+    );
+    assert.throws(
+      () => validateTrackerProvider("github", { ...provider, endpoint: "http://github.example" }),
+      /refuses to send a token over a non-HTTPS endpoint/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env[variable];
+    else process.env[variable] = previous;
+  }
 });
 
 test("uses GITHUB_TOKEN fallback and registry creates the GitHub tracker", async () => {

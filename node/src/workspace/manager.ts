@@ -129,6 +129,17 @@ export function workspaceKey(identifier: string): string {
   return `${sanitized}-${digest}`;
 }
 
+export async function inspectWorkspaceRoot(configuredRoot: string): Promise<"missing" | "valid"> {
+  try {
+    await validateOwnedDirectory(configuredRoot, "Workspace root");
+    await realpath(configuredRoot);
+    return "valid";
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
 async function validateWorkspacePath(
   workspacePath: string,
   issue: Issue,

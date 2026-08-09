@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "vitest";
 import { loadWorkflow } from "../src/config/workflow.js";
+import { configuredExecutableCandidates, runDoctor } from "../src/doctor.js";
 import type { Issue } from "../src/domain.js";
 import { summarizePreflight } from "../src/preflight.js";
 
@@ -16,7 +17,7 @@ const exampleWorkflowPath = fileURLToPath(new URL("../WORKFLOW.md", import.meta.
 
 test("CLI prints help and exits successfully", async () => {
   const result = await execFileAsync(process.execPath, [cliPath, "--help"]);
-  assert.match(result.stdout, /Usage: symphony-node \[--once \| --preflight\] \[WORKFLOW\]/);
+  assert.match(result.stdout, /Usage: symphony-node \[--once \| --preflight \| --doctor\] \[WORKFLOW\]/);
   assert.equal(result.stderr, "");
 });
 
@@ -157,18 +158,347 @@ test("preflight deduplicates tracker results before exposing eligible issue fiel
   assert.deepEqual(result.eligible, [{ id: "duplicate", identifier: "DUPLICATE-2", state: "Todo" }]);
 });
 
-test("CLI rejects mutually exclusive execution modes before loading the workflow", async () => {
-  await assert.rejects(
-    execFileAsync(process.execPath, [cliPath, "--once", "--preflight", exampleWorkflowPath]),
-    (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.ok("stdout" in error);
-      assert.ok("stderr" in error);
-      assert.equal(String(error.stdout), "");
-      assert.match(String(error.stderr), /cannot be used with option/);
-      return true;
-    },
+test(
+  "CLI --doctor stays offline and reports missing local paths as warnings without side effects",
+  { skip: process.platform === "win32" },
+  async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-"));
+    const workflowPath = path.join(directory, "WORKFLOW.md");
+    const workspaceRoot = path.join(directory, "missing-workspaces");
+    const stateDirectory = path.join(directory, "missing-state");
+    const statePath = path.join(stateDirectory, "checkpoint.json");
+    const hookMarker = path.join(directory, "hook-ran");
+    const executableMarker = path.join(directory, "executable-ran");
+    const executablePath = path.join(directory, "doctor-executable");
+    await writeFile(executablePath, `#!/bin/sh\nprintf x > ${JSON.stringify(executableMarker)}\n`);
+    await chmod(executablePath, 0o700);
+    await writeFile(
+      workflowPath,
+      `---
+tracker:
+  kind: github
+  provider:
+    owner: doctor-secret-owner
+    repo: doctor-secret-repository
+    endpoint: https://127.0.0.1:1
+    token: $DOCTOR_SECRET_TOKEN
+  required_labels: [symphony]
+  active_states: [open]
+  terminal_states: [closed]
+workspace:
+  root: ${JSON.stringify(workspaceRoot)}
+state:
+  path: ${JSON.stringify(statePath)}
+hooks:
+  after_create: printf x > ${JSON.stringify(hookMarker)}
+runtime:
+  kind: claude
+  options:
+    claude_executable: ${JSON.stringify(executablePath)}
+---
+Doctor secret prompt must never be rendered.
+`,
+    );
+
+    try {
+      const environment: NodeJS.ProcessEnv = { ...process.env, LOG_LEVEL: "silent" };
+      delete environment.DOCTOR_SECRET_TOKEN;
+      const result = await execFileAsync(process.execPath, [cliPath, "--doctor", workflowPath], {
+        env: environment,
+      });
+
+      assert.equal(result.stdout.trim().split("\n").length, 1);
+      assert.equal(result.stderr, "");
+      assert.deepEqual(JSON.parse(result.stdout), {
+        schemaVersion: 1,
+        ok: true,
+        tracker: "github",
+        runtime: "claude",
+        checks: [
+          { id: "workflow.config", status: "ok", summary: "workflow configuration is valid" },
+          { id: "tracker.config", status: "ok", summary: "tracker configuration is locally usable" },
+          { id: "runtime.options", status: "ok", summary: "runtime options are valid" },
+          { id: "runtime.executable", status: "ok", summary: "runtime executable is available" },
+          { id: "runtime.auth", status: "warning", summary: "runtime authentication was not verified" },
+          { id: "workspace.root", status: "warning", summary: "workspace root does not exist yet" },
+          { id: "state.store", status: "warning", summary: "durable state does not exist yet" },
+        ],
+      });
+      for (const sensitive of [
+        directory,
+        "DOCTOR_SECRET_TOKEN",
+        "doctor-secret-owner",
+        "doctor-secret-repository",
+        "Doctor secret prompt",
+      ]) {
+        assert.equal(result.stdout.includes(sensitive), false);
+      }
+      await assert.rejects(access(hookMarker));
+      await assert.rejects(access(executableMarker));
+      await assert.rejects(access(workspaceRoot));
+      await assert.rejects(access(stateDirectory));
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("doctor mirrors native Windows executable lookup without accepting shell scripts", () => {
+  assert.deepEqual(
+    configuredExecutableCandidates("agent.exe", "win32", "C:\\bin;D:\\tools"),
+    ["C:\\bin\\agent.exe", "D:\\tools\\agent.exe"],
   );
+  assert.deepEqual(
+    configuredExecutableCandidates("agent", "win32", "C:\\bin"),
+    ["C:\\bin\\agent.COM", "C:\\bin\\agent.EXE"],
+  );
+  assert.deepEqual(
+    configuredExecutableCandidates("C:\\bin\\agent.com", "win32", "D:\\ignored"),
+    ["C:\\bin\\agent.com"],
+  );
+  assert.deepEqual(configuredExecutableCandidates("agent.cmd", "win32", "C:\\bin"), []);
+  assert.deepEqual(configuredExecutableCandidates("C:\\bin\\agent.bat", "win32", ""), []);
+});
+
+test("doctor rejects Windows host delivery but leaves control-only GitHub routing usable", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-windows-delivery-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  assert.ok(platformDescriptor);
+  const workflow = (hostConfig: string) => `---
+tracker:
+  kind: github
+  provider:
+    owner: acme
+    repo: widget
+    token: $DOCTOR_WINDOWS_TOKEN
+  required_labels: [symphony]
+workspace:
+  root: ${JSON.stringify(path.join(directory, "missing-workspaces"))}
+runtime:
+  kind: claude
+  options:
+    permission_mode: acceptEdits
+${hostConfig}
+---
+Never rendered.
+`;
+
+  try {
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: "win32" });
+    await writeFile(workflowPath, workflow("delivery:\n  queue_label: symphony\n  review_label: review"));
+    const delivery = await runDoctor(workflowPath);
+    assert.deepEqual(
+      delivery.checks.find(({ id }) => id === "tracker.config"),
+      { id: "tracker.config", status: "error", summary: "tracker configuration is not locally usable" },
+    );
+
+    await writeFile(workflowPath, workflow("control:\n  retry_label: retry"));
+    const control = await runDoctor(workflowPath);
+    assert.deepEqual(
+      control.checks.find(({ id }) => id === "tracker.config"),
+      { id: "tracker.config", status: "ok", summary: "tracker configuration is locally usable" },
+    );
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test(
+  "CLI --doctor aggregates unsafe workspace and corrupt state errors without exposing raw details",
+  { skip: process.platform === "win32" },
+  async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-errors-"));
+    const workflowPath = path.join(directory, "WORKFLOW.md");
+    const workspaceRoot = path.join(directory, "unsafe-workspaces");
+    const stateDirectory = path.join(directory, "state");
+    const statePath = path.join(stateDirectory, "checkpoint.json");
+    const hookMarker = path.join(directory, "hook-ran");
+    await mkdir(workspaceRoot, { mode: 0o700 });
+    await chmod(workspaceRoot, 0o777);
+    await mkdir(stateDirectory, { mode: 0o700 });
+    await writeFile(statePath, "RAW_STATE_SECRET", { mode: 0o600 });
+    await writeFile(
+      workflowPath,
+      `---
+tracker:
+  kind: memory
+  provider: { issues: [] }
+workspace:
+  root: ${JSON.stringify(workspaceRoot)}
+state:
+  path: ${JSON.stringify(statePath)}
+hooks:
+  after_create: printf x > ${JSON.stringify(hookMarker)}
+runtime:
+  kind: claude
+  options:
+    claude_executable: ${JSON.stringify(process.execPath)}
+---
+Raw doctor error prompt must stay private.
+`,
+    );
+
+    try {
+      await assert.rejects(
+        execFileAsync(process.execPath, [cliPath, "--doctor", workflowPath]),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok("stdout" in error);
+          assert.ok("stderr" in error);
+          const stdout = String(error.stdout);
+          assert.equal(stdout.trim().split("\n").length, 1);
+          assert.equal(String(error.stderr), "");
+          assert.deepEqual(JSON.parse(stdout), {
+            schemaVersion: 1,
+            ok: false,
+            tracker: "memory",
+            runtime: "claude",
+            checks: [
+              { id: "workflow.config", status: "ok", summary: "workflow configuration is valid" },
+              { id: "tracker.config", status: "ok", summary: "tracker configuration is locally usable" },
+              { id: "runtime.options", status: "ok", summary: "runtime options are valid" },
+              { id: "runtime.executable", status: "ok", summary: "runtime executable is available" },
+              { id: "runtime.auth", status: "warning", summary: "runtime authentication was not verified" },
+              { id: "workspace.root", status: "error", summary: "workspace root is not locally usable" },
+              { id: "state.store", status: "error", summary: "durable state is not locally usable" },
+            ],
+          });
+          for (const sensitive of [directory, "RAW_STATE_SECRET", "Raw doctor error prompt"]) {
+            assert.equal(stdout.includes(sensitive), false);
+          }
+          return true;
+        },
+      );
+      await assert.rejects(access(hookMarker));
+      assert.equal(await readFile(statePath, "utf8"), "RAW_STATE_SECRET");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "CLI --doctor rejects missing and non-executable configured runtime paths without running them",
+  { skip: process.platform === "win32" },
+  async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-executable-"));
+    const workflowPath = path.join(directory, "WORKFLOW.md");
+    const executableMarker = path.join(directory, "executable-ran");
+    const missingExecutable = path.join(directory, "missing-executable");
+    const nonExecutable = path.join(directory, "non-executable");
+    await writeFile(nonExecutable, `#!/bin/sh\nprintf x > ${JSON.stringify(executableMarker)}\n`, { mode: 0o600 });
+
+    try {
+      for (const candidate of [missingExecutable, nonExecutable]) {
+        await writeFile(
+          workflowPath,
+          `---
+tracker:
+  kind: memory
+  provider: { issues: [] }
+workspace:
+  root: ${JSON.stringify(path.join(directory, "missing-workspaces"))}
+runtime:
+  kind: claude
+  options:
+    claude_executable: ${JSON.stringify(candidate)}
+---
+Executable probe must stay offline.
+`,
+        );
+        await assert.rejects(
+          execFileAsync(process.execPath, [cliPath, "--doctor", workflowPath]),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.ok("stdout" in error);
+            assert.ok("stderr" in error);
+            const stdout = String(error.stdout);
+            const report = JSON.parse(stdout) as {
+              ok: boolean;
+              checks: Array<{ id: string; status: string }>;
+            };
+            assert.equal(stdout.trim().split("\n").length, 1);
+            assert.equal(String(error.stderr), "");
+            assert.equal(report.ok, false);
+            assert.deepEqual(
+              report.checks.find(({ id }) => id === "runtime.executable"),
+              { id: "runtime.executable", status: "error", summary: "runtime executable is unavailable" },
+            );
+            assert.equal(stdout.includes(candidate), false);
+            return true;
+          },
+        );
+      }
+      await assert.rejects(access(executableMarker));
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("CLI --doctor reports invalid workflows with generic redacted JSON", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-config-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const rawSecret = "RAW_INVALID_WORKFLOW_SECRET";
+  await writeFile(workflowPath, `---\ntracker: { leaked: ${rawSecret} }\n---\n${rawSecret}\n`);
+
+  try {
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, "--doctor", workflowPath]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok("stdout" in error);
+        assert.ok("stderr" in error);
+        const stdout = String(error.stdout);
+        const report = JSON.parse(stdout) as {
+          schemaVersion: number;
+          ok: boolean;
+          tracker: string | null;
+          runtime: string | null;
+          checks: Array<{ id: string; status: string }>;
+        };
+        assert.equal(stdout.trim().split("\n").length, 1);
+        assert.equal(String(error.stderr), "");
+        assert.equal(report.schemaVersion, 1);
+        assert.equal(report.ok, false);
+        assert.equal(report.tracker, null);
+        assert.equal(report.runtime, null);
+        assert.equal(report.checks.length, 7);
+        assert.deepEqual(report.checks[0], {
+          id: "workflow.config",
+          status: "error",
+          summary: "workflow configuration is invalid",
+        });
+        assert.equal(stdout.includes(directory), false);
+        assert.equal(stdout.includes(rawSecret), false);
+        return true;
+      },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI rejects mutually exclusive execution modes before loading the workflow", async () => {
+  for (const modes of [
+    ["--once", "--preflight"],
+    ["--once", "--doctor"],
+    ["--preflight", "--doctor"],
+  ]) {
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, ...modes, exampleWorkflowPath]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok("stdout" in error);
+        assert.ok("stderr" in error);
+        assert.equal(String(error.stdout), "");
+        assert.match(String(error.stderr), /cannot be used with option/);
+        return true;
+      },
+    );
+  }
 });
 
 test("CLI --preflight exits nonzero on configuration and tracker errors", async () => {

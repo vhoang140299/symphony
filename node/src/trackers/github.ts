@@ -646,7 +646,14 @@ function publishedBaseBranch(
   return published.baseBranch;
 }
 
-function parseSettings(provider: Record<string, unknown>): GitHubSettings {
+export function validateGitHubProvider(provider: Record<string, unknown>): void {
+  parseSettings(provider, false);
+}
+
+function parseSettings(
+  provider: Record<string, unknown>,
+  materializeToken = true,
+): GitHubSettings {
   const unknownKeys = Object.keys(provider).filter(
     (key) => !["owner", "repo", "endpoint", "token", "base_branch", "git_url"].includes(key),
   );
@@ -657,10 +664,11 @@ function parseSettings(provider: Record<string, unknown>): GitHubSettings {
   const owner = repositorySegment(provider.owner, "owner");
   const repo = repositorySegment(provider.repo, "repo");
   const endpoint = normalizeEndpoint(provider.endpoint);
-  const token = resolveToken(provider.token, endpoint);
+  const tokenReference = validateTokenReference(provider.token);
+  const token = materializeToken ? resolveToken(tokenReference, endpoint) : undefined;
   const baseBranch = optionalBranch(provider.base_branch);
   const gitUrl = optionalGitUrl(provider.git_url, owner, repo);
-  if (token !== undefined && new URL(endpoint).protocol !== "https:") {
+  if ((tokenReference !== undefined || token !== undefined) && new URL(endpoint).protocol !== "https:") {
     throw new Error("GitHub tracker refuses to send a token over a non-HTTPS endpoint");
   }
   return { owner, repo, endpoint, token, baseBranch, gitUrl };
@@ -745,10 +753,8 @@ function normalizeEndpoint(value: unknown): string {
   return url.toString().replace(/\/+$/, "");
 }
 
-function resolveToken(value: unknown, endpoint: string): string | undefined {
-  if (value === undefined) {
-    return endpoint === DEFAULT_ENDPOINT ? nonBlank(process.env.GITHUB_TOKEN) : undefined;
-  }
+function validateTokenReference(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
   if (typeof value !== "string") {
     throw new Error("GitHub tracker provider.token must be an environment reference such as $GITHUB_TOKEN");
   }
@@ -757,9 +763,16 @@ function resolveToken(value: unknown, endpoint: string): string | undefined {
   if (!match?.[1]) {
     throw new Error("GitHub tracker provider.token must be an environment reference such as $GITHUB_TOKEN");
   }
-  const token = nonBlank(process.env[match[1]]);
+  return match[1];
+}
+
+function resolveToken(reference: string | undefined, endpoint: string): string | undefined {
+  if (reference === undefined) {
+    return endpoint === DEFAULT_ENDPOINT ? nonBlank(process.env.GITHUB_TOKEN) : undefined;
+  }
+  const token = nonBlank(process.env[reference]);
   if (token === undefined) {
-    throw new Error(`GitHub token environment variable ${match[1]} is not set`);
+    throw new Error(`GitHub token environment variable ${reference} is not set`);
   }
   return token;
 }

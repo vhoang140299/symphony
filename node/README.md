@@ -90,6 +90,30 @@ validate coding-agent login, model access, or the configured runtime executable.
 tracker-read failures exit nonzero; an empty or nonempty eligible list is a successful preflight.
 `--preflight` and `--once` cannot be combined.
 
+For a completely offline deployment-readiness check, run:
+
+```bash
+node dist/src/cli.js --doctor ./WORKFLOW.md
+```
+
+`--doctor` prints exactly one compact JSON document with `schemaVersion: 1`, an overall `ok`
+boolean, the configured `tracker` and `runtime` kinds, and fixed checks shaped as
+`{ id, status, summary }`. The check IDs, in order, are `workflow.config`, `tracker.config`,
+`runtime.options`, `runtime.executable`, `runtime.auth`, `workspace.root`, and `state.store`.
+`tracker` and `runtime` are `null` when the workflow cannot be loaded. Check status is `ok`,
+`warning`, or `error`; warnings still exit zero, while any error exits one. A missing workspace root
+or configured checkpoint is a warning because Symphony can create it when real work starts. An
+existing unsafe workspace or checkpoint is an error.
+
+Doctor validates workflow and adapter configuration, runtime options, and existing
+workspace/checkpoint safety. It is deliberately offline: it does not contact the
+tracker or an AI provider, start a subprocess or model, run hooks, create or modify workspace/state
+paths, mutate issues, or publish changes. It does not validate credential presence or authentication;
+the runtime-authentication check remains a warning. Use `--preflight` for the read-only tracker fetch and a
+supervised `--once` run for the real agent path. Doctor output omits paths, tokens, environment
+variable names, account details, prompts, and raw underlying errors. `--doctor`, `--preflight`, and
+`--once` are mutually exclusive.
+
 For development:
 
 ```bash

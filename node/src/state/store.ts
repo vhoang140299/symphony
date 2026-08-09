@@ -85,6 +85,12 @@ export class RunStateStore {
     return (await this.#readExisting()) ?? [];
   }
 
+  async inspect(): Promise<"missing" | "valid"> {
+    await this.#writeTail;
+    if (!(await inspectParent(this.#directory))) return "missing";
+    return (await this.#readExisting()) === undefined ? "missing" : "valid";
+  }
+
   async #readExisting(): Promise<PersistedClaim[] | undefined> {
     const expectedStat = await validateExistingFile(this.#filePath);
     if (expectedStat === undefined) return undefined;
@@ -174,6 +180,20 @@ export class RunStateStore {
 
 async function validateParent(directory: string): Promise<void> {
   await mkdir(directory, { recursive: true, mode: REQUIRED_DIRECTORY_MODE });
+  await validateParentMetadata(directory);
+}
+
+async function inspectParent(directory: string): Promise<boolean> {
+  try {
+    await validateParentMetadata(directory);
+    return true;
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return false;
+    throw error;
+  }
+}
+
+async function validateParentMetadata(directory: string): Promise<void> {
   const stat = await lstat(directory);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error("Run state parent must be a real directory");

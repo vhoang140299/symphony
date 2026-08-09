@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { WorkflowConfig } from "./config/schema.js";
@@ -18,6 +18,7 @@ import { isTerminalAgentEvent, normalizeState } from "./domain.js";
 import type { AppLogger } from "./log.js";
 import { classifyIssue, isRoutable, selectRoutableIssues } from "./routing.js";
 import { RunStateStore, type PersistedClaim } from "./state/store.js";
+import { workflowScopeHash } from "./state/scope.js";
 import { createAgentDriver } from "./agents/registry.js";
 import { createTracker } from "./trackers/registry.js";
 import { WorkspaceManager, workspaceKey } from "./workspace/manager.js";
@@ -1440,46 +1441,7 @@ function deliveryCredentialNames(config: WorkflowConfig): string[] {
   return matched === undefined ? ["GITHUB_TOKEN"] : ["GITHUB_TOKEN", matched];
 }
 
-export function workflowScopeHash(workflow: WorkflowDefinition): string {
-  const provider = workflow.config.tracker.provider;
-  const github = workflow.config.tracker.kind === "github"
-    ? {
-        owner: scopeString(provider.owner),
-        repo: scopeString(provider.repo),
-        endpoint: scopeUrl(provider.endpoint, "https://api.github.com"),
-        baseBranch: scopeString(provider.base_branch),
-        gitUrl: scopeUrl(provider.git_url, null),
-      }
-    : null;
-  const memoryIssues = workflow.config.tracker.kind === "memory" && Array.isArray(provider.issues)
-    ? provider.issues
-        .flatMap((issue) => {
-          if (typeof issue !== "object" || issue === null) return [];
-          const { id, identifier } = issue as Record<string, unknown>;
-          return typeof id === "string" && typeof identifier === "string" ? [{ id, identifier }] : [];
-        })
-        .sort((left, right) => left.id.localeCompare(right.id) || left.identifier.localeCompare(right.identifier))
-    : null;
-  return createHash("sha256")
-    .update(JSON.stringify({
-      workflowPath: workflow.path,
-      trackerKind: workflow.config.tracker.kind,
-      workspaceRoot: workflow.config.workspace.root,
-      github,
-      memoryIssues,
-    }))
-    .digest("hex");
-}
-
-function scopeString(value: unknown): string | null {
-  return typeof value === "string" ? value.trim() : null;
-}
-
-function scopeUrl(value: unknown, fallback: string | null): string | null {
-  const candidate = scopeString(value) ?? fallback;
-  if (candidate === null) return null;
-  return new URL(candidate).toString().replace(/\/+$/u, "");
-}
+export { workflowScopeHash } from "./state/scope.js";
 
 function requireRecoveryDelivery(workflow: WorkflowDefinition, tracker: Tracker): void {
   if (

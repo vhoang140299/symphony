@@ -71,7 +71,7 @@ export class CodexAgentDriver implements AgentDriver {
     let lastCompletedAgentMessage: string | undefined;
 
     try {
-      const configured = codexOptionsSchema.parse(context.runtimeOptions);
+      const configured = parseCodexRuntimeOptions(context.runtimeOptions);
       if (context.signal.aborted) {
         terminalEmitted = true;
         yield eventNow("turn_failed", {
@@ -243,6 +243,10 @@ export class CodexAgentDriver implements AgentDriver {
     this.#safeHome ??= resolveSafeCodexHome(process.env.CODEX_HOME);
     return this.#safeHome;
   }
+}
+
+export function parseCodexRuntimeOptions(options: Record<string, unknown>) {
+  return codexOptionsSchema.parse(options);
 }
 
 export function buildCodexEnvironment(
