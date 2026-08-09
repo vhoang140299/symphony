@@ -634,6 +634,35 @@ Doctor secret prompt must never be rendered.
   },
 );
 
+test("doctor resolves Claude's bundled executable from the SDK dependency tree", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-doctor-bundled-claude-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  await writeFile(
+    workflowPath,
+    `---
+tracker:
+  kind: memory
+  provider: { issues: [] }
+workspace:
+  root: ${JSON.stringify(path.join(directory, "missing-workspaces"))}
+runtime:
+  kind: claude
+---
+Doctor must not run Claude.
+`,
+  );
+
+  try {
+    const result = await runDoctor(workflowPath);
+    assert.deepEqual(
+      result.checks.find(({ id }) => id === "runtime.executable"),
+      { id: "runtime.executable", status: "ok", summary: "runtime executable is available" },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("doctor mirrors native Windows executable lookup without accepting shell scripts", () => {
   assert.deepEqual(
     configuredExecutableCandidates("agent.exe", "win32", "C:\\bin;D:\\tools"),

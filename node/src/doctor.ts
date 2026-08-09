@@ -1,5 +1,6 @@
 import { constants as fsConstants } from "node:fs";
 import { access, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseClaudeRuntimeOptions } from "./agents/claude.js";
@@ -182,6 +183,7 @@ function windowsExecutableNames(candidate: string): string[] {
 }
 
 async function inspectDefaultClaudeExecutable(): Promise<void> {
+  const sdkRequire = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
   const suffix = process.platform === "win32" ? ".exe" : "";
   const platformPackages = process.platform === "linux"
     ? [
@@ -191,7 +193,7 @@ async function inspectDefaultClaudeExecutable(): Promise<void> {
     : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`];
   for (const packageName of platformPackages) {
     try {
-      await requireExecutable(fileURLToPath(import.meta.resolve(`${packageName}/claude${suffix}`)));
+      await requireExecutable(sdkRequire.resolve(`${packageName}/claude${suffix}`));
       return;
     } catch {
       // The SDK supports a fallback Linux libc package; try every local candidate.
