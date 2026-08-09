@@ -11,6 +11,7 @@ import { createLogger } from "../src/log.js";
 import { Orchestrator, workflowScopeHash } from "../src/orchestrator.js";
 import { RunStateStore, type PersistedClaim } from "../src/state/store.js";
 import { MemoryTracker } from "../src/trackers/memory.js";
+import { WorkspaceManager } from "../src/workspace/manager.js";
 
 const logger = createLogger("silent");
 const idempotencyKey = "123e4567-e89b-42d3-a456-426614174000";
@@ -439,6 +440,160 @@ posixTest("persists a partial delivery and resumes it with the same comment key 
   await restarted.stop();
 });
 
+posixTest("recovers a durable Linear handoff through its owned workspace without publisher or model", async () => {
+  const root = await fixture("symphony-recovery-linear-delivery-");
+  let current = linearIssue();
+  const workflowPath = await writeLinearDeliveryWorkflow(root);
+  const { workflowStore, definition, store } = await durableStore(workflowPath);
+  await seedState(store, [
+    {
+      kind: "running",
+      issueId: current.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+  ]);
+  const workspace = await new WorkspaceManager(logger).createForIssue(current, definition.config);
+
+  let modelCalls = 0;
+  const operations: string[] = [];
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async mutateIssue(_target, mutation) {
+      if (mutation.kind === "comment") {
+        assert.equal(mutation.idempotencyKey, idempotencyKey);
+        assert.match(mutation.body, /Implemented the requested fix/);
+        operations.push(`comment:${mutation.idempotencyKey}`);
+        return;
+      }
+      if (mutation.kind === "set_state") {
+        operations.push(`state:${mutation.state}`);
+        current = { ...current, state: mutation.state };
+        return;
+      }
+      assert.fail(`Unexpected mutation ${mutation.kind}`);
+    },
+  };
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(operations, [`comment:${idempotencyKey}`, "state:Human Review"]);
+  assert.equal(current.state, "Human Review");
+  await access(workspace.path);
+  assert.deepEqual(await store.load(), []);
+  await orchestrator.stop();
+});
+
+posixTest("keeps a recovered Linear handoff pending when its owned workspace is missing", async () => {
+  const root = await fixture("symphony-recovery-linear-missing-workspace-");
+  const issue = linearIssue();
+  const workflowPath = await writeLinearDeliveryWorkflow(root);
+  const { workflowStore, definition, store } = await durableStore(workflowPath);
+  await seedState(store, [
+    {
+      kind: "running",
+      issueId: issue.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+  ]);
+
+  let modelCalls = 0;
+  let mutationCalls = 0;
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(issue.state) ? [issue] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(issue.id) ? [issue] : [];
+    },
+    async mutateIssue() {
+      mutationCalls += 1;
+    },
+  };
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+    failureBaseDelayMs: 60_000,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(modelCalls, 0);
+  assert.equal(mutationCalls, 0);
+  await assert.rejects(access(definition.config.workspace.root), isMissing);
+  const [retry] = await store.load();
+  assert.equal(retry?.kind, "retrying");
+  assert.equal(
+    retry !== undefined && "pendingDelivery" in retry ? retry.pendingDelivery?.idempotencyKey : undefined,
+    idempotencyKey,
+  );
+  await orchestrator.stop();
+});
+
+posixTest("fails Linear pending-delivery recovery when mutation support is missing", async () => {
+  const root = await fixture("symphony-recovery-linear-missing-mutate-");
+  const issue = linearIssue();
+  const workflowPath = await writeLinearDeliveryWorkflow(root);
+  const { workflowStore, definition, store } = await durableStore(workflowPath);
+  await seedState(store, [
+    {
+      kind: "running",
+      issueId: issue.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+  ]);
+  let trackerCalls = 0;
+  let modelCalls = 0;
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker: {
+      async fetchIssuesByStates() {
+        trackerCalls += 1;
+        return [issue];
+      },
+      async fetchIssuesByIds() {
+        trackerCalls += 1;
+        return [issue];
+      },
+    },
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_failed");
+    }),
+  });
+
+  await assert.rejects(
+    orchestrator.initialize(),
+    /Configured host delivery requires the tracker capabilities for its delivery kind/,
+  );
+  assert.equal(trackerCalls, 0);
+  assert.equal(modelCalls, 0);
+  await assert.rejects(access(definition.config.workspace.root), isMissing);
+  assert.equal((await store.load()).length, 1);
+});
+
 posixTest("does not create a workspace or invoke the model for an undeliverable recovered result", async () => {
   const root = await fixture("symphony-recovery-missing-workspace-");
   const issue = githubIssue();
@@ -770,6 +925,25 @@ async function writeGithubWorkflow(root: string, options: { delivery?: boolean }
   });
 }
 
+async function writeLinearDeliveryWorkflow(root: string): Promise<string> {
+  return writeWorkflow(root, {
+    tracker: {
+      kind: "linear",
+      provider: { project_slug: "project", api_key: "$RECOVERY_TRACKER_TOKEN" },
+      required_labels: ["symphony"],
+      active_states: ["Todo"],
+      terminal_states: ["Done"],
+    },
+    delivery: { review_state: "Human Review" },
+    polling: { interval_ms: 60_000 },
+    workspace: { root: "./workspaces" },
+    hooks: { timeout_ms: 1_000 },
+    agent: { max_concurrent_agents: 1, max_turns: 1, max_retry_backoff_ms: 1_000 },
+    runtime: { kind: "claude", turn_timeout_ms: 10_000, stall_timeout_ms: 0, options: {} },
+    state: { path: "./runs.json" },
+  });
+}
+
 async function writeWorkflow(root: string, config: Record<string, unknown>): Promise<string> {
   const workflowPath = path.join(root, "WORKFLOW.md");
   await writeFile(workflowPath, `---\n${stringifyYaml(config)}---\nWork on {{ issue.identifier }}.\n`);
@@ -807,6 +981,17 @@ function githubIssue(): Issue {
     dispatchable: true,
     createdAt: "2025-01-01T00:00:00Z",
     updatedAt: "2025-01-01T00:00:00Z",
+  };
+}
+
+function linearIssue(): Issue {
+  return {
+    ...githubIssue(),
+    id: "linear-issue-1",
+    nativeRef: null,
+    identifier: "LIN-1",
+    state: "Todo",
+    url: "https://linear.app/acme/issue/LIN-1",
   };
 }
 

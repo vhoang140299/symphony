@@ -1,6 +1,8 @@
 ---
 tracker:
   kind: memory
+  # This inert memory demo cannot use host delivery. For Linear, replace this tracker and add
+  # `delivery.review_state` as shown in README.md.
   provider:
     issues:
       - id: "demo-1"

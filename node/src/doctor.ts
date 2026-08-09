@@ -75,7 +75,7 @@ export async function runDoctor(workflowPath: string): Promise<DoctorReport> {
 function inspectTrackerConfig(workflow: WorkflowDefinition): DoctorCheck {
   try {
     validateTrackerProvider(workflow.config.tracker.kind, workflow.config.tracker.provider);
-    if (workflow.config.delivery !== undefined && process.platform === "win32") throw new Error();
+    if (workflow.config.delivery?.kind === "github_pr" && process.platform === "win32") throw new Error();
     return check("tracker.config", "ok", "tracker configuration is locally usable");
   } catch {
     return check("tracker.config", "error", "tracker configuration is not locally usable");

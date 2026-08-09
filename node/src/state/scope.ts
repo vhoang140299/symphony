@@ -28,6 +28,9 @@ export function workflowScopeHash(workflow: WorkflowDefinition): string {
         })
         .sort((left, right) => left.id.localeCompare(right.id) || left.identifier.localeCompare(right.identifier))
     : null;
+  const linearDelivery = workflow.config.delivery?.kind === "linear_handoff"
+    ? { reviewState: workflow.config.delivery.reviewState.trim().toLowerCase() }
+    : null;
   return createHash("sha256")
     .update(JSON.stringify({
       workflowPath: workflow.path,
@@ -36,6 +39,7 @@ export function workflowScopeHash(workflow: WorkflowDefinition): string {
       github,
       linear,
       memoryIssues,
+      ...(linearDelivery === null ? {} : { linearDelivery }),
     }))
     .digest("hex");
 }

@@ -180,10 +180,15 @@ test("accepts Linear, rejects unsupported tracker kinds, and validates GitHub st
 test("binds durable Linear state to its project scope without hashing credentials", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-linear-scope-"));
   const workflowPath = path.join(directory, "WORKFLOW.md");
-  const writeLinearWorkflow = async (projectSlug: string, token: string, assignee = "worker-1") => {
+  const writeLinearWorkflow = async (
+    projectSlug: string,
+    token: string,
+    assignee = "worker-1",
+    reviewState?: string,
+  ) => {
     await writeFile(
       workflowPath,
-      `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: ${projectSlug}\n    api_key: ${token}\n    assignee: ${assignee}\nworkspace:\n  root: ./workspaces\n---\nDo work.\n`,
+      `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: ${projectSlug}\n    api_key: ${token}\n    assignee: ${assignee}\nworkspace:\n  root: ./workspaces\n${reviewState === undefined ? "" : `delivery:\n  review_state: ${JSON.stringify(reviewState)}\n`}---\nDo work.\n`,
     );
     return workflowScopeHash(await loadWorkflow(workflowPath));
   };
@@ -192,6 +197,21 @@ test("binds durable Linear state to its project scope without hashing credential
   assert.equal(await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_TWO"), original);
   assert.notEqual(await writeLinearWorkflow("project-b", "$LINEAR_TOKEN_TWO"), original);
   assert.notEqual(await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_TWO", "worker-2"), original);
+  const handoff = await writeLinearWorkflow(
+    "project-a",
+    "$LINEAR_TOKEN_TWO",
+    "worker-1",
+    "Human Review",
+  );
+  assert.notEqual(handoff, original);
+  assert.equal(
+    await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_ONE", "worker-1", " human review "),
+    handoff,
+  );
+  assert.notEqual(
+    await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_TWO", "worker-1", "Quality Review"),
+    handoff,
+  );
 });
 
 test("accepts supported coding-agent runtimes and rejects unknown kinds during config parsing", () => {
@@ -214,6 +234,7 @@ test("host delivery is explicit, label-bound, and keeps tracker credentials out 
   };
 
   assert.deepEqual(parseWorkflowConfig(config).delivery, {
+    kind: "github_pr",
     queueLabel: "symphony",
     reviewLabel: "human-review",
   });
@@ -263,6 +284,76 @@ test("host delivery is explicit, label-bound, and keeps tracker credentials out 
     }),
     /credentials must not be passed/i,
   );
+});
+
+test("Linear host handoff is state-bound and keeps tracker credentials out of the agent", () => {
+  const config = {
+    tracker: {
+      kind: "linear",
+      provider: { project_slug: "symphony", api_key: "$LINEAR_HANDOFF_TOKEN" },
+      required_labels: ["Symphony"],
+      active_states: ["Todo", "In Progress"],
+      terminal_states: ["Done", "Canceled"],
+    },
+    delivery: { review_state: " Human Review " },
+    runtime: { kind: "codex", options: { env_allowlist: ["CI"] } },
+  };
+
+  assert.deepEqual(parseWorkflowConfig(config).delivery, {
+    kind: "linear_handoff",
+    reviewState: "Human Review",
+  });
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { review_state: "Human Review", extra: true } }),
+    /unrecognized|extra|union/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { review_state: "r".repeat(101) } }),
+    /100/,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { review_state: " in progress " } }),
+    /review_state.*active_states.*terminal_states/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, delivery: { review_state: "CANCELED" } }),
+    /review_state.*active_states.*terminal_states/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, hooks: { after_run: "cleanup" } }),
+    /does not support hooks\.after_run/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, kind: "github" } }),
+    /Linear tracker/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, kind: "memory" } }),
+    /Linear tracker/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...config,
+      tracker: { ...config.tracker, provider: { project_slug: "symphony" } },
+    }),
+    /Linear host handoff.*explicit tracker API key environment reference/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...config,
+      tracker: { ...config.tracker, provider: { project_slug: "symphony", api_key: "literal-key" } },
+    }),
+    /Linear host handoff.*explicit tracker API key environment reference/i,
+  );
+  for (const name of ["LINEAR_HANDOFF_TOKEN", "LINEAR_API_KEY"]) {
+    assert.throws(
+      () => parseWorkflowConfig({
+        ...config,
+        runtime: { kind: "codex", options: { env_allowlist: [name] } },
+      }),
+      /credentials must not be passed/i,
+    );
+  }
 });
 
 test("operator retry control supports GitHub and Linear while keeping credentials host-side", () => {
@@ -359,7 +450,11 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
     token: "$GITHUB_TOKEN",
     base_branch: "main",
   });
-  assert.deepEqual(workflow.config.delivery, { queueLabel: "symphony", reviewLabel: "human-review" });
+  assert.deepEqual(workflow.config.delivery, {
+    kind: "github_pr",
+    queueLabel: "symphony",
+    reviewLabel: "human-review",
+  });
   assert.deepEqual(workflow.config.control, { retryLabel: "symphony-retry" });
   assert.equal(workflow.config.state, undefined);
   assert.equal(workflow.config.agent.maxTurns, 1);
