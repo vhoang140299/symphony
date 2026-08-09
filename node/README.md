@@ -26,6 +26,8 @@ issues may therefore be retried after a run.
 
 - Node.js 24 or newer; [`mise`](https://mise.jdx.dev/) can install the recommended Node version
   from `mise.toml`.
+- Git and the [GitHub CLI](https://cli.github.com/) authenticated with access to the target
+  repository.
 - Claude Code authentication available to the child process, such as `ANTHROPIC_API_KEY` or an
   existing Claude Code login. Symphony does not store or refresh Claude credentials.
 - For the Codex runtime, set `CODEX_HOME` to a dedicated private profile and authenticate it with
@@ -76,6 +78,74 @@ For development:
 npm run check
 npm test
 ```
+
+## GitHub preview quickstart
+
+Start with Claude and one small issue in a trusted test repository. After installing and building as
+above, authenticate Git and create the two labels used by host-controlled delivery:
+
+```bash
+SYMPHONY_REPO=YOUR_ORG/YOUR_REPO
+gh auth status
+gh auth setup-git
+gh label create symphony --repo "$SYMPHONY_REPO" --color 1D76DB \
+  --description "Queued for Symphony" --force
+gh label create human-review --repo "$SYMPHONY_REPO" --color FBCA04 \
+  --description "Ready for human review" --force
+```
+
+Copy [`WORKFLOW.github.md`](WORKFLOW.github.md) to a local profile:
+
+```bash
+cp WORKFLOW.github.md WORKFLOW.preview.claude.md
+```
+
+Replace every `YOUR_ORG` and `YOUR_REPO`, and review the clone hook,
+workspace root, limits, prompt, and repository instructions. The token needs `Issues: write`,
+`Contents: write`, and `Pull requests: write`; Symphony keeps it in the host process.
+
+Before adding the queue label to any issue, confirm the repository has no open `symphony` issues and
+run one no-op poll:
+
+```bash
+gh api "repos/$SYMPHONY_REPO/issues?state=open&per_page=100" --paginate \
+  --jq '.[] | select(.pull_request == null and (.labels | any(.name == "symphony"))) | .html_url'
+GITHUB_TOKEN="$(gh auth token)" \
+  node dist/src/cli.js --once ./WORKFLOW.preview.claude.md
+```
+
+`--once` is not a dry run. With an empty queue it makes no agent call; after an issue is queued it
+performs one poll and waits for that poll's dispatched work. Queue exactly one reviewed issue for
+the first real run:
+
+```bash
+gh issue edit ISSUE_NUMBER --repo "$SYMPHONY_REPO" --add-label symphony
+GITHUB_TOKEN="$(gh auth token)" \
+  node dist/src/cli.js --once ./WORKFLOW.preview.claude.md
+```
+
+A successful handoff creates or updates `symphony/issue-ISSUE_NUMBER` and its pull request, changes
+the issue from `symphony` to `human-review`, and leaves `main` untouched for human review. Once the
+supervised flow is proven, omit `--once` to poll continuously.
+
+To use Codex instead, copy [`WORKFLOW.codex.github.md`](WORKFLOW.codex.github.md), make the same
+repository edits, and authenticate a dedicated private profile using the
+[official Codex authentication guide](https://developers.openai.com/codex/auth/). Do not use your
+normal `~/.codex`:
+
+```bash
+cp WORKFLOW.codex.github.md WORKFLOW.preview.codex.md
+SYMPHONY_CODEX_HOME="$HOME/.symphony-codex"
+install -d -m 700 "$SYMPHONY_CODEX_HOME"
+CODEX_HOME="$SYMPHONY_CODEX_HOME" npm exec -- codex login
+CODEX_HOME="$SYMPHONY_CODEX_HOME" npm exec -- codex login status
+GITHUB_TOKEN="$(gh auth token)" CODEX_HOME="$SYMPHONY_CODEX_HOME" \
+  node dist/src/cli.js --once ./WORKFLOW.preview.codex.md
+```
+
+Keep passing that same dedicated `CODEX_HOME` on every Codex run. Start with one tightly scoped
+issue because the Codex SDK reports token usage but does not provide Symphony with a USD limit or
+cost amount.
 
 ## Workflow configuration
 
