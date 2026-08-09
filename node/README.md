@@ -13,7 +13,8 @@ Claude Code or Codex through their official SDKs.
 ## Current scope
 
 - Runtime: Node.js with strict TypeScript and ESM
-- CLI and tooling: Commander, pnpm, and Vitest (Vite-powered)
+- CLI and tooling: Commander, Fastify for optional operational HTTP, pnpm, and Vitest
+  (Vite-powered)
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
 - Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools, host-controlled PR
   delivery, and operator retry labels
@@ -113,6 +114,25 @@ the runtime-authentication check remains a warning. Use `--preflight` for the re
 supervised `--once` run for the real agent path. Doctor output omits paths, tokens, environment
 variable names, account details, prompts, and raw underlying errors. `--doctor`, `--preflight`, and
 `--once` are mutually exclusive.
+
+For local health checks and aggregate runtime status, opt the continuous daemon into its Fastify
+server:
+
+```bash
+node dist/src/cli.js --http-port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
+```
+
+`--http-host` defaults to `127.0.0.1`. The HTTP flags are daemon-only and cannot be combined with
+`--once`, `--preflight`, or `--doctor`. The read-only server exposes:
+
+- `GET /healthz`: reports that the HTTP process is responding.
+- `GET /readyz`: reports ready after the daemon has initialized and unavailable while it is
+  shutting down. It does not test tracker or coding-agent provider reachability.
+- `GET /status`: reports timestamps, aggregate run-state counts, and usage totals. It omits issue
+  identifiers, workspace paths, agent session IDs, provider details, and raw errors.
+
+These endpoints have no authentication. Keep the default loopback binding; if you bind to a remote
+interface, add authentication and network access controls outside Symphony.
 
 For development:
 
