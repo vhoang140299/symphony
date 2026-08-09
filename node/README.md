@@ -180,7 +180,12 @@ Claude-specific settings live under `runtime.options` when `runtime.kind` is `cl
 - `claude_executable`: optional path to a specific Claude Code executable.
 
 `agent.max_turns` separately limits how many completed SDK queries Symphony resumes for one issue
-before placing it on the short continuation retry queue.
+before placing it on the short continuation retry queue. Optional `agent.max_attempts` limits
+dispatched agent run cycles per issue, including the initial run; omission means unlimited. Host-only
+delivery retries do not count. Exhaustion moves the issue to blocked/manual retry. Attempt counters
+belong to the in-memory claim lifecycle and reset when the claim is released or Symphony restarts.
+An explicit `retryBlocked()` grants one additional run before reapplying the limit. With
+`max_turns: 1`, `max_attempts: 3` caps a claimed issue at three SDK queries before manual retry.
 
 ### Codex runtime
 
@@ -249,6 +254,7 @@ delivery:
 
 agent:
   max_turns: 1
+  max_attempts: 3
 
 runtime:
   kind: claude
@@ -266,8 +272,9 @@ Host delivery currently requires the GitHub tracker. `delivery.queue_label` must
 `tracker.required_labels`, and `delivery.review_label` must differ from every required label. Create
 both labels in the repository before starting Symphony so their color and description are controlled
 and the profile remains portable to GitHub Enterprise. GitHub.com may create a missing review label
-with default metadata. The checked-in profiles use one SDK query per issue (`agent.max_turns: 1`)
-because each run must make an explicit handoff decision.
+with default metadata. The checked-in profiles use one SDK query per run (`agent.max_turns: 1`)
+because each run must make an explicit handoff decision, and block after three dispatched runs
+(`agent.max_attempts: 3`).
 
 In delivery mode, Claude and Codex return a constrained result with this shape:
 

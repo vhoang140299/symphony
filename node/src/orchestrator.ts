@@ -866,6 +866,32 @@ export class Orchestrator {
       const isDeliveryFailure = outcome.kind === "delivery_failure";
       const isFailure = outcome.kind === "failure" || isDeliveryFailure;
       const nextAttempt = (entry.attempt ?? 0) + 1;
+      const maxAttempts = entry.workflow.config.agent.maxAttempts;
+      if (!isDeliveryFailure && maxAttempts !== null && nextAttempt >= maxAttempts) {
+        const summary = `Agent retry budget exhausted after ${nextAttempt} dispatched runs (max_attempts=${maxAttempts}); manual retry required`;
+        this.#logger[isFailure ? "error" : "warn"](
+          {
+            issue_id: entry.issue.id,
+            issue_identifier: entry.issue.identifier,
+            reason: summary,
+            error: outcome.kind === "failure" ? outcome.error : undefined,
+          },
+          isFailure ? "Agent run failed; retry budget exhausted" : "Agent retry budget exhausted",
+        );
+        this.#blocked.set(entry.issue.id, {
+          issue: entry.issue,
+          workflow: entry.workflow,
+          tracker: entry.tracker,
+          driver: entry.driver,
+          attempt: entry.attempt,
+          continuation: entry.continuation,
+          sessionId: isFailure ? undefined : entry.sessionId,
+          blockedAtMs: this.#now(),
+          summary,
+        });
+        this.#assertClaimInvariant();
+        return;
+      }
       const delayMs = isFailure
         ? Math.min(
             this.#failureBaseDelayMs * 2 ** Math.max(0, nextAttempt - 1),
