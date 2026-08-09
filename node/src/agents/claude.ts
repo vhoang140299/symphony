@@ -58,12 +58,7 @@ export class ClaudeAgentDriver implements AgentDriver {
     let abort: (() => void) | undefined;
 
     try {
-      const configured = claudeOptionsSchema.parse(context.runtimeOptions);
-      if (configured.permission_mode !== "default" && configured.permission_mode !== "plan") {
-        throw new Error(
-          `Claude permission mode ${configured.permission_mode} is unsupported because it can bypass workspace policy`,
-        );
-      }
+      const configured = parseClaudeRuntimeOptions(context.runtimeOptions);
 
       const abortController = new AbortController();
       abort = () => abortController.abort(context.signal.reason);
@@ -139,6 +134,16 @@ export class ClaudeAgentDriver implements AgentDriver {
       }
     }
   }
+}
+
+export function parseClaudeRuntimeOptions(options: Record<string, unknown>) {
+  const configured = claudeOptionsSchema.parse(options);
+  if (configured.permission_mode !== "default" && configured.permission_mode !== "plan") {
+    throw new Error(
+      `Claude permission mode ${configured.permission_mode} is unsupported because it can bypass workspace policy`,
+    );
+  }
+  return configured;
 }
 
 export function createIssueMutationTools(context: AgentRunContext): SdkMcpToolDefinition<any>[] {

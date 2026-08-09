@@ -59,6 +59,7 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
   assert.deepEqual(await store.load(), []);
   await store.save(claims);
   assert.deepEqual(await store.load(), claims);
+  assert.equal(await store.inspect(), "valid");
   assert.equal((await lstat(parent)).mode & 0o7777, 0o700);
   assert.equal((await lstat(filePath)).mode & 0o7777, 0o600);
 
@@ -66,6 +67,24 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
   assert.deepEqual(Object.keys(envelope), ["version", "scope", "claims"]);
   assert.equal(envelope.version, 1);
   assert.equal(envelope.scope, scope);
+});
+
+posixTest("inspects missing state without creating its parent or file", async () => {
+  const { parent, filePath } = await fixture();
+  const store = new RunStateStore(filePath, scope);
+
+  assert.equal(await store.inspect(), "missing");
+  await assert.rejects(
+    access(parent),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOENT",
+  );
+
+  await mkdir(parent, { mode: 0o700 });
+  assert.equal(await store.inspect(), "missing");
+  await assert.rejects(
+    access(filePath),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOENT",
+  );
 });
 
 posixTest("serializes concurrent saves so the last call wins", async () => {
@@ -117,6 +136,7 @@ posixTest("rejects corrupt, incompatible, cross-scope, and duplicate state", asy
 
   for (const contents of invalidContents) {
     await writeFile(filePath, contents, { mode: 0o600 });
+    await assert.rejects(store.inspect());
     await assert.rejects(store.load());
     await assert.rejects(store.save([]));
   }
@@ -130,16 +150,19 @@ posixTest("rejects symlinks, unsafe permissions, canonical aliases, and oversize
   const target = path.join(parent, "target.json");
   await writeFile(target, validEnvelope, { mode: 0o600 });
   await symlink(target, filePath);
+  await assert.rejects(store.inspect(), /regular file/);
   await assert.rejects(store.load(), /regular file/);
   await assert.rejects(store.save([]), /regular file/);
 
   await unlink(filePath);
   await writeFile(filePath, validEnvelope, { mode: 0o600 });
   await chmod(filePath, 0o644);
+  await assert.rejects(store.inspect(), /0600/);
   await assert.rejects(store.load(), /0600/);
 
   await unlink(filePath);
   await writeFile(filePath, Buffer.alloc(1024 * 1024 + 1), { mode: 0o600 });
+  await assert.rejects(store.inspect(), /1 MiB/);
   await assert.rejects(store.load(), /1 MiB/);
 
   const largeClaims: PersistedClaim[] = Array.from({ length: 600 }, (_, index) => ({
@@ -156,11 +179,19 @@ posixTest("rejects symlinks, unsafe permissions, canonical aliases, and oversize
   const aliasParent = path.join(root, "alias-parent");
   await mkdir(realParent, { mode: 0o700 });
   await symlink(realParent, aliasParent);
+  await assert.rejects(
+    new RunStateStore(path.join(aliasParent, "state.json"), scope).inspect(),
+    /real directory|canonical/,
+  );
   await assert.rejects(new RunStateStore(path.join(aliasParent, "state.json"), scope).load(), /real directory|canonical/);
 
   const unsafeParent = path.join(root, "unsafe-parent");
   await mkdir(unsafeParent, { mode: 0o700 });
   await chmod(unsafeParent, 0o755);
+  await assert.rejects(
+    new RunStateStore(path.join(unsafeParent, "state.json"), scope).inspect(),
+    /0700/,
+  );
   await assert.rejects(new RunStateStore(path.join(unsafeParent, "state.json"), scope).load(), /0700/);
 });
 
