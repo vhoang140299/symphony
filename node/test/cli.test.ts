@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,9 +19,172 @@ const exampleWorkflowPath = fileURLToPath(new URL("../WORKFLOW.md", import.meta.
 
 test("CLI prints help and exits successfully", async () => {
   const result = await execFileAsync(process.execPath, [cliPath, "--help"]);
-  assert.match(result.stdout, /Usage: symphony-node \[--once \| --preflight \| --doctor\] \[WORKFLOW\]/);
+  assert.match(result.stdout, /--http-port <PORT>/);
+  assert.match(result.stdout, /--http-host <HOST>/);
+  assert.match(result.stdout, /default: 127\.0\.0\.1/);
   assert.equal(result.stderr, "");
 });
+
+test("CLI validates the operational HTTP address before loading the workflow", async () => {
+  for (const port of ["0", "65536", "1.5", "not-a-port"]) {
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, "--http-port", port, exampleWorkflowPath]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok("stdout" in error);
+        assert.ok("stderr" in error);
+        assert.equal(String(error.stdout), "");
+        assert.match(String(error.stderr), /expected an integer between 1 and 65535/);
+        return true;
+      },
+    );
+  }
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [cliPath, "--http-host", "   ", exampleWorkflowPath]),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.ok("stdout" in error);
+      assert.ok("stderr" in error);
+      assert.equal(String(error.stdout), "");
+      assert.match(String(error.stderr), /expected a non-empty host/);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [cliPath, "--http-host", "localhost", exampleWorkflowPath]),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.ok("stdout" in error);
+      assert.ok("stderr" in error);
+      assert.equal(String(error.stdout), "");
+      assert.match(String(error.stderr), /--http-host <HOST>.*requires option '--http-port <PORT>'/);
+      return true;
+    },
+  );
+});
+
+test("CLI binds operational HTTP before polling or running workspace hooks", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-http-bind-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const workspaceRoot = path.join(directory, "workspaces");
+  const hookMarker = path.join(directory, "hook-ran");
+  const blocker = createNetServer();
+  const blockedPort = await listenOnEphemeralPort(blocker);
+  await writeFile(
+    workflowPath,
+    `---
+tracker:
+  kind: memory
+  provider:
+    issues:
+      - id: bind-1
+        identifier: BIND-1
+        title: Must not run
+        state: Todo
+        labels: [symphony]
+        dispatchable: true
+  required_labels: [symphony]
+  active_states: [Todo]
+  terminal_states: [Done]
+workspace:
+  root: ${JSON.stringify(workspaceRoot)}
+hooks:
+  after_create: printf x > ${JSON.stringify(hookMarker)}
+runtime:
+  kind: claude
+---
+The agent must not start.
+`,
+  );
+
+  try {
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [cliPath, "--http-port", String(blockedPort), workflowPath],
+        { env: { ...process.env, LOG_LEVEL: "silent" }, timeout: 5_000 },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok("stderr" in error);
+        assert.match(String(error.stderr), /EADDRINUSE|address already in use/iu);
+        return true;
+      },
+    );
+    await assert.rejects(access(hookMarker));
+    await assert.rejects(access(workspaceRoot));
+  } finally {
+    await closeServer(blocker);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test(
+  "CLI handles SIGTERM while operational HTTP is listening but startup is not ready",
+  { timeout: 5_000 },
+  async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-http-startup-signal-"));
+    const workflowPath = path.join(directory, "WORKFLOW.md");
+    const trackerServer = createHttpServer((_request, response) => {
+      setTimeout(() => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end("[]");
+      }, 750);
+    });
+    const trackerPort = await listenOnEphemeralPort(trackerServer);
+    const portReservation = createNetServer();
+    const operationsPort = await listenOnEphemeralPort(portReservation);
+    await closeServer(portReservation);
+    await writeFile(
+      workflowPath,
+      `---
+tracker:
+  kind: github
+  provider:
+    owner: acme
+    repo: widget
+    endpoint: http://127.0.0.1:${trackerPort}
+  required_labels: [symphony]
+  active_states: [open]
+  terminal_states: [closed]
+workspace:
+  root: ${JSON.stringify(path.join(directory, "workspaces"))}
+runtime:
+  kind: claude
+---
+The agent must not start.
+`,
+    );
+
+    const child = spawn(
+      process.execPath,
+      [cliPath, "--http-port", String(operationsPort), workflowPath],
+      { env: { ...process.env, LOG_LEVEL: "silent" }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+
+    try {
+      await waitForHttpStatus(`http://127.0.0.1:${operationsPort}/readyz`, 503, 2_000);
+      assert.equal(child.kill("SIGTERM"), true);
+      assert.deepEqual(await closed, { code: 0, signal: null });
+      await assert.rejects(
+        fetch(`http://127.0.0.1:${operationsPort}/healthz`, {
+          headers: { connection: "close" },
+          signal: AbortSignal.timeout(500),
+        }),
+      );
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closeServer(trackerServer);
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test("CLI --once polls once, prints a compact snapshot, and exits successfully when idle", async () => {
   const result = await execFileAsync(process.execPath, [cliPath, "--once", exampleWorkflowPath], {
@@ -501,6 +666,24 @@ test("CLI rejects mutually exclusive execution modes before loading the workflow
   }
 });
 
+test("CLI limits operational HTTP endpoints to daemon mode", async () => {
+  for (const mode of ["--once", "--preflight", "--doctor"]) {
+    for (const httpOption of [["--http-port", "3000"], ["--http-host", "localhost"]]) {
+      await assert.rejects(
+        execFileAsync(process.execPath, [cliPath, mode, ...httpOption, exampleWorkflowPath]),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok("stdout" in error);
+          assert.ok("stderr" in error);
+          assert.equal(String(error.stdout), "");
+          assert.match(String(error.stderr), /cannot be used with option/);
+          return true;
+        },
+      );
+    }
+  }
+});
+
 test("CLI --preflight exits nonzero on configuration and tracker errors", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-preflight-errors-"));
   const invalidConfigPath = path.join(directory, "invalid-WORKFLOW.md");
@@ -761,4 +944,38 @@ function terminateBestEffort(pid: number): void {
   } catch {
     // The process has already exited.
   }
+}
+
+async function listenOnEphemeralPort(server: Server): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return address.port;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+async function waitForHttpStatus(url: string, status: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, {
+        headers: { connection: "close" },
+        signal: AbortSignal.timeout(100),
+      });
+      await response.arrayBuffer();
+      if (response.status === status) return;
+    } catch {
+      // The server has not started listening yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for HTTP ${status}`);
 }
