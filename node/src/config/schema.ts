@@ -91,6 +91,12 @@ const deliverySchema = z
   })
   .strict();
 
+const controlSchema = z
+  .object({
+    retry_label: githubLabel,
+  })
+  .strict();
+
 const rawWorkflowConfigSchema = z
   .object({
     tracker: trackerSchema,
@@ -100,18 +106,19 @@ const rawWorkflowConfigSchema = z
     agent: agentSchema,
     runtime: runtimeSchema,
     delivery: deliverySchema.optional(),
+    control: controlSchema.optional(),
   })
   .passthrough()
   .superRefine((value, context) => {
-    if (value.delivery === undefined) return;
+    if (value.delivery === undefined && value.control === undefined) return;
     if (value.tracker.kind !== "github") {
       context.addIssue({
         code: "custom",
-        path: ["delivery"],
-        message: "Host delivery currently requires the GitHub tracker",
+        path: [value.delivery === undefined ? "control" : "delivery"],
+        message: "Configured host controls require the GitHub tracker",
       });
     }
-    if (value.hooks.after_run !== undefined) {
+    if (value.delivery !== undefined && value.hooks.after_run !== undefined) {
       context.addIssue({
         code: "custom",
         path: ["hooks", "after_run"],
@@ -119,22 +126,36 @@ const rawWorkflowConfigSchema = z
       });
     }
 
-    const queueLabel = value.delivery.queue_label.trim().toLowerCase();
-    const reviewLabel = value.delivery.review_label.trim().toLowerCase();
     const requiredLabels = value.tracker.required_labels.map((label) => label.trim().toLowerCase());
-    if (!requiredLabels.includes(queueLabel)) {
-      context.addIssue({
-        code: "custom",
-        path: ["delivery", "queue_label"],
-        message: "delivery.queue_label must be present in tracker.required_labels",
-      });
+    const deliveryLabels: string[] = [];
+    if (value.delivery !== undefined) {
+      const queueLabel = value.delivery.queue_label.trim().toLowerCase();
+      const reviewLabel = value.delivery.review_label.trim().toLowerCase();
+      deliveryLabels.push(queueLabel, reviewLabel);
+      if (!requiredLabels.includes(queueLabel)) {
+        context.addIssue({
+          code: "custom",
+          path: ["delivery", "queue_label"],
+          message: "delivery.queue_label must be present in tracker.required_labels",
+        });
+      }
+      if (requiredLabels.includes(reviewLabel)) {
+        context.addIssue({
+          code: "custom",
+          path: ["delivery", "review_label"],
+          message: "delivery.review_label must differ from every tracker.required_labels entry",
+        });
+      }
     }
-    if (requiredLabels.includes(reviewLabel)) {
-      context.addIssue({
-        code: "custom",
-        path: ["delivery", "review_label"],
-        message: "delivery.review_label must differ from every tracker.required_labels entry",
-      });
+    if (value.control !== undefined) {
+      const retryLabel = value.control.retry_label.trim().toLowerCase();
+      if ([...requiredLabels, ...deliveryLabels].includes(retryLabel)) {
+        context.addIssue({
+          code: "custom",
+          path: ["control", "retry_label"],
+          message: "control.retry_label must differ from tracker.required_labels and delivery labels",
+        });
+      }
     }
 
     const tokenReference = value.tracker.provider.token;
@@ -145,7 +166,7 @@ const rawWorkflowConfigSchema = z
       context.addIssue({
         code: "custom",
         path: ["tracker", "provider", "token"],
-        message: "Host delivery requires an explicit tracker token environment reference",
+        message: "Host-controlled GitHub features require an explicit tracker token environment reference",
       });
       return;
     }
@@ -199,6 +220,9 @@ export interface WorkflowConfig {
     queueLabel: string;
     reviewLabel: string;
   };
+  control?: {
+    retryLabel: string;
+  };
 }
 
 export function parseWorkflowConfig(input: unknown): WorkflowConfig {
@@ -246,6 +270,13 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
           delivery: {
             queueLabel: parsed.delivery.queue_label.trim().toLowerCase(),
             reviewLabel: parsed.delivery.review_label.trim().toLowerCase(),
+          },
+        }),
+    ...(parsed.control === undefined
+      ? {}
+      : {
+          control: {
+            retryLabel: parsed.control.retry_label.trim().toLowerCase(),
           },
         }),
   };

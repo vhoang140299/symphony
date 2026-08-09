@@ -14,8 +14,8 @@ Claude Code or Codex through their official SDKs.
 
 - Runtime: Node.js with strict TypeScript and ESM
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
-- Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools and host-controlled
-  PR delivery
+- Trackers: in-memory issues, or GitHub Issues polling with manual Claude tools, host-controlled PR
+  delivery, and operator retry labels
 - Operations: structured logs and an in-process runtime snapshot
 
 The in-memory tracker is for development and smoke tests. It does not persist state, synchronize
@@ -82,7 +82,7 @@ npm test
 ## GitHub preview quickstart
 
 Start with Claude and one small issue in a trusted test repository. After installing and building as
-above, authenticate Git and create the two labels used by host-controlled delivery:
+above, authenticate Git and create the three labels used by host-controlled delivery and retry:
 
 ```bash
 SYMPHONY_REPO=YOUR_ORG/YOUR_REPO
@@ -92,6 +92,8 @@ gh label create symphony --repo "$SYMPHONY_REPO" --color 1D76DB \
   --description "Queued for Symphony" --force
 gh label create human-review --repo "$SYMPHONY_REPO" --color FBCA04 \
   --description "Ready for human review" --force
+gh label create symphony-retry --repo "$SYMPHONY_REPO" --color D4C5F9 \
+  --description "Retry one blocked Symphony run" --force
 ```
 
 Copy [`WORKFLOW.github.md`](WORKFLOW.github.md) to a local profile:
@@ -252,6 +254,9 @@ delivery:
   queue_label: symphony
   review_label: human-review
 
+control:
+  retry_label: symphony-retry
+
 agent:
   max_turns: 1
   max_attempts: 3
@@ -268,13 +273,28 @@ runtime:
     tools: [Read, Edit, Write, Glob, Grep]
 ```
 
-Host delivery currently requires the GitHub tracker. `delivery.queue_label` must be one of
-`tracker.required_labels`, and `delivery.review_label` must differ from every required label. Create
-both labels in the repository before starting Symphony so their color and description are controlled
-and the profile remains portable to GitHub Enterprise. GitHub.com may create a missing review label
-with default metadata. The checked-in profiles use one SDK query per run (`agent.max_turns: 1`)
-because each run must make an explicit handoff decision, and block after three dispatched runs
+Host delivery and operator retry control currently require the GitHub tracker.
+`delivery.queue_label` must be one of `tracker.required_labels`; `delivery.review_label` and
+`control.retry_label` must differ from the required and delivery labels. Create all three labels in
+the repository before starting Symphony so their color and description are controlled and the
+profile remains portable to GitHub Enterprise. GitHub.com may create a missing review label with
+default metadata. The checked-in profiles use one SDK query per run (`agent.max_turns: 1`) because
+each run must make an explicit handoff decision, and block after three dispatched runs
 (`agent.max_attempts: 3`).
+
+Adding `control.retry_label` to an issue requests one more run only when that issue is already
+blocked in the current process and remains routable. Symphony removes the retry label before
+releasing the run; if removal fails, the issue stays blocked. After that one run, `max_attempts`
+applies again. This control is at-most-once: if the label disappears but the issue remains blocked
+after an ambiguous GitHub response, add the label again. Blocked claims are in memory: restarting
+Symphony loses them, leaves any retry label on GitHub, and may dispatch the still-routable issue as a
+fresh claim instead of consuming the label.
+The retry label therefore works only while the continuous daemon that owns the blocked claim remains
+running; it cannot resume a completed `--once` process.
+
+```bash
+gh issue edit ISSUE_NUMBER --repo "$SYMPHONY_REPO" --add-label symphony-retry
+```
 
 In delivery mode, Claude and Codex return a constrained result with this shape:
 
@@ -298,11 +318,12 @@ between host retries can change the pending commit, while delaying cleanup can l
 Pending delivery state is in memory; after a process restart, a still-routable issue can be dispatched
 to the agent again.
 
-Host delivery requires `tracker.provider.token` to be an explicit environment reference such as
-`$GITHUB_TOKEN`; set that variable in Symphony's host environment. The named variable and
-`GITHUB_TOKEN` must not appear in `runtime.options.env_allowlist`. Comment and label updates execute
-inside Symphony, so the tracker credential never needs to enter the coding-agent child. The token
-needs repository `Issues: write`, `Contents: write`, and `Pull requests: write` permissions.
+Host delivery and operator retry control require `tracker.provider.token` to be an explicit environment
+reference such as `$GITHUB_TOKEN`; set that variable in Symphony's host environment. The named
+variable and `GITHUB_TOKEN` must not appear in `runtime.options.env_allowlist`. Comment and label
+updates execute inside Symphony, so the tracker credential never needs to enter the coding-agent
+child. The checked-in profiles need repository `Issues: write`, `Contents: write`, and
+`Pull requests: write` permissions.
 
 Outside delivery mode, the implicit `GITHUB_TOKEN` fallback is limited to `https://api.github.com`.
 A custom endpoint must name its token environment variable explicitly, and authenticated endpoints

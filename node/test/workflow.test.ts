@@ -168,6 +168,54 @@ test("host delivery is explicit, label-bound, and keeps tracker credentials out 
   );
 });
 
+test("operator retry control is strict, GitHub-only, label-bound, and keeps credentials host-side", () => {
+  const config = {
+    tracker: {
+      kind: "github",
+      provider: { owner: "acme", repo: "widget", token: "$TRACKER_TOKEN" },
+      required_labels: ["Symphony"],
+    },
+    control: { retry_label: " Symphony-Retry " },
+    runtime: { kind: "codex", options: { env_allowlist: ["CI"] } },
+  };
+
+  assert.deepEqual(parseWorkflowConfig(config).control, { retryLabel: "symphony-retry" });
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, control: { retry_label: "symphony-retry", extra: true } }),
+    /unrecognized|extra/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, control: { retry_label: "symphony" } }),
+    /retry_label.*required_labels.*delivery labels/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({
+      ...config,
+      delivery: { queue_label: "symphony", review_label: "human-review" },
+      control: { retry_label: "human-review" },
+    }),
+    /retry_label.*required_labels.*delivery labels/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, control: { retry_label: "r".repeat(51) } }),
+    /50/,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, kind: "memory" } }),
+    /GitHub tracker/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { ...config.tracker, provider: { owner: "acme", repo: "widget" } } }),
+    /explicit tracker token environment reference/i,
+  );
+  for (const name of ["TRACKER_TOKEN", "GITHUB_TOKEN"]) {
+    assert.throws(
+      () => parseWorkflowConfig({ ...config, runtime: { kind: "claude", options: { env_allowlist: [name] } } }),
+      /credentials must not be passed/i,
+    );
+  }
+});
+
 test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   const workflow = await loadWorkflow(path.resolve("WORKFLOW.github.md"));
   const codexWorkflow = await loadWorkflow(path.resolve("WORKFLOW.codex.github.md"));
@@ -181,6 +229,7 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
     base_branch: "main",
   });
   assert.deepEqual(workflow.config.delivery, { queueLabel: "symphony", reviewLabel: "human-review" });
+  assert.deepEqual(workflow.config.control, { retryLabel: "symphony-retry" });
   assert.equal(workflow.config.agent.maxTurns, 1);
   assert.equal(workflow.config.agent.maxAttempts, 3);
   assert.deepEqual(workflow.config.runtime.options.allowed_tools, [
@@ -194,6 +243,7 @@ test("loads the checked-in GitHub issue-to-PR workflow", async () => {
   assert.equal(codexWorkflow.config.agent.maxTurns, 1);
   assert.equal(codexWorkflow.config.agent.maxAttempts, 3);
   assert.deepEqual(codexWorkflow.config.delivery, workflow.config.delivery);
+  assert.deepEqual(codexWorkflow.config.control, workflow.config.control);
 });
 
 const sampleIssue: Issue = {

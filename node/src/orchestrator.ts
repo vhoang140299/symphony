@@ -329,6 +329,9 @@ export class Orchestrator {
     if (driver.kind !== workflow.config.runtime.kind) {
       throw new Error(`Runtime driver ${driver.kind} does not match configured kind ${workflow.config.runtime.kind}`);
     }
+    if (workflow.config.control !== undefined && tracker.mutateIssue === undefined) {
+      throw new Error("Configured control labels require tracker mutation support");
+    }
     if (
       workflow.config.delivery !== undefined &&
       (tracker.publishIssueChange === undefined || tracker.mutateIssue === undefined)
@@ -402,6 +405,40 @@ export class Orchestrator {
         this.#release(issueId);
       } else if (classification !== "routable") {
         this.#release(issueId);
+      } else {
+        const retryLabel = entry.workflow.config.control?.retryLabel;
+        if (retryLabel === undefined || !refreshed.labels.some((label) => sameLabel(label, retryLabel))) continue;
+        if (this.#shuttingDown) return;
+        if (this.#blocked.get(issueId) !== entry) continue;
+        const mutateIssue = requireValue(
+          entry.tracker.mutateIssue?.bind(entry.tracker),
+          "Configured control labels require tracker mutation support",
+        );
+        try {
+          await mutateIssue(
+            refreshed,
+            { kind: "remove_label", label: retryLabel },
+            this.#shutdownController.signal,
+          );
+        } catch {
+          this.#logger.warn(
+            { issue_id: issueId, issue_identifier: refreshed.identifier },
+            "Blocked retry label removal failed; claim retained",
+          );
+          continue;
+        }
+        if (this.#shuttingDown) return;
+        if (!this.retryBlocked(issueId)) {
+          this.#logger.warn(
+            { issue_id: issueId, issue_identifier: refreshed.identifier },
+            "Retry label was removed after the blocked claim changed; no retry scheduled",
+          );
+          continue;
+        }
+        this.#logger.info(
+          { issue_id: issueId, issue_identifier: refreshed.identifier },
+          "Blocked retry label consumed; manual run scheduled",
+        );
       }
     }
   }
@@ -657,7 +694,17 @@ export class Orchestrator {
         ...(hostDelivery || mutateIssue === undefined
           ? {}
           : {
-              mutateCurrentIssue: (mutation, signal) => mutateIssue(boundIssue, mutation, signal),
+              mutateCurrentIssue: (mutation, signal) => {
+                const retryLabel = entry.workflow.config.control?.retryLabel;
+                if (
+                  retryLabel !== undefined &&
+                  (mutation.kind === "add_label" || mutation.kind === "remove_label") &&
+                  sameLabel(mutation.label, retryLabel)
+                ) {
+                  throw new Error("Agent cannot mutate the configured control retry label");
+                }
+                return mutateIssue(boundIssue, mutation, signal);
+              },
             }),
         ...(hostDelivery || publishIssueChange === undefined
           ? {}
@@ -1044,6 +1091,10 @@ function isRoutable(issue: Issue, config: WorkflowConfig): boolean {
   if (config.tracker.terminalStates.some((terminal) => normalizeState(terminal) === state)) return false;
   const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()).filter(Boolean));
   return config.tracker.requiredLabels.every((label) => labels.has(label));
+}
+
+function sameLabel(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 function publishInputFor(issue: Issue, completion: AgentCompletion): PublishChangeInput {

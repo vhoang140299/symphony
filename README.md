@@ -36,8 +36,8 @@ help with the setup:
 
 For a smaller Node.js implementation, see [node/README.md](node/README.md). It supports Claude Code
 and Codex, with in-memory and GitHub Issues trackers plus an opt-in, host-controlled GitHub
-issue-to-pull-request flow for either agent; it does not yet provide the full adapter and operational
-surface of the Elixir reference implementation.
+issue-to-pull-request flow and retry-label control for either agent; it does not yet provide the full
+adapter and operational surface of the Elixir reference implementation.
 
 ---
 
