@@ -1,10 +1,21 @@
 import type { Tracker } from "../domain.js";
 import { GitHubTracker, validateGitHubProvider } from "./github.js";
+import { LinearTracker, validateLinearProvider } from "./linear.js";
 import { MemoryTracker } from "./memory.js";
 
-export function createTracker(kind: string, provider: Record<string, unknown>): Tracker {
+export function createTracker(
+  kind: string,
+  provider: Record<string, unknown>,
+  options: { terminalStates?: string[] } = {},
+): Tracker {
   if (kind === "memory") return new MemoryTracker(provider);
   if (kind === "github") return new GitHubTracker(provider);
+  if (kind === "linear") {
+    return new LinearTracker(
+      provider,
+      options.terminalStates === undefined ? {} : { terminalStates: options.terminalStates },
+    );
+  }
   throw new Error(`Unsupported tracker kind: ${kind}`);
 }
 
@@ -15,6 +26,10 @@ export function validateTrackerProvider(kind: string, provider: Record<string, u
   }
   if (kind === "github") {
     validateGitHubProvider(provider);
+    return;
+  }
+  if (kind === "linear") {
+    validateLinearProvider(provider);
     return;
   }
   throw new Error(`Unsupported tracker kind: ${kind}`);

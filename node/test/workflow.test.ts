@@ -8,6 +8,7 @@ import { WorkflowStore } from "../src/config/store.js";
 import { loadWorkflow, renderPrompt } from "../src/config/workflow.js";
 import type { Issue } from "../src/domain.js";
 import { createLogger } from "../src/log.js";
+import { workflowScopeHash } from "../src/state/scope.js";
 
 const logger = createLogger("silent");
 
@@ -144,6 +145,19 @@ test("uses tracker-specific state defaults and preserves explicit states", () =>
   assert.deepEqual(github.tracker.activeStates, ["open"]);
   assert.deepEqual(github.tracker.terminalStates, ["closed"]);
 
+  const linear = parseWorkflowConfig({ tracker: { kind: "linear" } });
+  assert.deepEqual(linear.tracker.activeStates, ["Todo", "In Progress"]);
+  assert.deepEqual(linear.tracker.terminalStates, ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"]);
+  assert.equal(linear.agent.maxTurns, 1);
+  assert.equal(linear.agent.maxAttempts, 3);
+
+  const explicitLinear = parseWorkflowConfig({
+    tracker: { kind: "linear" },
+    agent: { max_turns: 2, max_attempts: 4 },
+  });
+  assert.equal(explicitLinear.agent.maxTurns, 2);
+  assert.equal(explicitLinear.agent.maxAttempts, 4);
+
   const explicit = parseWorkflowConfig({
     tracker: { kind: "github", active_states: [" CLOSED "], terminal_states: [" OPEN "] },
   });
@@ -151,12 +165,33 @@ test("uses tracker-specific state defaults and preserves explicit states", () =>
   assert.deepEqual(explicit.tracker.terminalStates, ["OPEN"]);
 });
 
-test("rejects unsupported tracker kinds and GitHub states while loading config", () => {
-  assert.throws(() => parseWorkflowConfig({ tracker: { kind: "linear" } }), /memory.*github|github.*memory/i);
+test("accepts Linear, rejects unsupported tracker kinds, and validates GitHub states", () => {
+  assert.equal(parseWorkflowConfig({ tracker: { kind: "linear" } }).tracker.kind, "linear");
+  assert.throws(
+    () => parseWorkflowConfig({ tracker: { kind: "unknown" } }),
+    /memory.*github.*linear|linear.*github.*memory/i,
+  );
   assert.throws(
     () => parseWorkflowConfig({ tracker: { kind: "github", active_states: ["Todo"] } }),
     /GitHub tracker states must be open, closed, or all/,
   );
+});
+
+test("binds durable Linear state to its project scope without hashing credentials", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-linear-scope-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const writeLinearWorkflow = async (projectSlug: string, token: string, assignee = "worker-1") => {
+    await writeFile(
+      workflowPath,
+      `---\ntracker:\n  kind: linear\n  provider:\n    project_slug: ${projectSlug}\n    api_key: ${token}\n    assignee: ${assignee}\nworkspace:\n  root: ./workspaces\n---\nDo work.\n`,
+    );
+    return workflowScopeHash(await loadWorkflow(workflowPath));
+  };
+
+  const original = await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_ONE");
+  assert.equal(await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_TWO"), original);
+  assert.notEqual(await writeLinearWorkflow("project-b", "$LINEAR_TOKEN_TWO"), original);
+  assert.notEqual(await writeLinearWorkflow("project-a", "$LINEAR_TOKEN_TWO", "worker-2"), original);
 });
 
 test("accepts supported coding-agent runtimes and rejects unknown kinds during config parsing", () => {
@@ -204,6 +239,10 @@ test("host delivery is explicit, label-bound, and keeps tracker credentials out 
   );
   assert.throws(
     () => parseWorkflowConfig({ ...config, tracker: { kind: "memory", required_labels: ["symphony"] } }),
+    /GitHub tracker/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...config, tracker: { kind: "linear", required_labels: ["symphony"] } }),
     /GitHub tracker/i,
   );
   assert.throws(

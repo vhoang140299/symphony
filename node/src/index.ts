@@ -27,5 +27,6 @@ export {
   type OrchestratorSnapshot,
 } from "./orchestrator.js";
 export { GitHubTracker } from "./trackers/github.js";
+export { LinearTracker } from "./trackers/linear.js";
 export { MemoryTracker } from "./trackers/memory.js";
 export { WorkspaceManager, workspaceKey } from "./workspace/manager.js";

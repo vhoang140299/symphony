@@ -15,7 +15,11 @@ export interface PreflightResult {
 
 export async function runPreflight(workflowPath: string): Promise<PreflightResult> {
   const workflow = await loadWorkflow(workflowPath);
-  const tracker = createTracker(workflow.config.tracker.kind, workflow.config.tracker.provider);
+  const tracker = createTracker(
+    workflow.config.tracker.kind,
+    workflow.config.tracker.provider,
+    { terminalStates: workflow.config.tracker.terminalStates },
+  );
   const fetched = await tracker.fetchIssuesByStates(workflow.config.tracker.activeStates);
   return summarizePreflight(workflow, fetched);
 }
