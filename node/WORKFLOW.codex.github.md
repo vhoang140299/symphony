@@ -14,6 +14,9 @@ delivery:
   queue_label: symphony
   review_label: human-review
 
+control:
+  retry_label: symphony-retry
+
 polling:
   interval_ms: 30000
 
