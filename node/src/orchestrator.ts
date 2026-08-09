@@ -175,6 +175,7 @@ export class Orchestrator {
   #timer: NodeJS.Timeout | undefined;
   #initializationPromise: Promise<void> | undefined;
   #pollPromise: Promise<void> | undefined;
+  #stopPromise: Promise<void> | undefined;
   #started = false;
   #startupComplete = false;
   #shuttingDown = false;
@@ -235,14 +236,19 @@ export class Orchestrator {
     return this.#fatalErrorPromise;
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.#stopPromise) return this.#stopPromise;
     this.#started = false;
     this.#startupComplete = false;
     this.#shuttingDown = true;
+    this.#stopPromise = Promise.resolve().then(() => this.#finishStop());
     this.#shutdownController.abort(new Error("Orchestrator is shutting down"));
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    return this.#stopPromise;
+  }
 
+  async #finishStop(): Promise<void> {
     for (const entry of this.#running.values()) {
       this.#requestStop(entry, "shutdown", "Orchestrator is shutting down");
     }
@@ -250,9 +256,13 @@ export class Orchestrator {
       this.#shutdownGraceMs ?? Math.max(30_000, (this.#workflow?.config.hooks.timeoutMs ?? 0) + 1_000);
     const deadlineMs = Date.now() + graceMs;
     let checkpointSafe = true;
+    let timedOut = false;
+    const outstanding: Promise<unknown>[] = [];
     const initialization = this.#initializationPromise;
+    if (initialization) outstanding.push(initialization);
     if (initialization && !(await settlesWithin(initialization, graceMs))) {
       checkpointSafe = false;
+      timedOut = true;
       this.#stateWritesFrozen = true;
       this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for initialization");
     } else if (initialization && this.#workflow === undefined) {
@@ -260,7 +270,10 @@ export class Orchestrator {
       this.#stateWritesFrozen = true;
     }
     const pollWaitMs = Math.max(0, deadlineMs - Date.now());
-    if (this.#pollPromise && !(await settlesWithin(this.#pollPromise, pollWaitMs))) {
+    const poll = this.#pollPromise;
+    if (poll) outstanding.push(poll);
+    if (poll && !(await settlesWithin(poll, pollWaitMs))) {
+      timedOut = true;
       this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for the active poll");
     }
     for (const entry of this.#running.values()) {
@@ -268,27 +281,59 @@ export class Orchestrator {
     }
     const remainingMs = Math.max(0, deadlineMs - Date.now());
     const runs = Promise.allSettled([...this.#running.values()].map((entry) => entry.done));
+    outstanding.push(runs);
     if (!(await settlesWithin(runs, remainingMs))) {
+      timedOut = true;
       this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for agent runs");
     }
 
-    if (checkpointSafe) await this.#checkpointInterruptedRuns();
+    let stopError: unknown;
+    try {
+      if (checkpointSafe) await this.#checkpointInterruptedRuns();
+    } catch (error) {
+      stopError = error;
+    }
 
     this.#running.clear();
     this.#retrying.clear();
     this.#blocked.clear();
     this.#claimed.clear();
+
+    if (timedOut) {
+      void Promise.allSettled(outstanding)
+        .then(() => this.#releaseStateLease())
+        .catch((error: unknown) => this.#logger.error({ error }, "Run state lease release failed"));
+    } else {
+      try {
+        await this.#releaseStateLease();
+      } catch (error) {
+        if (stopError === undefined) stopError = error;
+        else this.#logger.error({ error }, "Run state lease release failed");
+      }
+    }
+    if (stopError !== undefined) throw stopError;
   }
 
   async #initializeWorkflow(): Promise<void> {
     try {
       const workflow = await this.#workflowStore.initialize();
+      if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
       this.#applyWorkflow(workflow);
+      if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
+      if (this.#stateStore !== undefined) {
+        await this.#stateStore.acquireLease();
+      }
+      if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
       this.#startedAtMs = this.#now();
       await this.#recoverState();
       if (!this.#shuttingDown) await this.#cleanupTerminalWorkspaces();
       if (this.#shuttingDown && this.#stateWritesFrozen) this.#clearClaims();
     } catch (error) {
+      try {
+        await this.#releaseStateLease();
+      } catch (releaseError) {
+        this.#logger.error({ error: releaseError }, "Run state lease release failed after initialization error");
+      }
       this.#clearClaims();
       this.#workflow = undefined;
       this.#tracker = undefined;
@@ -389,6 +434,7 @@ export class Orchestrator {
   }
 
   async #poll(failOnTrackerError: boolean): Promise<void> {
+    if (this.#shuttingDown) return;
     await this.initialize();
     this.#requirePersistenceHealthy();
     if (this.#shuttingDown) return;
@@ -663,6 +709,10 @@ export class Orchestrator {
     } catch (error) {
       throw this.#failPersistence(error);
     }
+  }
+
+  async #releaseStateLease(): Promise<void> {
+    await this.#stateStore?.releaseLease();
   }
 
   async #cleanupTerminalWorkspaces(): Promise<void> {
