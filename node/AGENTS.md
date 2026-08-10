@@ -26,11 +26,13 @@ This directory is the Node.js/TypeScript Symphony implementation. Keep it aligne
 
 ## Validation
 
-Run focused tests while editing, then finish with:
+Run focused tests while editing. Use `pnpm run check` optionally for fast backend and dashboard
+type-check feedback. Finish with the full gate, which already builds and type-checks both:
 
 ```bash
-pnpm run check
 pnpm test
 ```
+
+For packaging or CLI artifact changes, also run `pnpm run test:pack`.
 
 Update `README.md` and `WORKFLOW.md` whenever public configuration or runtime behavior changes.

@@ -1,6 +1,6 @@
 # Symphony Node
 
-This directory contains a small TypeScript implementation of the
+This directory contains the TypeScript implementation of the
 [`SPEC.md`](https://github.com/vhoang140299/symphony/blob/main/SPEC.md). It polls a tracker, creates
 an isolated workspace for each issue, and runs Claude Code or Codex through their official SDKs.
 
