@@ -170,6 +170,7 @@ test("validates provider settings offline, resolves env keys at runtime, and ski
     assert.deepEqual(await runtime.tracker.fetchIssuesByStates(["Todo"]), []);
     assert.equal(runtime.clientOptions[0]?.apiKey, "resolved-secret");
     assert.equal(runtime.clientOptions[0]?.apiUrl, "https://api.linear.app/graphql");
+    assert.deepEqual(runtime.requests[0]?.variables.assigneeFilter, {});
     assert.ok(runtime.clientOptions[0]?.signal instanceof AbortSignal);
     assert.equal(runtime.clientOptions[0]?.signal?.aborted, false);
   } finally {
