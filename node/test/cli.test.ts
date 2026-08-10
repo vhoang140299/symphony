@@ -85,11 +85,16 @@ test("workflow server.port 0 accepts a CLI host override and logs the actual eph
     assert.equal(started.http_host, "127.0.0.1");
     assert.ok(Number.isSafeInteger(started.http_port) && Number(started.http_port) > 0);
     await waitForHttpStatus(`http://127.0.0.1:${String(started.http_port)}/readyz`, 200, 2_000);
-    const refresh = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/refresh`, { method: "POST" });
+    const operationHeaders = { "X-Symphony-Operation": "1" };
+    const refresh = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/refresh`, {
+      method: "POST",
+      headers: operationHeaders,
+    });
     assert.equal(refresh.status, 202);
     assert.deepEqual(await refresh.json(), { queued: true });
     const retry = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/MISSING-1/retry`, {
       method: "POST",
+      headers: operationHeaders,
     });
     assert.equal(retry.status, 404);
     assert.deepEqual(await retry.json(), { error: { code: "issue_not_found", message: "Issue not found" } });

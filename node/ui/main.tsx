@@ -59,6 +59,7 @@ interface DashboardState {
 
 const unavailableMessage = "Dashboard data is temporarily unavailable. Retrying automatically.";
 const actionFailedMessage = "The request could not be completed. Refresh and try again.";
+const operationHeaders = { "X-Symphony-Operation": "1" };
 const numberFormatter = new Intl.NumberFormat();
 const currencyFormatter = new Intl.NumberFormat(undefined, {
   style: "currency",
@@ -119,7 +120,7 @@ function App() {
     setRefreshing(true);
     setError(null);
     try {
-      const response = await fetch("/api/v1/refresh", { method: "POST" });
+      const response = await fetch("/api/v1/refresh", { method: "POST", headers: operationHeaders });
       if (!response.ok) throw new Error("refresh request failed");
       await loadState(true);
     } catch {
@@ -133,7 +134,10 @@ function App() {
     setRetryingBlockedIssue(issue.issueId);
     setError(null);
     try {
-      const response = await fetch(`/api/v1/${encodeURIComponent(issue.identifier)}/retry`, { method: "POST" });
+      const response = await fetch(`/api/v1/${encodeURIComponent(issue.identifier)}/retry`, {
+        method: "POST",
+        headers: operationHeaders,
+      });
       if (!response.ok) throw new Error("blocked retry request failed");
       await loadState(true);
     } catch {

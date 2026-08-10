@@ -179,6 +179,14 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
   later poll cannot schedule the same manual retry again. Missing/non-routable issues return `404`;
   an unavailable scheduler returns `503`.
 
+Mutation requests must include `X-Symphony-Operation: 1`; browser requests with an `Origin` header
+must also use the same authority as the request's `Host`. For example:
+
+```bash
+curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/refresh
+curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/OPS-123/retry
+```
+
 The API omits workspace paths, agent session IDs, blocked summaries, provider details, raw rate-limit
 payloads, and raw errors. `secondsRunning` is in-process claimed-run wall time, including hooks and
 host delivery, and resets when the process restarts. Unknown routes and unsupported methods use JSON
@@ -187,10 +195,14 @@ host delivery, and resets when the process restarts. Unknown routes and unsuppor
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.
 
-The dashboard and API have no authentication. Its poll and retry controls can start agent work. Keep
-the default loopback binding; if you bind to a remote interface, add authentication and network
-access controls outside Symphony. Dashboard issue links are limited to HTTP(S), and provider
-content is rendered as text rather than HTML.
+The dashboard and API have no authentication. Its poll and retry controls can start agent work. All
+requests require a trusted `Host`: the configured listener host, the concrete local destination
+address, or a loopback alias when listening on loopback. A wildcard listener accepts its concrete
+interface address, not an arbitrary DNS hostname. Keep the default loopback binding; if you bind to
+a remote or wildcard interface, add authentication and network access controls outside Symphony.
+A reverse proxy must preserve or rewrite a trusted `Host` and does not replace external
+authentication. Dashboard issue links are limited to HTTP(S), and provider content is rendered as
+text rather than HTML.
 
 For development:
 
