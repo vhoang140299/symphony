@@ -33,9 +33,19 @@ try {
     "package/codex-symphony-wrapper.mjs",
     "package/package.json",
   ]);
+  assert.ok(packagedFiles.includes("package/dist/dashboard/index.html"), "tarball must include the dashboard");
+  assert.ok(
+    packagedFiles.includes("package/dist/dashboard/assets/licenses.md"),
+    "tarball must include bundled dependency licenses",
+  );
   assert.ok(packagedFiles.includes("package/dist/src/cli.js"), "tarball must include the compiled CLI");
   assert.deepEqual(
-    packagedFiles.filter((entry) => !allowedFiles.has(entry) && !entry.startsWith("package/dist/src/")),
+    packagedFiles.filter(
+      (entry) =>
+        !allowedFiles.has(entry) &&
+        !entry.startsWith("package/dist/dashboard/") &&
+        !entry.startsWith("package/dist/src/"),
+    ),
     [],
     "tarball must contain only runtime artifacts and public documentation",
   );
