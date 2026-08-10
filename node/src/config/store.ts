@@ -14,9 +14,11 @@ export class WorkflowStore {
   }
 
   async initialize(): Promise<WorkflowDefinition> {
+    if (this.#workflow) return this.#workflow;
     const workflow = await loadWorkflow(this.#path);
+    const mtimeMs = (await stat(workflow.path)).mtimeMs;
     this.#workflow = workflow;
-    this.#mtimeMs = (await stat(workflow.path)).mtimeMs;
+    this.#mtimeMs = mtimeMs;
     return workflow;
   }
 

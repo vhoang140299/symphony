@@ -65,13 +65,16 @@ interface RunningEntry extends SessionConfig {
   issue: Issue;
   attempt: number | null;
   continuation: number;
+  turnCount: number;
   controller: AbortController;
   startedAtMs: number;
   lastActivityAtMs: number;
   sessionId: string | undefined;
   workspacePath: string | undefined;
   stopReason: StopReason | undefined;
+  usage: AgentUsage;
   lastUsage: AgentUsage;
+  lastEvent: AgentEvent["type"] | null;
   pendingDelivery?: PendingDelivery;
   done: Promise<void>;
 }
@@ -119,17 +122,23 @@ export interface OrchestratorSnapshot {
   running: Array<{
     issueId: string;
     identifier: string;
+    issueUrl: string | null;
     state: string;
     attempt: number | null;
     continuation: number;
+    turnCount: number;
     startedAt: string;
     lastActivityAt: string;
+    secondsRunning: number;
+    usage: AgentUsage;
+    lastEvent: AgentEvent["type"] | null;
     sessionId?: string;
     workspacePath?: string;
   }>;
   retrying: Array<{
     issueId: string;
     identifier: string;
+    issueUrl: string | null;
     attempt: number;
     dueAt: string;
     reason: "continuation" | "failure";
@@ -137,10 +146,11 @@ export interface OrchestratorSnapshot {
   blocked: Array<{
     issueId: string;
     identifier: string;
+    issueUrl: string | null;
     blockedAt: string;
     summary: string;
   }>;
-  totals: AgentUsage;
+  totals: AgentUsage & { secondsRunning: number };
   latestRateLimits: unknown;
 }
 
@@ -182,6 +192,7 @@ export class Orchestrator {
   #startedAtMs: number | undefined;
   #lastPollAtMs: number | undefined;
   #totals = zeroUsage();
+  #completedRuntimeMs = 0;
   #latestRateLimits: unknown = null;
 
   constructor(workflowStore: WorkflowStore, logger: AppLogger, dependencies: OrchestratorDependencies = {}) {
@@ -294,6 +305,7 @@ export class Orchestrator {
       stopError = error;
     }
 
+    for (const entry of this.#running.values()) this.#recordRuntime(entry);
     this.#running.clear();
     this.#retrying.clear();
     this.#blocked.clear();
@@ -401,23 +413,31 @@ export class Orchestrator {
   }
 
   snapshot(): OrchestratorSnapshot {
+    const now = this.#now();
+    const running = [...this.#running.values()].map((entry) => ({
+      issueId: entry.issue.id,
+      identifier: entry.issue.identifier,
+      issueUrl: entry.issue.url,
+      state: entry.issue.state,
+      attempt: entry.attempt,
+      continuation: entry.continuation,
+      turnCount: entry.turnCount,
+      startedAt: iso(entry.startedAtMs),
+      lastActivityAt: iso(entry.lastActivityAtMs),
+      secondsRunning: Math.max(0, now - entry.startedAtMs) / 1_000,
+      usage: { ...entry.usage },
+      lastEvent: entry.lastEvent,
+      ...(entry.sessionId === undefined ? {} : { sessionId: entry.sessionId }),
+      ...(entry.workspacePath === undefined ? {} : { workspacePath: entry.workspacePath }),
+    }));
     return {
       startedAt: this.#startedAtMs === undefined ? null : iso(this.#startedAtMs),
       lastPollAt: this.#lastPollAtMs === undefined ? null : iso(this.#lastPollAtMs),
-      running: [...this.#running.values()].map((entry) => ({
-        issueId: entry.issue.id,
-        identifier: entry.issue.identifier,
-        state: entry.issue.state,
-        attempt: entry.attempt,
-        continuation: entry.continuation,
-        startedAt: iso(entry.startedAtMs),
-        lastActivityAt: iso(entry.lastActivityAtMs),
-        ...(entry.sessionId === undefined ? {} : { sessionId: entry.sessionId }),
-        ...(entry.workspacePath === undefined ? {} : { workspacePath: entry.workspacePath }),
-      })),
+      running,
       retrying: [...this.#retrying.values()].map((entry) => ({
         issueId: entry.issue.id,
         identifier: entry.issue.identifier,
+        issueUrl: entry.issue.url,
         attempt: entry.attempt,
         dueAt: iso(entry.dueAtMs),
         reason: entry.reason,
@@ -425,10 +445,15 @@ export class Orchestrator {
       blocked: [...this.#blocked.values()].map((entry) => ({
         issueId: entry.issue.id,
         identifier: entry.issue.identifier,
+        issueUrl: entry.issue.url,
         blockedAt: iso(entry.blockedAtMs),
         summary: entry.summary,
       })),
-      totals: { ...this.#totals },
+      totals: {
+        ...this.#totals,
+        secondsRunning: this.#completedRuntimeMs / 1_000
+          + running.reduce((total, entry) => total + entry.secondsRunning, 0),
+      },
       latestRateLimits: this.#latestRateLimits,
     };
   }
@@ -678,6 +703,7 @@ export class Orchestrator {
     const store = this.#stateStore;
     if (store === undefined || this.#stateWritesFrozen) return;
     for (const [issueId, entry] of [...this.#running.entries()]) {
+      this.#recordRuntime(entry);
       this.#running.delete(issueId);
       if (entry.pendingDelivery !== undefined) {
         this.#retrying.set(issueId, {
@@ -923,13 +949,16 @@ export class Orchestrator {
       driver: source.driver,
       attempt: source.attempt,
       continuation: source.continuation,
+      turnCount: 0,
       controller: new AbortController(),
       startedAtMs: now,
       lastActivityAtMs: now,
       sessionId: source.sessionId,
       workspacePath: undefined,
       stopReason: undefined,
+      usage: zeroUsage(),
       lastUsage: zeroUsage(),
+      lastEvent: null,
       ...(source.pendingDelivery === undefined ? {} : { pendingDelivery: source.pendingDelivery }),
       done: Promise.resolve(),
     };
@@ -946,6 +975,7 @@ export class Orchestrator {
         issue_identifier: entry.issue.identifier,
         attempt: entry.attempt,
         runtime: entry.driver.kind,
+        ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
       },
       entry.pendingDelivery === undefined ? "Agent run started" : "Host delivery retry started",
     );
@@ -1042,6 +1072,7 @@ export class Orchestrator {
   }
 
   async #consumeTurn(entry: RunningEntry, prompt: string): Promise<AgentEvent> {
+    entry.turnCount += 1;
     entry.lastUsage = zeroUsage();
     let terminal: AgentEvent | undefined;
     let terminalCount = 0;
@@ -1114,6 +1145,7 @@ export class Orchestrator {
                       issue_id: boundIssue.id,
                       issue_identifier: boundIssue.identifier,
                       error,
+                      ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
                     },
                     "Current issue change publication failed",
                   );
@@ -1125,6 +1157,7 @@ export class Orchestrator {
       })) {
         resetTimeout();
         entry.lastActivityAtMs = this.#now();
+        entry.lastEvent = event.type;
         if (event.sessionId) entry.sessionId = event.sessionId;
         if (event.type === "usage_updated" && event.usage) this.#addUsage(entry, event.usage);
         if (event.type === "rate_limit_updated") this.#latestRateLimits = event.rateLimits ?? null;
@@ -1144,9 +1177,9 @@ export class Orchestrator {
             {
               issue_id: entry.issue.id,
               issue_identifier: entry.issue.identifier,
-              session_id: entry.sessionId,
               event_type: event.type,
               summary: event.summary,
+              ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
             },
             "Agent event",
           );
@@ -1287,6 +1320,7 @@ export class Orchestrator {
           issue_id: entry.issue.id,
           issue_identifier: entry.issue.identifier,
           error,
+          ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
         },
         "Host delivery failed",
       );
@@ -1318,9 +1352,15 @@ export class Orchestrator {
     for (const key of usageKeys) {
       const value = finiteNonNegative(current[key]);
       const previous = finiteNonNegative(entry.lastUsage[key]);
-      this.#totals[key] += Math.max(0, value - previous);
+      const delta = Math.max(0, value - previous);
+      this.#totals[key] += delta;
+      entry.usage[key] += delta;
     }
     entry.lastUsage = { ...current };
+  }
+
+  #recordRuntime(entry: RunningEntry): void {
+    this.#completedRuntimeMs += Math.max(0, this.#now() - entry.startedAtMs);
   }
 
   async #finish(entry: RunningEntry, outcome: RunOutcome): Promise<void> {
@@ -1340,6 +1380,7 @@ export class Orchestrator {
     if (outcome.kind === "terminal") {
       await this.#removeWorkspace(entry.issue, entry.workflow.config);
       if (this.#running.get(entry.issue.id) !== entry) return;
+      this.#recordRuntime(entry);
       this.#running.delete(entry.issue.id);
       this.#claimed.delete(entry.issue.id);
       this.#assertClaimInvariant();
@@ -1347,11 +1388,17 @@ export class Orchestrator {
       return;
     }
 
+    this.#recordRuntime(entry);
     this.#running.delete(entry.issue.id);
     if (outcome.kind === "release") {
       this.#claimed.delete(entry.issue.id);
       this.#logger.info(
-        { issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, reason: outcome.summary },
+        {
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+          reason: outcome.summary,
+          ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
+        },
         "Issue claim released",
       );
     } else if (outcome.kind === "blocked") {
@@ -1367,7 +1414,12 @@ export class Orchestrator {
         summary: outcome.summary,
       });
       this.#logger.warn(
-        { issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, reason: outcome.summary },
+        {
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+          reason: outcome.summary,
+          ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
+        },
         "Agent run blocked; manual retry required",
       );
     } else {
@@ -1383,6 +1435,7 @@ export class Orchestrator {
             issue_identifier: entry.issue.identifier,
             reason: summary,
             error: outcome.kind === "failure" ? outcome.error : undefined,
+            ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
           },
           isFailure ? "Agent run failed; retry budget exhausted" : "Agent retry budget exhausted",
         );
@@ -1431,6 +1484,7 @@ export class Orchestrator {
             outcome.kind === "failure" || outcome.kind === "delivery_failure"
               ? outcome.error
               : undefined,
+          ...(entry.sessionId === undefined ? {} : { session_id: entry.sessionId }),
         },
         isDeliveryFailure
           ? "Host delivery failed; retry scheduled"

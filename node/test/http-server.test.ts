@@ -5,18 +5,31 @@ import type { OrchestratorSnapshot } from "../src/orchestrator.js";
 
 test("operations endpoints expose health and aggregate status without run details", async () => {
   let ready = false;
+  let refreshes = 0;
   const snapshot: OrchestratorSnapshot = {
     startedAt: "2026-08-09T01:00:00.000Z",
     lastPollAt: "2026-08-09T01:01:00.000Z",
     running: [
       {
         issueId: "secret-issue-id",
-        identifier: "SECRET-1",
+        identifier: "acme/widget#7",
+        issueUrl: "https://github.example/acme/widget/issues/7",
         state: "Todo",
         attempt: 1,
         continuation: 0,
+        turnCount: 2,
         startedAt: "2026-08-09T01:00:10.000Z",
         lastActivityAt: "2026-08-09T01:00:20.000Z",
+        secondsRunning: 50,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 2,
+          cacheCreationInputTokens: 1,
+          totalTokens: 18,
+          costUsd: 0.01,
+        },
+        lastEvent: "activity",
         sessionId: "secret-session",
         workspacePath: "/secret/workspace",
       },
@@ -25,6 +38,7 @@ test("operations endpoints expose health and aggregate status without run detail
       {
         issueId: "retry-issue-id",
         identifier: "RETRY-1",
+        issueUrl: "https://tracker.example/issues/RETRY-1",
         attempt: 2,
         dueAt: "2026-08-09T01:02:00.000Z",
         reason: "failure",
@@ -34,6 +48,7 @@ test("operations endpoints expose health and aggregate status without run detail
       {
         issueId: "blocked-issue-id",
         identifier: "BLOCKED-1",
+        issueUrl: "https://tracker.example/issues/BLOCKED-1",
         blockedAt: "2026-08-09T01:00:30.000Z",
         summary: "secret summary",
       },
@@ -45,10 +60,17 @@ test("operations endpoints expose health and aggregate status without run detail
       cacheCreationInputTokens: 1,
       totalTokens: 18,
       costUsd: 0.01,
+      secondsRunning: 60,
     },
     latestRateLimits: { secret: "provider detail" },
   };
-  const server = createOperationsServer(() => snapshot, () => ready);
+  const server = createOperationsServer(
+    () => snapshot,
+    () => ready,
+    () => {
+      refreshes += 1;
+    },
+  );
 
   try {
     const health = await server.inject({ method: "GET", url: "/healthz" });
@@ -93,18 +115,31 @@ test("operations endpoints expose health and aggregate status without run detail
       running: [
         {
           issueId: "secret-issue-id",
-          identifier: "SECRET-1",
+          identifier: "acme/widget#7",
+          issueUrl: "https://github.example/acme/widget/issues/7",
           state: "Todo",
           attempt: 1,
           continuation: 0,
+          turnCount: 2,
           startedAt: "2026-08-09T01:00:10.000Z",
           lastActivityAt: "2026-08-09T01:00:20.000Z",
+          secondsRunning: 50,
+          usage: {
+            inputTokens: 10,
+            outputTokens: 5,
+            cacheReadInputTokens: 2,
+            cacheCreationInputTokens: 1,
+            totalTokens: 18,
+            costUsd: 0.01,
+          },
+          lastEvent: "activity",
         },
       ],
       retrying: [
         {
           issueId: "retry-issue-id",
           identifier: "RETRY-1",
+          issueUrl: "https://tracker.example/issues/RETRY-1",
           attempt: 2,
           dueAt: "2026-08-09T01:02:00.000Z",
           reason: "failure",
@@ -114,12 +149,51 @@ test("operations endpoints expose health and aggregate status without run detail
         {
           issueId: "blocked-issue-id",
           identifier: "BLOCKED-1",
+          issueUrl: "https://tracker.example/issues/BLOCKED-1",
           blockedAt: "2026-08-09T01:00:30.000Z",
         },
       ],
       totals: snapshot.totals,
     });
     assert.doesNotMatch(state.body, /secret-session|secret summary|\/secret\/workspace|provider detail/iu);
+
+    for (const [identifier, status, row] of [
+      ["acme/widget#7", "running", stateBody.running[0]],
+      ["RETRY-1", "retrying", stateBody.retrying[0]],
+      ["BLOCKED-1", "blocked", stateBody.blocked[0]],
+    ] as const) {
+      const issue = await server.inject({ method: "GET", url: `/api/v1/${encodeURIComponent(identifier)}` });
+      assert.equal(issue.statusCode, 200);
+      assert.equal(issue.headers["cache-control"], "no-store");
+      assert.deepEqual(issue.json(), { status, ...row });
+      assert.doesNotMatch(issue.body, /secret-session|secret summary|\/secret\/workspace|provider detail/iu);
+    }
+
+    const missing = await server.inject({ method: "GET", url: "/api/v1/MISSING-1" });
+    assert.equal(missing.statusCode, 404);
+    assert.deepEqual(missing.json(), { error: { code: "issue_not_found", message: "Issue not found" } });
+
+    const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh" });
+    assert.equal(refresh.statusCode, 202);
+    assert.equal(refresh.headers["cache-control"], "no-store");
+    assert.deepEqual(refresh.json(), { queued: true });
+    assert.equal(refreshes, 1);
+
+    for (const [method, url, allow] of [
+      ["GET", "/api/v1/refresh", "POST"],
+      ["POST", "/status", "GET"],
+    ] as const) {
+      const response = await server.inject({ method, url });
+      assert.equal(response.statusCode, 405);
+      assert.equal(response.headers.allow, allow);
+      assert.deepEqual(response.json(), {
+        error: { code: "method_not_allowed", message: "Method not allowed" },
+      });
+    }
+
+    const unknown = await server.inject({ method: "GET", url: "/unknown" });
+    assert.equal(unknown.statusCode, 404);
+    assert.deepEqual(unknown.json(), { error: { code: "not_found", message: "Route not found" } });
   } finally {
     await server.close();
   }
@@ -131,16 +205,54 @@ test("operations server does not expose internal status errors", async () => {
       throw new Error("secret snapshot detail");
     },
     () => true,
+    () => {
+      throw new Error("secret refresh detail");
+    },
   );
 
   try {
-    for (const url of ["/status", "/api/v1/state"]) {
+    for (const url of ["/status", "/api/v1/state", "/api/v1/SECRET-1"]) {
       const response = await server.inject({ method: "GET", url });
       assert.equal(response.statusCode, 500);
       assert.deepEqual(response.json(), { status: "error" });
       assert.doesNotMatch(response.body, /secret|snapshot detail/iu);
     }
+    const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh" });
+    assert.equal(refresh.statusCode, 500);
+    assert.deepEqual(refresh.json(), { status: "error" });
+    assert.doesNotMatch(refresh.body, /secret|refresh detail/iu);
   } finally {
+    await server.close();
+  }
+});
+
+test("refresh reports an unavailable or unready orchestrator without invoking the snapshot", async () => {
+  const unavailable = createOperationsServer(
+    () => assert.fail("snapshot must not be called"),
+    () => true,
+  );
+  let ready = true;
+  let refreshes = 0;
+  const server = createOperationsServer(
+    () => assert.fail("snapshot must not be called"),
+    () => ready,
+    () => {
+      refreshes += 1;
+    },
+  );
+
+  try {
+    const missingCallback = await unavailable.inject({ method: "POST", url: "/api/v1/refresh" });
+    assert.equal(missingCallback.statusCode, 503);
+    ready = false;
+    const response = await server.inject({ method: "POST", url: "/api/v1/refresh" });
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.json(), {
+      error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
+    });
+    assert.equal(refreshes, 0);
+  } finally {
+    await unavailable.close();
     await server.close();
   }
 });

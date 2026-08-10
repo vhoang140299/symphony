@@ -111,6 +111,13 @@ const stateSchema = z
   })
   .strict();
 
+const serverSchema = z
+  .object({
+    port: z.number().int().min(0).max(65_535).optional(),
+    host: nonEmptyString.default("127.0.0.1"),
+  })
+  .strict();
+
 const rawWorkflowConfigSchema = z
   .object({
     tracker: trackerSchema,
@@ -122,6 +129,7 @@ const rawWorkflowConfigSchema = z
     delivery: deliverySchema.optional(),
     control: controlSchema.optional(),
     state: stateSchema.optional(),
+    server: serverSchema.optional(),
   })
   .passthrough()
   .superRefine((value, context) => {
@@ -318,6 +326,10 @@ export interface WorkflowConfig {
   state?: {
     path: string;
   };
+  server?: {
+    port?: number;
+    host: string;
+  };
 }
 
 export function parseWorkflowConfig(input: unknown): WorkflowConfig {
@@ -388,6 +400,14 @@ export function parseWorkflowConfig(input: unknown): WorkflowConfig {
       : {
           state: {
             path: parsed.state.path,
+          },
+        }),
+    ...(parsed.server === undefined
+      ? {}
+      : {
+          server: {
+            ...(parsed.server.port === undefined ? {} : { port: parsed.server.port }),
+            host: parsed.server.host,
           },
         }),
   };

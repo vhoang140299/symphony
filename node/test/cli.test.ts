@@ -19,14 +19,15 @@ const exampleWorkflowPath = fileURLToPath(new URL("../WORKFLOW.md", import.meta.
 
 test("CLI prints help and exits successfully", async () => {
   const result = await execFileAsync(process.execPath, [cliPath, "--help"]);
+  assert.match(result.stdout, /--port <PORT>/);
   assert.match(result.stdout, /--http-port <PORT>/);
   assert.match(result.stdout, /--http-host <HOST>/);
   assert.match(result.stdout, /default: 127\.0\.0\.1/);
   assert.equal(result.stderr, "");
 });
 
-test("CLI validates the operational HTTP address before loading the workflow", async () => {
-  for (const port of ["0", "65536", "1.5", "not-a-port"]) {
+test("CLI validates the operational HTTP address before startup", async () => {
+  for (const port of ["-1", "65536", "1.5", "not-a-port"]) {
     await assert.rejects(
       execFileAsync(process.execPath, [cliPath, "--http-port", port, exampleWorkflowPath]),
       (error: unknown) => {
@@ -34,7 +35,7 @@ test("CLI validates the operational HTTP address before loading the workflow", a
         assert.ok("stdout" in error);
         assert.ok("stderr" in error);
         assert.equal(String(error.stdout), "");
-        assert.match(String(error.stderr), /expected an integer between 1 and 65535/);
+        assert.match(String(error.stderr), /expected an integer between 0 and 65535/);
         return true;
       },
     );
@@ -59,10 +60,93 @@ test("CLI validates the operational HTTP address before loading the workflow", a
       assert.ok("stdout" in error);
       assert.ok("stderr" in error);
       assert.equal(String(error.stdout), "");
-      assert.match(String(error.stderr), /--http-host <HOST>.*requires option '--http-port <PORT>'/);
+      assert.match(String(error.stderr), /--http-host <HOST>.*requires.*--port.*--http-port.*server\.port/);
       return true;
     },
   );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [cliPath, "--port", "0", "--http-port", "0", exampleWorkflowPath]),
+    /cannot be used with option/,
+  );
+});
+
+test("workflow server.port 0 accepts a CLI host override and logs the actual ephemeral port", { timeout: 5_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-workflow-http-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  await writeFile(
+    workflowPath,
+    "---\ntracker:\n  kind: memory\n  provider: { issues: [] }\nserver:\n  port: 0\n  host: 0.0.0.0\n---\nNo work.\n",
+  );
+  const daemon = spawnCliDaemon(["--http-host", "127.0.0.1", workflowPath]);
+
+  try {
+    const started = await waitForStartupRecord(daemon, 3_000);
+    assert.equal(started.http_host, "127.0.0.1");
+    assert.ok(Number.isSafeInteger(started.http_port) && Number(started.http_port) > 0);
+    await waitForHttpStatus(`http://127.0.0.1:${String(started.http_port)}/readyz`, 200, 2_000);
+    const refresh = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/refresh`, { method: "POST" });
+    assert.equal(refresh.status, 202);
+    assert.deepEqual(await refresh.json(), { queued: true });
+    assert.equal(daemon.child.kill("SIGTERM"), true);
+    assert.deepEqual(await daemon.closed, { code: 0, signal: null });
+  } finally {
+    if (daemon.child.exitCode === null && daemon.child.signalCode === null) daemon.child.kill("SIGKILL");
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI port overrides workflow port and preserves its host", { timeout: 5_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-http-override-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const blocker = createNetServer();
+  const blockedPort = await listenOnEphemeralPort(blocker);
+  await writeFile(
+    workflowPath,
+    `---
+tracker:
+  kind: memory
+  provider: { issues: [] }
+server:
+  port: ${blockedPort}
+  host: 127.0.0.1
+---
+No work.
+`,
+  );
+  const daemon = spawnCliDaemon(["--port", "0", workflowPath]);
+
+  try {
+    const started = await waitForStartupRecord(daemon, 3_000);
+    assert.equal(started.http_host, "127.0.0.1");
+    assert.ok(Number.isSafeInteger(started.http_port) && Number(started.http_port) > 0);
+    assert.notEqual(started.http_port, blockedPort);
+    await waitForHttpStatus(`http://127.0.0.1:${String(started.http_port)}/healthz`, 200, 2_000);
+    assert.equal(daemon.child.kill("SIGTERM"), true);
+    assert.deepEqual(await daemon.closed, { code: 0, signal: null });
+  } finally {
+    if (daemon.child.exitCode === null && daemon.child.signalCode === null) daemon.child.kill("SIGKILL");
+    await closeServer(blocker);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workflow without server config starts no operations listener", { timeout: 5_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-no-http-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  await writeFile(workflowPath, "---\ntracker:\n  kind: memory\n  provider: { issues: [] }\n---\nNo work.\n");
+  const daemon = spawnCliDaemon([workflowPath]);
+
+  try {
+    const started = await waitForStartupRecord(daemon, 3_000);
+    assert.equal(Object.hasOwn(started, "http_host"), false);
+    assert.equal(Object.hasOwn(started, "http_port"), false);
+    assert.equal(daemon.child.kill("SIGTERM"), true);
+    assert.deepEqual(await daemon.closed, { code: 0, signal: null });
+  } finally {
+    if (daemon.child.exitCode === null && daemon.child.signalCode === null) daemon.child.kill("SIGKILL");
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("CLI binds operational HTTP before polling or running workspace hooks", async () => {
@@ -428,6 +512,7 @@ test("CLI --once polls once, prints a compact snapshot, and exits successfully w
       cacheCreationInputTokens: 0,
       totalTokens: 0,
       costUsd: 0,
+      secondsRunning: 0,
     },
   });
   assert.equal(result.stderr, "");
@@ -975,7 +1060,11 @@ test("CLI rejects mutually exclusive execution modes before loading the workflow
 
 test("CLI limits operational HTTP endpoints to daemon mode", async () => {
   for (const mode of ["--once", "--preflight", "--doctor"]) {
-    for (const httpOption of [["--http-port", "3000"], ["--http-host", "localhost"]]) {
+    for (const httpOption of [
+      ["--port", "3000"],
+      ["--http-port", "3000"],
+      ["--http-host", "localhost"],
+    ]) {
       await assert.rejects(
         execFileAsync(process.execPath, [cliPath, mode, ...httpOption, exampleWorkflowPath]),
         (error: unknown) => {
@@ -988,6 +1077,39 @@ test("CLI limits operational HTTP endpoints to daemon mode", async () => {
         },
       );
     }
+  }
+});
+
+test("finite execution modes ignore workflow listener config", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-http-modes-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const blocker = createNetServer();
+  const blockedPort = await listenOnEphemeralPort(blocker);
+  await writeFile(
+    workflowPath,
+    `---
+tracker:
+  kind: memory
+  provider: { issues: [] }
+server:
+  port: ${blockedPort}
+---
+No work.
+`,
+  );
+
+  try {
+    for (const mode of ["--once", "--preflight", "--doctor"]) {
+      const result = await execFileAsync(process.execPath, [cliPath, mode, workflowPath], {
+        env: { ...process.env, LOG_LEVEL: "silent" },
+        timeout: 3_000,
+      });
+      assert.equal(result.stderr, "");
+      assert.doesNotThrow(() => JSON.parse(result.stdout));
+    }
+  } finally {
+    await closeServer(blocker);
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -1088,7 +1210,11 @@ This prompt must never reach Claude.
         assert.ok(error instanceof Error);
         assert.ok("stdout" in error);
         assert.ok("stderr" in error);
-        assert.deepEqual(JSON.parse(String(error.stdout)), {
+        const snapshot = JSON.parse(String(error.stdout)) as {
+          totals: { secondsRunning: number };
+        };
+        assert.ok(snapshot.totals.secondsRunning >= 0);
+        assert.deepEqual(snapshot, {
           running: 0,
           retrying: 1,
           blocked: 0,
@@ -1099,6 +1225,7 @@ This prompt must never reach Claude.
             cacheCreationInputTokens: 0,
             totalTokens: 0,
             costUsd: 0,
+            secondsRunning: snapshot.totals.secondsRunning,
           },
         });
         assert.match(String(error.stderr), /Agent run started/);
@@ -1251,6 +1378,47 @@ function terminateBestEffort(pid: number): void {
   } catch {
     // The process has already exited.
   }
+}
+
+function spawnCliDaemon(args: string[]) {
+  const child = spawn(process.execPath, [cliPath, ...args], {
+    env: { ...process.env, LOG_LEVEL: "info" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => (stdout += chunk));
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  return { child, closed, stdout: () => stdout, stderr: () => stderr };
+}
+
+async function waitForStartupRecord(
+  daemon: ReturnType<typeof spawnCliDaemon>,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const line of daemon.stdout().trim().split("\n")) {
+      try {
+        const record = JSON.parse(line) as Record<string, unknown>;
+        if (record.msg === "Symphony Node started") return record;
+      } catch {
+        // The final log line may still be streaming.
+      }
+    }
+    if (daemon.child.exitCode !== null || daemon.child.signalCode !== null) {
+      const outcome = await daemon.closed;
+      throw new Error(`Daemon exited before startup (${JSON.stringify(outcome)}): ${daemon.stderr().trim()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for startup log: ${daemon.stderr().trim()}`);
 }
 
 async function listenOnEphemeralPort(server: Server): Promise<number> {
