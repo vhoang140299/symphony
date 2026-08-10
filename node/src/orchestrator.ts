@@ -9,13 +9,14 @@ import type {
   AgentCompletion,
   AgentDriver,
   AgentEvent,
+  AgentRateLimit,
   AgentUsage,
   BlockedReasonCode,
   Issue,
   PublishChangeInput,
   Tracker,
 } from "./domain.js";
-import { isTerminalAgentEvent, normalizeState } from "./domain.js";
+import { isTerminalAgentEvent, normalizeAgentRateLimit, normalizeState } from "./domain.js";
 import type { AppLogger } from "./log.js";
 import { classifyIssue, isRoutable, selectRoutableIssues } from "./routing.js";
 import { RunStateStore, type PersistedClaim } from "./state/store.js";
@@ -155,7 +156,7 @@ export interface OrchestratorSnapshot {
     reasonCode: BlockedReasonCode;
   }>;
   totals: AgentUsage & { secondsRunning: number };
-  latestRateLimits: unknown;
+  latestRateLimits: AgentRateLimit | null;
 }
 
 export class Orchestrator {
@@ -198,7 +199,7 @@ export class Orchestrator {
   #lastPollAtMs: number | undefined;
   #totals = zeroUsage();
   #completedRuntimeMs = 0;
-  #latestRateLimits: unknown = null;
+  #latestRateLimits: AgentRateLimit | null = null;
 
   constructor(workflowStore: WorkflowStore, logger: AppLogger, dependencies: OrchestratorDependencies = {}) {
     this.#workflowStore = workflowStore;
@@ -463,7 +464,7 @@ export class Orchestrator {
         secondsRunning: this.#completedRuntimeMs / 1_000
           + running.reduce((total, entry) => total + entry.secondsRunning, 0),
       },
-      latestRateLimits: this.#latestRateLimits,
+      latestRateLimits: normalizeAgentRateLimit(this.#latestRateLimits),
     };
   }
 
@@ -1229,7 +1230,9 @@ export class Orchestrator {
         entry.lastEvent = event.type;
         if (event.sessionId) entry.sessionId = event.sessionId;
         if (event.type === "usage_updated" && event.usage) this.#addUsage(entry, event.usage);
-        if (event.type === "rate_limit_updated") this.#latestRateLimits = event.rateLimits ?? null;
+        if (event.type === "rate_limit_updated") {
+          this.#latestRateLimits = normalizeAgentRateLimit(event.rateLimits);
+        }
         if (event.type === "approval_required" || event.type === "input_required") {
           this.#requestStop(
             entry,

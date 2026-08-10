@@ -66,7 +66,15 @@ test("operations endpoints expose health and aggregate status without run detail
       costUsd: 0.01,
       secondsRunning: 60,
     },
-    latestRateLimits: { secret: "provider detail" },
+    latestRateLimits: {
+      status: "allowed_warning",
+      rateLimitType: "five_hour",
+      utilization: 0.82,
+      resetsAt: 1_786_268_400,
+      overageDisabledReason: "secret overage reason",
+      creditBalance: "secret account balance",
+      secret: "provider detail",
+    } as unknown as OrchestratorSnapshot["latestRateLimits"],
   };
   const server = createOperationsServer(
     () => snapshot,
@@ -110,6 +118,10 @@ test("operations endpoints expose health and aggregate status without run detail
       assert.equal(asset.headers["x-content-type-options"], "nosniff");
       assert.equal(asset.headers["referrer-policy"], "no-referrer");
       assert.match(asset.headers["content-type"] ?? "", assetPath.endsWith(".js") ? /javascript/iu : /^text\/css/iu);
+      if (assetPath.endsWith(".js")) {
+        assert.match(asset.body, /Model quota/iu);
+        assert.match(asset.body, /Unavailable/iu);
+      }
       assert.doesNotMatch(
         asset.body,
         /secret-issue-id|secret-session|secret summary|\/secret\/workspace|provider detail/iu,
@@ -212,8 +224,32 @@ test("operations endpoints expose health and aggregate status without run detail
         },
       ],
       totals: snapshot.totals,
+      rateLimit: {
+        status: "allowed_warning",
+        rateLimitType: "five_hour",
+        utilization: 0.82,
+      },
     });
-    assert.doesNotMatch(state.body, /secret-session|secret summary|\/secret\/workspace|provider detail/iu);
+    assert.doesNotMatch(
+      state.body,
+      /secret-session|secret summary|\/secret\/workspace|provider detail|resetsAt|overageDisabledReason|account balance|creditBalance/iu,
+    );
+
+    snapshot.latestRateLimits = null;
+    const stateWithoutRateLimit = await server.inject({ method: "GET", url: "/api/v1/state" });
+    assert.equal(stateWithoutRateLimit.statusCode, 200);
+    assert.equal(stateWithoutRateLimit.json().rateLimit, null);
+
+    snapshot.latestRateLimits = {
+      status: "secret-status",
+      rateLimitType: "secret-window",
+      utilization: 7,
+      secret: "private malformed rate limit",
+    } as unknown as OrchestratorSnapshot["latestRateLimits"];
+    const stateWithMalformedRateLimit = await server.inject({ method: "GET", url: "/api/v1/state" });
+    assert.equal(stateWithMalformedRateLimit.statusCode, 200);
+    assert.equal(stateWithMalformedRateLimit.json().rateLimit, null);
+    assert.doesNotMatch(stateWithMalformedRateLimit.body, /secret-status|secret-window|private malformed/iu);
 
     for (const [identifier, status, row] of [
       ["acme/widget#7", "running", stateBody.running[0]],
@@ -224,7 +260,7 @@ test("operations endpoints expose health and aggregate status without run detail
       assert.equal(issue.statusCode, 200);
       assert.equal(issue.headers["cache-control"], "no-store");
       assert.deepEqual(issue.json(), { status, ...row });
-      assert.doesNotMatch(issue.body, /secret-session|secret summary|\/secret\/workspace|provider detail/iu);
+      assert.doesNotMatch(issue.body, /secret-session|secret summary|\/secret\/workspace|provider detail|rateLimit/iu);
     }
 
     const missing = await server.inject({ method: "GET", url: "/api/v1/MISSING-1" });

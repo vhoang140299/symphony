@@ -49,6 +49,19 @@ interface BlockedIssue {
     | "unknown";
 }
 
+interface RateLimit {
+  status: "allowed" | "allowed_warning" | "rejected";
+  rateLimitType:
+    | "five_hour"
+    | "seven_day"
+    | "seven_day_opus"
+    | "seven_day_sonnet"
+    | "seven_day_overage_included"
+    | "overage"
+    | null;
+  utilization: number | null;
+}
+
 interface DashboardState {
   generatedAt: string;
   startedAt: string | null;
@@ -62,6 +75,7 @@ interface DashboardState {
   retrying: RetryingIssue[];
   blocked: BlockedIssue[];
   totals: Usage & { secondsRunning: number };
+  rateLimit: RateLimit | null;
 }
 
 const unavailableMessage = "Dashboard data is temporarily unavailable. Retrying automatically.";
@@ -85,6 +99,19 @@ const blockedReasonLabels: Record<BlockedIssue["reasonCode"], string> = {
   run_interrupted: "Run interrupted",
   orchestrator_failure: "Orchestrator failure",
   unknown: "Unknown",
+};
+const rateLimitStatusLabels: Record<RateLimit["status"], string> = {
+  allowed: "Available",
+  allowed_warning: "Warning",
+  rejected: "Rate limited",
+};
+const rateLimitTypeLabels: Record<NonNullable<RateLimit["rateLimitType"]>, string> = {
+  five_hour: "5-hour",
+  seven_day: "7-day",
+  seven_day_opus: "7-day Opus",
+  seven_day_sonnet: "7-day Sonnet",
+  seven_day_overage_included: "7-day overage included",
+  overage: "Overage",
 };
 
 function App() {
@@ -204,6 +231,7 @@ function App() {
               <Metric label="Total tokens" value={formatNumber(state.totals.totalTokens)} />
               <Metric label="Estimated cost" value={formatCurrency(state.totals.costUsd)} />
               <Metric label="Claimed runtime" value={formatDuration(state.totals.secondsRunning)} />
+              <Metric label="Model quota" value={formatRateLimit(state.rateLimit)} />
             </div>
           </section>
 
@@ -393,6 +421,15 @@ function formatNumber(value: number): string {
 
 function formatCurrency(value: number): string {
   return currencyFormatter.format(value);
+}
+
+function formatRateLimit(rateLimit: RateLimit | null): string {
+  if (rateLimit === null) return "Unavailable";
+  return [
+    rateLimitStatusLabels[rateLimit.status],
+    rateLimit.utilization === null ? null : `${Math.round(rateLimit.utilization * 100)}%`,
+    rateLimit.rateLimitType === null ? null : rateLimitTypeLabels[rateLimit.rateLimitType],
+  ].filter((part): part is string => part !== null).join(" · ");
 }
 
 function formatDate(value: string | null): string {

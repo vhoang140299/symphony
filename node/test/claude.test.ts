@@ -52,6 +52,55 @@ test("normalizes Claude result usage as absolute totals", () => {
   });
 });
 
+test("normalizes Claude rate limits without retaining provider details", () => {
+  const events = normalizeClaudeMessage({
+    type: "rate_limit_event",
+    session_id: "session-1",
+    uuid: "event-1",
+    rate_limit_info: {
+      status: "allowed_warning",
+      rateLimitType: "seven_day_sonnet",
+      utilization: 0.72,
+      resetsAt: 1_800_000_000,
+      overageStatus: "rejected",
+      overageDisabledReason: "out_of_credits",
+      hasChargeableSavedPaymentMethod: true,
+      providerSecret: "private-provider-detail",
+    },
+  } as unknown as SDKMessage);
+
+  assert.deepEqual(events[0]?.rateLimits, {
+    status: "allowed_warning",
+    rateLimitType: "seven_day_sonnet",
+    utilization: 0.72,
+  });
+  assert.doesNotMatch(JSON.stringify(events), /resetsAt|overage|Payment|providerSecret|private-provider-detail/u);
+});
+
+test("rejects malformed Claude rate limits without leaking future values", () => {
+  for (const rate_limit_info of [null, [], {}, { status: "future_status", providerSecret: "private" }]) {
+    const [event] = normalizeClaudeMessage({
+      type: "rate_limit_event",
+      session_id: "session-1",
+      uuid: "event-1",
+      rate_limit_info,
+    } as unknown as SDKMessage);
+    assert.equal(event?.rateLimits, null);
+  }
+
+  const [event] = normalizeClaudeMessage({
+    type: "rate_limit_event",
+    session_id: "session-1",
+    uuid: "event-1",
+    rate_limit_info: {
+      status: "allowed",
+      rateLimitType: "future_window",
+      utilization: Number.POSITIVE_INFINITY,
+    },
+  } as unknown as SDKMessage);
+  assert.deepEqual(event?.rateLimits, { status: "allowed", rateLimitType: null, utilization: null });
+});
+
 test("validates Claude structured completion without exposing the raw result", () => {
   const events = normalizeClaudeMessage(
     {
