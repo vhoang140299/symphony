@@ -72,6 +72,56 @@ test("dispatches by priority without duplicate claims and accumulates absolute u
   await orchestrator.stop();
 });
 
+test("snapshots only normalized model rate-limit fields", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-orchestrator-rate-limit-"));
+  const issue = rawIssue("rate-limit", "RATE-1", 1, "2025-01-01T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [issue] });
+  const validObserved = deferred<void>();
+  const releaseInvalid = deferred<void>();
+  const driver = new FakeDriver(async function* () {
+    yield event("rate_limit_updated", {
+      rateLimits: {
+        status: "allowed_warning",
+        rateLimitType: "five_hour",
+        utilization: 0.85,
+        resetsAt: 1_800_000_000,
+        providerSecret: "private-provider-detail",
+      } as unknown as NonNullable<AgentEvent["rateLimits"]>,
+    });
+    validObserved.resolve();
+    await releaseInvalid.promise;
+    yield event("rate_limit_updated", {
+      rateLimits: {
+        status: "future_status",
+        rateLimitType: "future_window",
+        utilization: 2,
+        providerSecret: "second-private-detail",
+      } as unknown as NonNullable<AgentEvent["rateLimits"]>,
+    });
+    tracker.setIssueState(issue.id, "Done");
+    yield event("turn_completed");
+  });
+  const workflowPath = await writeWorkflow(directory, [issue]);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await validObserved.promise;
+
+  const validSnapshot = orchestrator.snapshot();
+  assert.deepEqual(validSnapshot.latestRateLimits, {
+    status: "allowed_warning",
+    rateLimitType: "five_hour",
+    utilization: 0.85,
+  });
+  assert.doesNotMatch(JSON.stringify(validSnapshot), /resetsAt|providerSecret|private-provider-detail/u);
+
+  releaseInvalid.resolve();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(orchestrator.snapshot().latestRateLimits, null);
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
 test("snapshots live per-run metrics and scopes session ids to known lifecycle logs", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-orchestrator-metrics-"));
   const issueUrl = "https://tracker.example/issues/METRICS-1";

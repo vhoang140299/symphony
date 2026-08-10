@@ -3,6 +3,7 @@ import { isIPv4 } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import { normalizeAgentRateLimit } from "../domain.js";
 import type { OrchestratorSnapshot } from "../orchestrator.js";
 
 const contentSecurityPolicy =
@@ -99,6 +100,7 @@ export function createOperationsServer(
   });
   app.get("/api/v1/state", () => {
     const current = snapshot();
+    const rateLimit = normalizeAgentRateLimit(current.latestRateLimits);
     return {
       generatedAt: new Date().toISOString(),
       startedAt: current.startedAt,
@@ -112,6 +114,13 @@ export function createOperationsServer(
       retrying: current.retrying.map(retryPayload),
       blocked: current.blocked.map(blockedPayload),
       totals: current.totals,
+      rateLimit: rateLimit === null
+        ? null
+        : {
+            status: rateLimit.status,
+            rateLimitType: rateLimit.rateLimitType,
+            utilization: rateLimit.utilization,
+          },
     };
   });
   app.get<{ Params: { issue_identifier: string } }>("/api/v1/:issue_identifier", (request, reply) => {

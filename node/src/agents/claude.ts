@@ -20,6 +20,7 @@ import type {
   IssueMutation,
   PublishChangeInput,
 } from "../domain.js";
+import { normalizeAgentRateLimit } from "../domain.js";
 import { pickEnvironment } from "./environment.js";
 
 const issueToolServerName = "symphony";
@@ -407,7 +408,7 @@ export function normalizeClaudeMessage(
   }
 
   if (message.type === "rate_limit_event") {
-    return [{ type: "rate_limit_updated", ...base, rateLimits: message.rate_limit_info }];
+    return [{ type: "rate_limit_updated", ...base, rateLimits: normalizeAgentRateLimit(message.rate_limit_info) }];
   }
 
   if (message.type === "system" && message.subtype === "permission_denied") {

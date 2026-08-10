@@ -79,6 +79,44 @@ export interface AgentUsage {
   costUsd: number;
 }
 
+const agentRateLimitStatuses = ["allowed", "allowed_warning", "rejected"] as const;
+
+export type AgentRateLimitStatus = (typeof agentRateLimitStatuses)[number];
+
+const agentRateLimitTypes = [
+  "five_hour",
+  "seven_day",
+  "seven_day_opus",
+  "seven_day_sonnet",
+  "seven_day_overage_included",
+  "overage",
+] as const;
+
+export type AgentRateLimitType = (typeof agentRateLimitTypes)[number];
+
+export interface AgentRateLimit {
+  status: AgentRateLimitStatus;
+  rateLimitType: AgentRateLimitType | null;
+  utilization: number | null;
+}
+
+export function normalizeAgentRateLimit(value: unknown): AgentRateLimit | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const info = value as Record<string, unknown>;
+  const status = agentRateLimitStatuses.find((candidate) => candidate === info.status);
+  if (status === undefined) return null;
+
+  const utilization = info.utilization;
+  return {
+    status,
+    rateLimitType: agentRateLimitTypes.find((candidate) => candidate === info.rateLimitType) ?? null,
+    utilization:
+      typeof utilization === "number" && Number.isFinite(utilization) && utilization >= 0 && utilization <= 1
+        ? utilization
+        : null,
+  };
+}
+
 export const blockedReasonCodes = [
   "agent_reported",
   "operator_action_required",
@@ -106,7 +144,7 @@ export interface AgentEvent {
   sessionId?: string;
   summary?: string;
   usage?: AgentUsage;
-  rateLimits?: unknown;
+  rateLimits?: AgentRateLimit | null;
   blockingReason?: "approval" | "input";
   completion?: AgentCompletion;
   providerData?: Record<string, unknown>;

@@ -160,7 +160,8 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
 
 - `GET /`: serves a React dashboard with scheduler readiness, aggregate usage, current
   running/retrying/blocked issues, automatic display refresh, and a button that queues an immediate
-  tracker poll. Eligible work can start when that poll runs.
+  tracker poll. It also shows the latest normalized model quota status when the provider reports
+  one. Eligible work can start when that poll runs.
 - `GET /healthz`: reports that the HTTP process is responding.
 - `GET /readyz`: reports ready only while the scheduler is initialized and running and no local
   fatal condition, such as a durable checkpoint failure, has stopped it. It does not test tracker
@@ -170,7 +171,8 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
 - `GET /api/v1/state`: reports privacy-filtered running, retrying, and blocked entries, including
   issue IDs, identifiers and URLs, lifecycle timestamps, turn counts, safe last-event types,
   per-run token usage, retry details, normalized blocked reason codes, and aggregate token/runtime
-  totals. Blocked reason codes are `agent_reported`, `operator_action_required`,
+  totals. Its `rateLimit` field is `null` when unavailable; otherwise it contains only `status`,
+  `rateLimitType`, and `utilization`. Blocked reason codes are `agent_reported`, `operator_action_required`,
   `retry_budget_exhausted`, `run_interrupted`, `orchestrator_failure`, or `unknown`.
 - `GET /api/v1/<issue_identifier>`: returns the same allow-listed details for one currently running,
   retrying, or blocked issue, or a JSON `404` when it is absent.
@@ -189,10 +191,14 @@ curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/refresh
 curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/OPS-123/retry
 ```
 
-The API exposes only the normalized blocked reason code; it omits workspace paths, agent session
-IDs, blocked summaries, provider details, raw rate-limit payloads, and raw errors. `secondsRunning`
-is in-process claimed-run wall time, including hooks and host delivery, and resets when the process
-restarts. Unknown routes and unsupported methods use JSON `404`/`405` responses.
+The normalized rate-limit `status` is `allowed`, `allowed_warning`, or `rejected`; `rateLimitType` is
+`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included`,
+`overage`, or `null`; and `utilization` is a number from 0 through 1 or `null`. The API omits
+workspace paths, agent session IDs, blocked summaries, raw provider/rate-limit payloads,
+`resetsAt`, overage/account/payment/credit details, and raw errors. `/status` and per-issue responses
+do not include the rate-limit object. `secondsRunning` is in-process claimed-run wall time,
+including hooks and host delivery, and resets when the process restarts. Unknown routes and
+unsupported methods use JSON `404`/`405` responses.
 
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.
