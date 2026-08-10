@@ -432,6 +432,83 @@ test("does not overwrite a Linear issue that leaves active state after the hando
   await rm(directory, { recursive: true, force: true });
 });
 
+test("guards the final Linear state handoff against terminal, state, and required-label drift", async () => {
+  const scenarios: Array<{ name: string; drift: (issue: Issue) => Issue }> = [
+    { name: "terminal", drift: (issue) => ({ ...issue, state: "Done" }) },
+    { name: "state", drift: (issue) => ({ ...issue, state: "Paused" }) },
+    { name: "required-label", drift: (issue) => ({ ...issue, labels: [] }) },
+  ];
+
+  for (const scenario of scenarios) {
+    const directory = await mkdtemp(path.join(tmpdir(), `symphony-linear-final-guard-${scenario.name}-`));
+    let current = linearIssue();
+    let modelRuns = 0;
+    let commentWrites = 0;
+    let stateAttempts = 0;
+    let stateWrites = 0;
+    const tracker: Tracker = {
+      async fetchIssuesByStates(states) {
+        return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+      },
+      async fetchIssuesByIds(ids) {
+        return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+      },
+      async mutateIssue(target, mutation, _signal, options) {
+        if (mutation.kind === "comment") {
+          commentWrites += 1;
+          current = { ...current, title: "Latest Linear issue" };
+          return;
+        }
+        assert.equal(mutation.kind, "set_state");
+        assert.deepEqual(options, { requireUnchanged: true }, scenario.name);
+        assert.deepEqual(target, current, `${scenario.name}: guard must use the latest refreshed issue`);
+        stateAttempts += 1;
+        current = scenario.drift(current);
+        const unchanged = current.state === target.state
+          && current.labels.join("\0") === target.labels.join("\0");
+        if (!unchanged) throw new Error("simulated Linear state guard conflict");
+        stateWrites += 1;
+        current = { ...current, state: mutation.state };
+      },
+    };
+    const driver = new FakeDriver(async function* () {
+      modelRuns += 1;
+      yield event("turn_completed", {
+        completion: { status: "ready", summary: "Fixed.", verification: ["pnpm test"] },
+      });
+    }, "codex");
+    const workflowPath = await writeLinearDeliveryWorkflow(directory);
+    let now = Date.UTC(2026, 0, 1);
+    const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+      tracker,
+      driver,
+      now: () => now,
+      failureBaseDelayMs: 1_000,
+    });
+
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+
+    assert.equal(modelRuns, 1, scenario.name);
+    assert.equal(commentWrites, 1, scenario.name);
+    assert.equal(stateAttempts, 1, scenario.name);
+    assert.equal(stateWrites, 0, scenario.name);
+    assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 }, scenario.name);
+
+    now += 1_000;
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+
+    assert.equal(modelRuns, 1, scenario.name);
+    assert.equal(commentWrites, 1, scenario.name);
+    assert.equal(stateAttempts, 1, scenario.name);
+    assert.equal(stateWrites, 0, scenario.name);
+    assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 }, scenario.name);
+    await orchestrator.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("retries or safely releases a Linear handoff after a lost state response", async () => {
   const scenarios = [
     { name: "before-commit", commitBeforeThrow: false, commentCalls: 2, stateCalls: 2 },

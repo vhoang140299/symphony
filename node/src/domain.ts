@@ -28,6 +28,10 @@ export type IssueMutation =
   | { kind: "remove_label"; label: string }
   | { kind: "set_state"; state: string };
 
+export interface IssueMutationOptions {
+  requireUnchanged?: boolean;
+}
+
 export type IssueStateMutationMode = "open_closed" | "named";
 
 export interface AgentCompletion {
@@ -52,7 +56,12 @@ export interface Tracker {
   readonly issueStateMutationMode?: IssueStateMutationMode;
   fetchIssuesByStates(states: string[]): Promise<Issue[]>;
   fetchIssuesByIds(ids: string[]): Promise<Issue[]>;
-  mutateIssue?(issue: Issue, mutation: IssueMutation, signal: AbortSignal): Promise<void>;
+  mutateIssue?(
+    issue: Issue,
+    mutation: IssueMutation,
+    signal: AbortSignal,
+    options?: IssueMutationOptions,
+  ): Promise<void>;
   publishIssueChange?(
     issue: Issue,
     workspacePath: string,

@@ -11,6 +11,7 @@ export type {
   AgentUsage,
   Issue,
   IssueMutation,
+  IssueMutationOptions,
   IssueStateMutationMode,
   PublishChangeInput,
   PublishedChange,
