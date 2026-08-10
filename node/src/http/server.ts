@@ -241,6 +241,7 @@ function blockedPayload(entry: OrchestratorSnapshot["blocked"][number]) {
     identifier: entry.identifier,
     issueUrl: entry.issueUrl,
     blockedAt: entry.blockedAt,
+    reasonCode: entry.reasonCode,
   };
 }
 

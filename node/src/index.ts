@@ -9,6 +9,7 @@ export type {
   AgentEvent,
   AgentRunContext,
   AgentUsage,
+  BlockedReasonCode,
   Issue,
   IssueMutation,
   IssueMutationOptions,

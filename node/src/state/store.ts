@@ -4,6 +4,7 @@ import { lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { agentCompletionSchema } from "../completion.js";
+import { blockedReasonCodes } from "../domain.js";
 import { RunStateLease } from "./lease.js";
 
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -51,6 +52,7 @@ const persistedClaimSchema = z.discriminatedUnion("kind", [
       attempt: z.number().int().nonnegative().nullable(),
       blockedAtMs: timestampSchema,
       summary: z.string().max(2_000),
+      reasonCode: z.enum(blockedReasonCodes).optional(),
     })
     .strict(),
 ]);

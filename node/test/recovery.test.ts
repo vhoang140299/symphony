@@ -239,6 +239,10 @@ posixTest("restores interrupted and exhausted model work as durable blocked clai
   await orchestrator.initialize();
   assert.equal(contexts.length, 0);
   assert.deepEqual(orchestrator.snapshot().blocked.map(({ issueId }) => issueId).sort(), ["crashed", "exhausted"]);
+  assert.deepEqual(
+    Object.fromEntries(orchestrator.snapshot().blocked.map(({ issueId, reasonCode }) => [issueId, reasonCode])),
+    { crashed: "run_interrupted", exhausted: "unknown" },
+  );
   assert.deepEqual((await store.load()).map(({ kind }) => kind), ["blocked", "blocked"]);
 
   await orchestrator.pollOnce();

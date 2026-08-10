@@ -169,7 +169,9 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
   identifiers, workspace paths, agent session IDs, provider details, and raw errors.
 - `GET /api/v1/state`: reports privacy-filtered running, retrying, and blocked entries, including
   issue IDs, identifiers and URLs, lifecycle timestamps, turn counts, safe last-event types,
-  per-run token usage, retry details, and aggregate token/runtime totals.
+  per-run token usage, retry details, normalized blocked reason codes, and aggregate token/runtime
+  totals. Blocked reason codes are `agent_reported`, `operator_action_required`,
+  `retry_budget_exhausted`, `run_interrupted`, `orchestrator_failure`, or `unknown`.
 - `GET /api/v1/<issue_identifier>`: returns the same allow-listed details for one currently running,
   retrying, or blocked issue, or a JSON `404` when it is absent.
 - `POST /api/v1/refresh`: queues an immediate coalesced poll while the scheduler is ready and returns
@@ -187,10 +189,10 @@ curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/refresh
 curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/OPS-123/retry
 ```
 
-The API omits workspace paths, agent session IDs, blocked summaries, provider details, raw rate-limit
-payloads, and raw errors. `secondsRunning` is in-process claimed-run wall time, including hooks and
-host delivery, and resets when the process restarts. Unknown routes and unsupported methods use JSON
-`404`/`405` responses.
+The API exposes only the normalized blocked reason code; it omits workspace paths, agent session
+IDs, blocked summaries, provider details, raw rate-limit payloads, and raw errors. `secondsRunning`
+is in-process claimed-run wall time, including hooks and host delivery, and resets when the process
+restarts. Unknown routes and unsupported methods use JSON `404`/`405` responses.
 
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.

@@ -79,6 +79,17 @@ export interface AgentUsage {
   costUsd: number;
 }
 
+export const blockedReasonCodes = [
+  "agent_reported",
+  "operator_action_required",
+  "retry_budget_exhausted",
+  "run_interrupted",
+  "orchestrator_failure",
+  "unknown",
+] as const;
+
+export type BlockedReasonCode = (typeof blockedReasonCodes)[number];
+
 export type AgentEventType =
   | "session_started"
   | "activity"

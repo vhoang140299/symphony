@@ -488,6 +488,7 @@ test("does not write a Linear handoff for a blocked Codex completion", async () 
   assert.equal(writes, 0);
   assert.equal(issue.state, "Todo");
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+  assert.equal(orchestrator.snapshot().blocked[0]?.reasonCode, "agent_reported");
 
   await orchestrator.stop();
   await rm(directory, { recursive: true, force: true });
@@ -1083,6 +1084,7 @@ test("blocks after exactly max_attempts dispatched runs and starts a fresh sessi
 
   assert.deepEqual(contexts.map(({ attempt }) => attempt), [null, 1]);
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+  assert.equal(orchestrator.snapshot().blocked[0]?.reasonCode, "retry_budget_exhausted");
   assert.match(orchestrator.snapshot().blocked[0]?.summary ?? "", /after 2 dispatched runs \(max_attempts=2\)/);
   const exhaustion = errors.find(({ message }) => message === "Agent run failed; retry budget exhausted");
   assert.equal((exhaustion?.bindings.error as Error | undefined)?.message, "transient-2");
@@ -1665,10 +1667,10 @@ test("graceful shutdown runs after_run once before checkpointing the interrupted
   assert.equal(await readFile(lifecyclePath, "utf8"), "after_run\n");
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
   const checkpoint = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as {
-    claims: Array<{ kind: string; issueId: string }>;
+    claims: Array<{ kind: string; issueId: string; reasonCode?: string }>;
   };
-  assert.deepEqual(checkpoint.claims.map(({ kind, issueId }) => ({ kind, issueId })), [
-    { kind: "blocked", issueId: issue.id },
+  assert.deepEqual(checkpoint.claims.map(({ kind, issueId, reasonCode }) => ({ kind, issueId, reasonCode })), [
+    { kind: "blocked", issueId: issue.id, reasonCode: "run_interrupted" },
   ]);
 });
 
@@ -1900,6 +1902,7 @@ test("tracker reload cannot retarget running, blocked, or retried work with a re
   await orchestrator.waitForCurrentRuns();
   await orchestrator.pollOnce();
   assert.equal(orchestrator.snapshot().blocked[0]?.identifier, "OLD-1");
+  assert.equal(orchestrator.snapshot().blocked[0]?.reasonCode, "operator_action_required");
 
   assert.equal(await orchestrator.retryBlocked("OLD-1"), true);
   await orchestrator.pollOnce();
