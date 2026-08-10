@@ -123,6 +123,7 @@ export interface OrchestratorDependencies {
 export interface OrchestratorSnapshot {
   startedAt: string | null;
   lastPollAt: string | null;
+  dispatchPaused: boolean;
   running: Array<{
     issueId: string;
     identifier: string;
@@ -197,6 +198,7 @@ export class Orchestrator {
   #shuttingDown = false;
   #startedAtMs: number | undefined;
   #lastPollAtMs: number | undefined;
+  #dispatchPaused = false;
   #totals = zeroUsage();
   #completedRuntimeMs = 0;
   #latestRateLimits: AgentRateLimit | null = null;
@@ -397,6 +399,17 @@ export class Orchestrator {
     if (rejection) throw rejection.reason;
   }
 
+  setDispatchPaused(paused: boolean): boolean {
+    this.#requirePersistenceHealthy();
+    if (this.#shuttingDown || this.#stateWritesFrozen) {
+      throw new Error("A stopped orchestrator cannot change dispatch state");
+    }
+    if (this.#dispatchPaused === paused) return false;
+    this.#dispatchPaused = paused;
+    if (paused && this.#started && this.#workflow !== undefined) this.#scheduleNextPoll();
+    return true;
+  }
+
   async retryBlocked(issueIdOrIdentifier: string): Promise<boolean> {
     this.#requirePersistenceHealthy();
     if (this.#shuttingDown || this.#stateWritesFrozen) {
@@ -442,6 +455,7 @@ export class Orchestrator {
     return {
       startedAt: this.#startedAtMs === undefined ? null : iso(this.#startedAtMs),
       lastPollAt: this.#lastPollAtMs === undefined ? null : iso(this.#lastPollAtMs),
+      dispatchPaused: this.#dispatchPaused,
       running,
       retrying: [...this.#retrying.values()].map((entry) => ({
         issueId: entry.issue.id,
@@ -918,23 +932,24 @@ export class Orchestrator {
   }
 
   async #dispatchDueRetries(): Promise<void> {
+    if (this.#dispatchPaused) return;
     const due = [...this.#retrying.entries()]
       .filter(([, entry]) => entry.dueAtMs <= this.#now())
       .sort(([, left], [, right]) => left.dueAtMs - right.dueAtMs);
 
     for (const [issueId, retry] of due) {
-      if (this.#shuttingDown) return;
+      if (this.#shuttingDown || this.#dispatchPaused) return;
       let issue: Issue | undefined;
       try {
         [issue] = await retry.tracker.fetchIssuesByIds([issueId]);
       } catch (error) {
-        if (this.#shuttingDown) return;
+        if (this.#shuttingDown || this.#dispatchPaused) return;
         this.#logger.warn({ error, issue_id: issueId }, "Retry refresh failed; retaining retry claim");
         retry.dueAtMs = this.#now() + retry.workflow.config.polling.intervalMs;
         await this.#persistState();
         continue;
       }
-      if (this.#shuttingDown) return;
+      if (this.#shuttingDown || this.#dispatchPaused) return;
       if (!issue) {
         await this.#release(issueId);
         continue;
@@ -956,7 +971,7 @@ export class Orchestrator {
         continue;
       }
 
-      this.#retrying.delete(issueId);
+      if (this.#dispatchPaused) return;
       await this.#spawn({
         ...retry,
         issue,
@@ -965,6 +980,7 @@ export class Orchestrator {
   }
 
   async #dispatchCandidates(failOnTrackerError: boolean): Promise<void> {
+    if (this.#dispatchPaused) return;
     const workflow = this.#requireWorkflow();
     const tracker = this.#requireTracker();
     const driver = this.#requireDriver();
@@ -976,9 +992,10 @@ export class Orchestrator {
       if (failOnTrackerError) throw error;
       return;
     }
+    if (this.#dispatchPaused) return;
 
     for (const candidate of selectRoutableIssues(candidates, workflow.config)) {
-      if (this.#shuttingDown) return;
+      if (this.#shuttingDown || this.#dispatchPaused) return;
       if (this.#claimed.has(candidate.id)) continue;
       if (!this.#hasCapacity(candidate, workflow.config)) continue;
 
@@ -990,9 +1007,10 @@ export class Orchestrator {
         if (failOnTrackerError) throw error;
         continue;
       }
-      if (this.#shuttingDown) return;
+      if (this.#shuttingDown || this.#dispatchPaused) return;
       if (!issue || !isRoutable(issue, workflow.config) || !this.#hasCapacity(issue, workflow.config)) continue;
 
+      if (this.#dispatchPaused) return;
       await this.#spawn({
         issue,
         workflow,
@@ -1008,10 +1026,13 @@ export class Orchestrator {
   }
 
   async #spawn(source: Omit<RetryEntry, "attempt"> & { attempt: number | null }): Promise<void> {
+    if (this.#dispatchPaused) return;
     if (this.#shuttingDown) {
       await this.#release(source.issue.id);
       return;
     }
+    const retry = this.#retrying.get(source.issue.id);
+    this.#retrying.delete(source.issue.id);
     const now = this.#now();
     const entry: RunningEntry = {
       issue: source.issue,
@@ -1038,6 +1059,14 @@ export class Orchestrator {
     this.#assertClaimInvariant();
     await this.#persistState();
     if (this.#shuttingDown || this.#running.get(entry.issue.id) !== entry) return;
+    if (this.#dispatchPaused) {
+      this.#running.delete(entry.issue.id);
+      if (retry === undefined) this.#claimed.delete(entry.issue.id);
+      else this.#retrying.set(entry.issue.id, retry);
+      this.#assertClaimInvariant();
+      await this.#persistState();
+      return;
+    }
     entry.done = this.#run(entry);
     void entry.done.catch(() => undefined);
     this.#logger.info(
@@ -1641,9 +1670,12 @@ export class Orchestrator {
     if (!this.#started || this.#shuttingDown || this.#persistenceFailure !== undefined) return;
     if (this.#timer) clearTimeout(this.#timer);
     const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
-    const nextRetryAt = Math.min(...[...this.#retrying.values()].map((entry) => entry.dueAtMs));
-    const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
-    const delayMs = Math.min(intervalMs, retryDelayMs);
+    let delayMs = intervalMs;
+    if (!this.#dispatchPaused) {
+      const nextRetryAt = Math.min(...[...this.#retrying.values()].map((entry) => entry.dueAtMs));
+      const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
+      delayMs = Math.min(intervalMs, retryDelayMs);
+    }
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       void this.pollOnce()
@@ -1653,7 +1685,7 @@ export class Orchestrator {
   }
 
   #wakeForRetry(): void {
-    if (this.#started) this.#scheduleNextPoll();
+    if (this.#started && !this.#dispatchPaused) this.#scheduleNextPoll();
   }
 
   #assertClaimInvariant(): void {

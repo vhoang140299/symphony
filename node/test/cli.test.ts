@@ -71,7 +71,7 @@ test("CLI validates the operational HTTP address before startup", async () => {
   );
 });
 
-test("workflow server.port 0 accepts a CLI host override and logs the actual ephemeral port", { timeout: 5_000 }, async () => {
+test("workflow server.port 0 logs its port and wires dispatch controls", { timeout: 5_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-workflow-http-"));
   const workflowPath = path.join(directory, "WORKFLOW.md");
   await writeFile(
@@ -92,6 +92,30 @@ test("workflow server.port 0 accepts a CLI host override and logs the actual eph
     });
     assert.equal(refresh.status, 202);
     assert.deepEqual(await refresh.json(), { queued: true });
+    const stateUrl = `http://127.0.0.1:${String(started.http_port)}/api/v1/state`;
+    const initialState = await fetch(stateUrl);
+    assert.equal((await initialState.json() as { dispatchPaused: boolean }).dispatchPaused, false);
+    const pause = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/pause`, {
+      method: "POST",
+      headers: operationHeaders,
+    });
+    assert.equal(pause.status, 202);
+    assert.deepEqual(await pause.json(), { dispatchPaused: true, changed: true });
+    const pausedState = await fetch(stateUrl);
+    assert.equal((await pausedState.json() as { dispatchPaused: boolean }).dispatchPaused, true);
+    const pauseAgain = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/pause`, {
+      method: "POST",
+      headers: operationHeaders,
+    });
+    assert.deepEqual(await pauseAgain.json(), { dispatchPaused: true, changed: false });
+    const resume = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/resume`, {
+      method: "POST",
+      headers: operationHeaders,
+    });
+    assert.equal(resume.status, 202);
+    assert.deepEqual(await resume.json(), { dispatchPaused: false, changed: true });
+    const resumedState = await fetch(stateUrl);
+    assert.equal((await resumedState.json() as { dispatchPaused: boolean }).dispatchPaused, false);
     const retry = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/MISSING-1/retry`, {
       method: "POST",
       headers: operationHeaders,
