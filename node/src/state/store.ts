@@ -4,7 +4,7 @@ import { lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { agentCompletionSchema } from "../completion.js";
-import { blockedReasonCodes } from "../domain.js";
+import { blockedReasonCodes, normalizeRetryError, type RetryError } from "../domain.js";
 import { RunStateLease } from "./lease.js";
 
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -13,6 +13,11 @@ const REQUIRED_FILE_MODE = 0o600;
 const MAX_TIMESTAMP_MS = 8_640_000_000_000_000;
 const SCOPE_HASH = /^[0-9a-f]{64}$/u;
 const timestampSchema = z.number().finite().nonnegative().max(MAX_TIMESTAMP_MS);
+const retryErrorSchema = z
+  .custom<RetryError>((value) => normalizeRetryError(value) !== null)
+  .nullable()
+  .optional()
+  .transform((value) => value ?? null);
 
 const pendingDeliverySchema = z
   .object({
@@ -42,6 +47,7 @@ const persistedClaimSchema = z.discriminatedUnion("kind", [
       attempt: z.number().int().nonnegative(),
       dueAtMs: timestampSchema,
       reason: z.enum(["continuation", "failure"]),
+      error: retryErrorSchema,
       pendingDelivery: pendingDeliverySchema.optional(),
     })
     .strict(),

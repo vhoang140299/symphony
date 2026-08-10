@@ -33,6 +33,7 @@ interface RetryingIssue {
   attempt: number;
   dueAt: string;
   reason: "continuation" | "failure";
+  error: string | null;
 }
 
 interface BlockedIssue {
@@ -324,7 +325,7 @@ function App() {
                     {state.retrying.map((issue) => (
                       <tr key={issue.issueId}>
                         <td><IssueReference identifier={issue.identifier} url={issue.issueUrl} /></td>
-                        <td>{humanize(issue.reason)}</td>
+                        <td>{issue.error ?? humanize(issue.reason)}</td>
                         <td>{issue.attempt}</td>
                         <td><Timestamp value={issue.dueAt} /></td>
                       </tr>

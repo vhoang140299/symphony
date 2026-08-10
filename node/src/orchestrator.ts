@@ -14,9 +14,10 @@ import type {
   BlockedReasonCode,
   Issue,
   PublishChangeInput,
+  RetryError,
   Tracker,
 } from "./domain.js";
-import { isTerminalAgentEvent, normalizeAgentRateLimit, normalizeState } from "./domain.js";
+import { isTerminalAgentEvent, normalizeAgentRateLimit, normalizeRetryError, normalizeState } from "./domain.js";
 import type { AppLogger } from "./log.js";
 import { classifyIssue, isRoutable, selectRoutableIssues } from "./routing.js";
 import { RunStateStore, type PersistedClaim } from "./state/store.js";
@@ -89,6 +90,7 @@ interface RetryEntry extends SessionConfig {
   sessionId: string | undefined;
   dueAtMs: number;
   reason: "continuation" | "failure";
+  error: RetryError | null;
   pendingDelivery?: PendingDelivery;
 }
 
@@ -147,6 +149,7 @@ export interface OrchestratorSnapshot {
     attempt: number;
     dueAt: string;
     reason: "continuation" | "failure";
+    error: RetryError | null;
   }>;
   blocked: Array<{
     issueId: string;
@@ -464,6 +467,7 @@ export class Orchestrator {
         attempt: entry.attempt,
         dueAt: iso(entry.dueAtMs),
         reason: entry.reason,
+        error: normalizeRetryError(entry.error),
       })),
       blocked: [...this.#blocked.values()].map((entry) => ({
         issueId: entry.issue.id,
@@ -606,6 +610,7 @@ export class Orchestrator {
             sessionId: undefined,
             dueAtMs: Math.max(0, this.#now()),
             reason: "failure",
+            error: "Host delivery failed",
             pendingDelivery: claim.pendingDelivery,
           });
         } else {
@@ -633,6 +638,7 @@ export class Orchestrator {
           sessionId: undefined,
           dueAtMs: claim.dueAtMs,
           reason: claim.reason,
+          error: normalizeRetryError(claim.error),
           ...(claim.pendingDelivery === undefined ? {} : { pendingDelivery: claim.pendingDelivery }),
         });
       } else {
@@ -686,6 +692,7 @@ export class Orchestrator {
         continuation: entry.continuation,
         dueAtMs: Math.max(0, entry.dueAtMs),
         reason: entry.reason,
+        error: normalizeRetryError(entry.error),
         ...(entry.pendingDelivery === undefined ? {} : { pendingDelivery: entry.pendingDelivery }),
       });
     }
@@ -748,6 +755,7 @@ export class Orchestrator {
           sessionId: undefined,
           dueAtMs: Math.max(0, this.#now()),
           reason: "failure",
+          error: "Host delivery failed",
           pendingDelivery: entry.pendingDelivery,
         });
       } else {
@@ -833,7 +841,10 @@ export class Orchestrator {
           );
           continue;
         }
-        this.#logger.warn({ error, issue_id: issueId }, "Blocked issue reconciliation failed");
+        this.#logger.warn(
+          { error, issue_id: issueId, issue_identifier: entry.issue.identifier },
+          "Blocked issue reconciliation failed",
+        );
       }
     }
   }
@@ -924,6 +935,7 @@ export class Orchestrator {
       sessionId: entry.sessionId,
       dueAtMs: this.#now(),
       reason: "continuation",
+      error: null,
     });
     this.#assertClaimInvariant();
     await this.#persistState();
@@ -944,8 +956,12 @@ export class Orchestrator {
         [issue] = await retry.tracker.fetchIssuesByIds([issueId]);
       } catch (error) {
         if (this.#shuttingDown || this.#dispatchPaused) return;
-        this.#logger.warn({ error, issue_id: issueId }, "Retry refresh failed; retaining retry claim");
+        this.#logger.warn(
+          { error, issue_id: issueId, issue_identifier: retry.issue.identifier },
+          "Retry refresh failed; retaining retry claim",
+        );
         retry.dueAtMs = this.#now() + retry.workflow.config.polling.intervalMs;
+        retry.error = "Tracker refresh failed";
         await this.#persistState();
         continue;
       }
@@ -967,6 +983,7 @@ export class Orchestrator {
       }
       if (!this.#hasCapacity(issue, retry.workflow.config)) {
         retry.dueAtMs = this.#now() + Math.min(1_000, retry.workflow.config.polling.intervalMs);
+        retry.error = "No available orchestrator slots";
         await this.#persistState();
         continue;
       }
@@ -1003,7 +1020,10 @@ export class Orchestrator {
       try {
         [issue] = await tracker.fetchIssuesByIds([candidate.id]);
       } catch (error) {
-        this.#logger.warn({ error, issue_id: candidate.id }, "Final issue refresh failed; dispatch skipped");
+        this.#logger.warn(
+          { error, issue_id: candidate.id, issue_identifier: candidate.identifier },
+          "Final issue refresh failed; dispatch skipped",
+        );
         if (failOnTrackerError) throw error;
         continue;
       }
@@ -1021,6 +1041,7 @@ export class Orchestrator {
         sessionId: undefined,
         dueAtMs: this.#now(),
         reason: "continuation",
+        error: null,
       });
     }
   }
@@ -1581,6 +1602,7 @@ export class Orchestrator {
         sessionId: isFailure ? undefined : entry.sessionId,
         dueAtMs: this.#now() + delayMs,
         reason: isFailure ? "failure" : "continuation",
+        error: isDeliveryFailure ? "Host delivery failed" : isFailure ? "Agent run failed" : null,
         ...(outcome.kind === "delivery_failure" ? { pendingDelivery: outcome.pendingDelivery } : {}),
       });
       this.#logger[isFailure ? "error" : "info"](

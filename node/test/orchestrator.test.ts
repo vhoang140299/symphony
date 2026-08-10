@@ -214,6 +214,7 @@ test("snapshots live per-run metrics and scopes session ids to known lifecycle l
   const completed = orchestrator.snapshot();
   assert.equal(completed.running.length, 0);
   assert.equal(completed.retrying[0]?.issueUrl, issueUrl);
+  assert.equal(completed.retrying[0]?.error, null);
   assert.equal(completed.totals.secondsRunning, 2.5);
   assert.equal(
     logs.find((entry) => entry.message === "Continuation scheduled")?.bindings.session_id,
@@ -881,6 +882,7 @@ test("a partial host-delivery failure retries host work at the agent-attempt lim
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
+  assert.equal(orchestrator.snapshot().retrying[0]?.error, "Host delivery failed");
   const [deliveryKey] = commentKeys;
   assert.match(
     deliveryKey ?? "",
@@ -1042,23 +1044,24 @@ test("host delivery does not publish blocked, stale, or failed completions", asy
 });
 
 test("refreshes before exponential retries and starts fresh sessions after failures", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "symphony-retry-"));
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "symphony-retry-")));
   const issues = [rawIssue("retry", "RETRY-1", 1, "2025-01-01T00:00:00Z")];
   const tracker = new MemoryTracker({ issues });
   const contexts: AgentRunContext[] = [];
+  const privateFailure = "private transient agent failure";
   let call = 0;
   const driver = new FakeDriver(async function* (context) {
     contexts.push(context);
     call += 1;
     yield event("session_started", { sessionId: "resume-me" });
     if (call <= 2) {
-      yield event("turn_failed", { sessionId: "resume-me", summary: "transient" });
+      yield event("turn_failed", { sessionId: "resume-me", summary: privateFailure });
       return;
     }
     tracker.setIssueState(context.issue.id, "Done");
     yield event("turn_completed", { sessionId: "resume-me" });
   });
-  const workflowPath = await writeWorkflow(directory, issues);
+  const workflowPath = await writeWorkflow(directory, issues, { durable: true });
   let now = Date.UTC(2026, 0, 1);
   const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
     tracker,
@@ -1072,6 +1075,11 @@ test("refreshes before exponential retries and starts fresh sessions after failu
   const retry = orchestrator.snapshot().retrying[0];
   assert.equal(retry?.attempt, 1);
   assert.equal(retry?.dueAt, new Date(now + 100).toISOString());
+  assert.equal(retry?.error, "Agent run failed");
+  const checkpoint = await readFile(path.join(directory, "runs.json"), "utf8");
+  assert.match(checkpoint, /"error":"Agent run failed"/u);
+  assert.doesNotMatch(checkpoint, new RegExp(privateFailure, "u"));
+  assert.doesNotMatch(JSON.stringify(orchestrator.snapshot()), new RegExp(privateFailure, "u"));
 
   now += 99;
   await orchestrator.pollOnce();
@@ -1083,6 +1091,7 @@ test("refreshes before exponential retries and starts fresh sessions after failu
   const secondRetry = orchestrator.snapshot().retrying[0];
   assert.equal(secondRetry?.attempt, 2);
   assert.equal(secondRetry?.dueAt, new Date(now + 200).toISOString());
+  assert.equal(secondRetry?.error, "Agent run failed");
   now += 200;
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
@@ -1095,6 +1104,69 @@ test("refreshes before exponential retries and starts fresh sessions after failu
   assert.equal(contexts[2]?.sessionId, undefined);
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
   await orchestrator.stop();
+});
+
+test("records safe tracker-refresh and capacity errors for queued retries", async () => {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "symphony-retry-diagnostics-")));
+  const retryIssue = rawIssue("retry", "RETRY-1", 1, "2025-01-01T00:00:00Z");
+  const blocker = rawIssue("blocker", "BLOCKER-1", 2, "2025-01-02T00:00:00Z");
+  const memory = new MemoryTracker({ issues: [retryIssue, blocker] });
+  const blockerStarted = deferred<void>();
+  const releaseBlocker = deferred<void>();
+  const privateTrackerError = "private tracker refresh failure";
+  let failRetryRefresh = false;
+  const tracker: Tracker = {
+    fetchIssuesByStates: (states) => memory.fetchIssuesByStates(states),
+    async fetchIssuesByIds(ids) {
+      if (failRetryRefresh && ids.length === 1 && ids[0] === retryIssue.id) {
+        failRetryRefresh = false;
+        throw new Error(privateTrackerError);
+      }
+      return memory.fetchIssuesByIds(ids);
+    },
+  };
+  const driver = new FakeDriver(async function* (context) {
+    if (context.issue.id === retryIssue.id) {
+      yield event("turn_failed", { summary: "queue retry" });
+      return;
+    }
+    blockerStarted.resolve();
+    await releaseBlocker.promise;
+    memory.setIssueState(blocker.id, "Done");
+    yield event("turn_completed");
+  });
+  const workflowPath = await writeWorkflow(directory, [retryIssue, blocker], { durable: true });
+  let now = Date.UTC(2026, 0, 1);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    now: () => now,
+    failureBaseDelayMs: 10,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  now += 9;
+  await orchestrator.pollOnce();
+  await blockerStarted.promise;
+
+  failRetryRefresh = true;
+  now += 1;
+  await orchestrator.pollOnce();
+  assert.equal(orchestrator.snapshot().retrying[0]?.error, "Tracker refresh failed");
+  assert.doesNotMatch(JSON.stringify(orchestrator.snapshot()), new RegExp(privateTrackerError, "u"));
+
+  now += 60_000;
+  await orchestrator.pollOnce();
+  assert.equal(orchestrator.snapshot().retrying[0]?.error, "No available orchestrator slots");
+  const checkpoint = await readFile(path.join(directory, "runs.json"), "utf8");
+  assert.match(checkpoint, /"error":"No available orchestrator slots"/u);
+  assert.doesNotMatch(checkpoint, new RegExp(privateTrackerError, "u"));
+
+  releaseBlocker.resolve();
+  await orchestrator.waitForCurrentRuns();
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("blocks after exactly max_attempts dispatched runs and starts a fresh session on manual retry", async () => {
@@ -1853,6 +1925,7 @@ test("pausing after a durable pre-run save rolls back candidate and retry claims
         now += 10;
       }
       const dueAt = orchestrator.snapshot().retrying[0]?.dueAt;
+      const retryError = orchestrator.snapshot().retrying[0]?.error;
       const runningSaved = deferred<void>();
       const releaseSave = deferred<void>();
       releaseBlockedSave = () => releaseSave.resolve();
@@ -1877,12 +1950,17 @@ test("pausing after a durable pre-run save rolls back candidate and retry claims
       assert.equal(paused.running.length, 0, kind);
       assert.equal(paused.retrying.length, kind === "candidate" ? 0 : 1, kind);
       assert.equal(paused.retrying[0]?.dueAt, dueAt, kind);
+      assert.equal(paused.retrying[0]?.error, retryError, kind);
       const checkpoint = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as {
         claims: PersistedClaim[];
       };
       assert.deepEqual(
-        checkpoint.claims.map((claim) => ({ kind: claim.kind, issueId: claim.issueId })),
-        kind === "candidate" ? [] : [{ kind: "retrying", issueId: issue.id }],
+        checkpoint.claims.map((claim) => ({
+          kind: claim.kind,
+          issueId: claim.issueId,
+          error: claim.kind === "retrying" ? claim.error : undefined,
+        })),
+        kind === "candidate" ? [] : [{ kind: "retrying", issueId: issue.id, error: "Agent run failed" }],
         kind,
       );
 
