@@ -69,6 +69,7 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
       continuation: 4,
       blockedAtMs: 9_876.5,
       summary: "Waiting for operator input.",
+      reasonCode: "operator_action_required",
     },
   ];
 

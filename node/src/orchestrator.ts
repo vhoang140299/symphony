@@ -10,6 +10,7 @@ import type {
   AgentDriver,
   AgentEvent,
   AgentUsage,
+  BlockedReasonCode,
   Issue,
   PublishChangeInput,
   Tracker,
@@ -48,6 +49,7 @@ type StopKind =
 interface StopReason {
   kind: StopKind;
   summary: string;
+  blockedReasonCode?: BlockedReasonCode;
 }
 
 interface SessionConfig {
@@ -96,13 +98,14 @@ interface BlockedEntry extends SessionConfig {
   sessionId: string | undefined;
   blockedAtMs: number;
   summary: string;
+  reasonCode: BlockedReasonCode;
 }
 
 type RunOutcome =
   | { kind: "terminal" }
   | { kind: "release"; summary: string }
   | { kind: "continuation" }
-  | { kind: "blocked"; summary: string }
+  | { kind: "blocked"; summary: string; reasonCode: BlockedReasonCode }
   | { kind: "delivery_failure"; error: unknown; pendingDelivery: PendingDelivery }
   | { kind: "failure"; error: unknown };
 
@@ -149,6 +152,7 @@ export interface OrchestratorSnapshot {
     issueUrl: string | null;
     blockedAt: string;
     summary: string;
+    reasonCode: BlockedReasonCode;
   }>;
   totals: AgentUsage & { secondsRunning: number };
   latestRateLimits: unknown;
@@ -452,6 +456,7 @@ export class Orchestrator {
         issueUrl: entry.issue.url,
         blockedAt: iso(entry.blockedAtMs),
         summary: entry.summary,
+        reasonCode: entry.reasonCode,
       })),
       totals: {
         ...this.#totals,
@@ -599,6 +604,7 @@ export class Orchestrator {
             sessionId: undefined,
             blockedAtMs: Math.max(0, this.#now()),
             summary: "Recovered an interrupted agent run; manual retry required",
+            reasonCode: "run_interrupted",
           });
         }
       } else if (claim.kind === "retrying") {
@@ -625,6 +631,7 @@ export class Orchestrator {
           sessionId: undefined,
           blockedAtMs: claim.blockedAtMs,
           summary: claim.summary,
+          reasonCode: claim.reasonCode ?? "unknown",
         });
       }
       this.#claimed.add(issue.id);
@@ -675,6 +682,7 @@ export class Orchestrator {
         continuation: entry.continuation,
         blockedAtMs: Math.max(0, entry.blockedAtMs),
         summary: truncate(entry.summary, 2_000),
+        reasonCode: entry.reasonCode,
       });
     }
     return claims.sort((left, right) => left.issueId.localeCompare(right.issueId));
@@ -693,7 +701,12 @@ export class Orchestrator {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     for (const entry of this.#running.values()) {
-      this.#requestStop(entry, "blocked", "Durable run state persistence failed; manual recovery required");
+      this.#requestStop(
+        entry,
+        "blocked",
+        "Durable run state persistence failed; manual recovery required",
+        "orchestrator_failure",
+      );
     }
     this.#logger.error({ error }, "Durable run state persistence failed; scheduling stopped");
     return failure;
@@ -733,6 +746,7 @@ export class Orchestrator {
           sessionId: undefined,
           blockedAtMs: Math.max(0, this.#now()),
           summary: "Orchestrator stopped during an active run; manual retry required",
+          reasonCode: "run_interrupted",
         });
       }
     }
@@ -1109,7 +1123,7 @@ export class Orchestrator {
           return { kind: "failure", error: new Error("Agent returned an invalid delivery completion") };
         }
         if (completion.status === "blocked") {
-          return { kind: "blocked", summary: completion.summary };
+          return { kind: "blocked", summary: completion.summary, reasonCode: "agent_reported" };
         }
         const pendingDelivery = { completion, idempotencyKey: randomUUID() };
         entry.pendingDelivery = pendingDelivery;
@@ -1221,6 +1235,7 @@ export class Orchestrator {
             entry,
             "blocked",
             event.summary ?? (event.type === "approval_required" ? "Agent needs approval" : "Agent needs input"),
+            "operator_action_required",
           );
         }
         if (isTerminalAgentEvent(event)) {
@@ -1425,7 +1440,11 @@ export class Orchestrator {
       outcome = this.#stateStore === undefined
         ? { kind: "release", summary: "Orchestrator stopped" }
         : entry.pendingDelivery === undefined
-          ? { kind: "blocked", summary: "Orchestrator stopped during an active run; manual retry required" }
+          ? {
+              kind: "blocked",
+              summary: "Orchestrator stopped during an active run; manual retry required",
+              reasonCode: "run_interrupted",
+            }
           : {
               kind: "delivery_failure",
               error: new Error("Orchestrator stopped during host delivery"),
@@ -1467,6 +1486,7 @@ export class Orchestrator {
         sessionId: entry.stopReason?.kind === "shutdown" ? undefined : entry.sessionId,
         blockedAtMs: this.#now(),
         summary: outcome.summary,
+        reasonCode: outcome.reasonCode,
       });
       this.#logger.warn(
         {
@@ -1504,6 +1524,7 @@ export class Orchestrator {
           sessionId: isFailure ? undefined : entry.sessionId,
           blockedAtMs: this.#now(),
           summary,
+          reasonCode: "retry_budget_exhausted",
         });
         this.#assertClaimInvariant();
         await this.#persistState();
@@ -1558,7 +1579,9 @@ export class Orchestrator {
     if (reason.kind === "stalled" || reason.kind === "turn_timeout") {
       return { kind: "failure", error: new Error(reason.summary) };
     }
-    if (reason.kind === "blocked") return { kind: "blocked", summary: reason.summary };
+    if (reason.kind === "blocked") {
+      return { kind: "blocked", summary: reason.summary, reasonCode: reason.blockedReasonCode ?? "unknown" };
+    }
     return { kind: "release", summary: reason.summary };
   }
 
@@ -1569,9 +1592,14 @@ export class Orchestrator {
     return this.#outcomeForStop(reason);
   }
 
-  #requestStop(entry: RunningEntry, kind: StopKind, summary: string): void {
+  #requestStop(
+    entry: RunningEntry,
+    kind: StopKind,
+    summary: string,
+    blockedReasonCode?: BlockedReasonCode,
+  ): void {
     if (entry.stopReason) return;
-    entry.stopReason = { kind, summary };
+    entry.stopReason = { kind, summary, ...(blockedReasonCode === undefined ? {} : { blockedReasonCode }) };
     entry.controller.abort(new Error(summary));
   }
 

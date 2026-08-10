@@ -40,6 +40,13 @@ interface BlockedIssue {
   identifier: string;
   issueUrl: string | null;
   blockedAt: string;
+  reasonCode:
+    | "agent_reported"
+    | "operator_action_required"
+    | "retry_budget_exhausted"
+    | "run_interrupted"
+    | "orchestrator_failure"
+    | "unknown";
 }
 
 interface DashboardState {
@@ -71,6 +78,14 @@ const dateFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "medium",
 });
+const blockedReasonLabels: Record<BlockedIssue["reasonCode"], string> = {
+  agent_reported: "Agent reported",
+  operator_action_required: "Operator action required",
+  retry_budget_exhausted: "Retry budget exhausted",
+  run_interrupted: "Run interrupted",
+  orchestrator_failure: "Orchestrator failure",
+  unknown: "Unknown",
+};
 
 function App() {
   const [state, setState] = useState<DashboardState | null>(null);
@@ -265,6 +280,7 @@ function App() {
                   <thead>
                     <tr>
                       <th scope="col">Issue</th>
+                      <th scope="col">Reason</th>
                       <th scope="col">Blocked since</th>
                       <th scope="col">Action</th>
                     </tr>
@@ -273,6 +289,7 @@ function App() {
                     {state.blocked.map((issue) => (
                       <tr key={issue.issueId}>
                         <td><IssueReference identifier={issue.identifier} url={issue.issueUrl} /></td>
+                        <td>{blockedReasonLabels[issue.reasonCode] ?? "Unknown"}</td>
                         <td><Timestamp value={issue.blockedAt} /></td>
                         <td>
                           <button
