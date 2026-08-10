@@ -78,6 +78,48 @@ test("operations endpoints expose health and aggregate status without run detail
       totals: snapshot.totals,
     });
     assert.doesNotMatch(status.body, /SECRET|secret|workspace|session|rate/i);
+
+    const state = await server.inject({ method: "GET", url: "/api/v1/state" });
+    assert.equal(state.statusCode, 200);
+    assert.equal(state.headers["cache-control"], "no-store");
+    const stateBody = state.json();
+    assert.equal(typeof stateBody.generatedAt, "string");
+    assert.equal(Number.isNaN(Date.parse(stateBody.generatedAt)), false);
+    delete stateBody.generatedAt;
+    assert.deepEqual(stateBody, {
+      startedAt: "2026-08-09T01:00:00.000Z",
+      lastPollAt: "2026-08-09T01:01:00.000Z",
+      counts: { running: 1, retrying: 1, blocked: 1 },
+      running: [
+        {
+          issueId: "secret-issue-id",
+          identifier: "SECRET-1",
+          state: "Todo",
+          attempt: 1,
+          continuation: 0,
+          startedAt: "2026-08-09T01:00:10.000Z",
+          lastActivityAt: "2026-08-09T01:00:20.000Z",
+        },
+      ],
+      retrying: [
+        {
+          issueId: "retry-issue-id",
+          identifier: "RETRY-1",
+          attempt: 2,
+          dueAt: "2026-08-09T01:02:00.000Z",
+          reason: "failure",
+        },
+      ],
+      blocked: [
+        {
+          issueId: "blocked-issue-id",
+          identifier: "BLOCKED-1",
+          blockedAt: "2026-08-09T01:00:30.000Z",
+        },
+      ],
+      totals: snapshot.totals,
+    });
+    assert.doesNotMatch(state.body, /secret-session|secret summary|\/secret\/workspace|provider detail/iu);
   } finally {
     await server.close();
   }
@@ -92,10 +134,12 @@ test("operations server does not expose internal status errors", async () => {
   );
 
   try {
-    const response = await server.inject({ method: "GET", url: "/status" });
-    assert.equal(response.statusCode, 500);
-    assert.deepEqual(response.json(), { status: "error" });
-    assert.doesNotMatch(response.body, /secret|snapshot detail/iu);
+    for (const url of ["/status", "/api/v1/state"]) {
+      const response = await server.inject({ method: "GET", url });
+      assert.equal(response.statusCode, 500);
+      assert.deepEqual(response.json(), { status: "error" });
+      assert.doesNotMatch(response.body, /secret|snapshot detail/iu);
+    }
   } finally {
     await server.close();
   }

@@ -30,6 +30,41 @@ export function createOperationsServer(
       totals: current.totals,
     };
   });
+  app.get("/api/v1/state", () => {
+    const current = snapshot();
+    return {
+      generatedAt: new Date().toISOString(),
+      startedAt: current.startedAt,
+      lastPollAt: current.lastPollAt,
+      counts: {
+        running: current.running.length,
+        retrying: current.retrying.length,
+        blocked: current.blocked.length,
+      },
+      running: current.running.map((entry) => ({
+        issueId: entry.issueId,
+        identifier: entry.identifier,
+        state: entry.state,
+        attempt: entry.attempt,
+        continuation: entry.continuation,
+        startedAt: entry.startedAt,
+        lastActivityAt: entry.lastActivityAt,
+      })),
+      retrying: current.retrying.map((entry) => ({
+        issueId: entry.issueId,
+        identifier: entry.identifier,
+        attempt: entry.attempt,
+        dueAt: entry.dueAt,
+        reason: entry.reason,
+      })),
+      blocked: current.blocked.map((entry) => ({
+        issueId: entry.issueId,
+        identifier: entry.identifier,
+        blockedAt: entry.blockedAt,
+      })),
+      totals: current.totals,
+    };
+  });
 
   return app;
 }

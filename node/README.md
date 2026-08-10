@@ -132,6 +132,9 @@ node dist/src/cli.js --http-port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
   or coding-agent provider reachability.
 - `GET /status`: reports timestamps, aggregate run-state counts, and usage totals. It omits issue
   identifiers, workspace paths, agent session IDs, provider details, and raw errors.
+- `GET /api/v1/state`: reports privacy-filtered running, retrying, and blocked entries, including
+  issue IDs and identifiers, lifecycle timestamps, retry details, and usage totals. It omits
+  workspace paths, agent session IDs, blocked summaries, provider details, and raw errors.
 
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.
