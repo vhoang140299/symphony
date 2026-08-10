@@ -29,6 +29,7 @@
     "symphony-node": "dist/src/cli.js"
   },
   "files": [
+    "dist/dashboard",
     "dist/src",
     "codex-symphony-wrapper.mjs",
     "NOTICE",
@@ -42,8 +43,9 @@
     ]
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json && pnpm run build:dashboard",
+    "build:dashboard": "tsc -p tsconfig.ui.json --noEmit && vite build --config vite.dashboard.config.ts",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ui.json --noEmit",
     "prepack": "pnpm run build",
     "start": "node dist/src/cli.js",
     "test": "pnpm run build && vitest run",
@@ -64,7 +66,12 @@
   },
   "devDependencies": {
     "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
     "typescript": "7.0.2",
+    "vite": "8.2.1",
     "vitest": "4.1.10"
   }
 }

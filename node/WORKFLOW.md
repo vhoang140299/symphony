@@ -21,7 +21,7 @@ tracker:
 polling:
   interval_ms: 30000
 
-# Optional operations HTTP listener. Port 0 selects an ephemeral local port.
+# Optional React operations dashboard and API. Port 0 selects an ephemeral local port.
 # server:
 #   port: 3000
 #   host: 127.0.0.1

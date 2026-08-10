@@ -73,6 +73,55 @@ test("operations endpoints expose health and aggregate status without run detail
   );
 
   try {
+    const dashboard = await server.inject({ method: "GET", url: "/" });
+    assert.equal(dashboard.statusCode, 200);
+    assert.match(dashboard.headers["content-type"] ?? "", /^text\/html; charset=utf-8/iu);
+    assert.equal(dashboard.headers["cache-control"], "no-store");
+    assert.equal(
+      dashboard.headers["content-security-policy"],
+      "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    );
+    assert.equal(dashboard.headers["x-content-type-options"], "nosniff");
+    assert.equal(dashboard.headers["referrer-policy"], "no-referrer");
+    assert.match(dashboard.body, /<div id="root"><\/div>/u);
+    assert.doesNotMatch(
+      dashboard.body,
+      /secret-issue-id|secret-session|secret summary|\/secret\/workspace|provider detail/iu,
+    );
+
+    const assetPaths = [...dashboard.body.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/gu)].flatMap((match) =>
+      match[1] === undefined ? [] : [match[1]]);
+    assert.ok(assetPaths.some((assetPath) => assetPath.endsWith(".js")));
+    assert.ok(assetPaths.some((assetPath) => assetPath.endsWith(".css")));
+    for (const assetPath of assetPaths) {
+      assert.match(assetPath, /^\/assets\/[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8,}\.(?:js|css)$/u);
+      const asset = await server.inject({ method: "GET", url: assetPath });
+      assert.equal(asset.statusCode, 200);
+      assert.equal(asset.headers["cache-control"], "no-store");
+      assert.equal(asset.headers["content-security-policy"], dashboard.headers["content-security-policy"]);
+      assert.equal(asset.headers["x-content-type-options"], "nosniff");
+      assert.equal(asset.headers["referrer-policy"], "no-referrer");
+      assert.match(asset.headers["content-type"] ?? "", assetPath.endsWith(".js") ? /javascript/iu : /^text\/css/iu);
+      assert.doesNotMatch(
+        asset.body,
+        /secret-issue-id|secret-session|secret summary|\/secret\/workspace|provider detail/iu,
+      );
+    }
+    const assetPath = assetPaths[0] ?? assert.fail("dashboard must reference at least one built asset");
+
+    const licenses = await server.inject({ method: "GET", url: "/assets/licenses.md" });
+    assert.equal(licenses.statusCode, 200);
+    assert.match(licenses.headers["content-type"] ?? "", /^text\/markdown; charset=utf-8/iu);
+    assert.equal(licenses.headers["cache-control"], "no-store");
+    assert.equal(licenses.headers["content-security-policy"], dashboard.headers["content-security-policy"]);
+    assert.equal(licenses.headers["x-content-type-options"], "nosniff");
+    assert.equal(licenses.headers["referrer-policy"], "no-referrer");
+    assert.ok(licenses.body.length > 0);
+    assert.doesNotMatch(
+      licenses.body,
+      /secret-issue-id|secret-session|secret summary|\/secret\/workspace|provider detail/iu,
+    );
+
     const health = await server.inject({ method: "GET", url: "/healthz" });
     assert.equal(health.statusCode, 200);
     assert.equal(health.headers["cache-control"], "no-store");
@@ -182,6 +231,9 @@ test("operations endpoints expose health and aggregate status without run detail
     for (const [method, url, allow] of [
       ["GET", "/api/v1/refresh", "POST"],
       ["POST", "/status", "GET"],
+      ["POST", "/", "GET"],
+      ["POST", "/assets", "GET"],
+      ["POST", assetPath, "GET"],
     ] as const) {
       const response = await server.inject({ method, url });
       assert.equal(response.statusCode, 405);
@@ -189,6 +241,23 @@ test("operations endpoints expose health and aggregate status without run detail
       assert.deepEqual(response.json(), {
         error: { code: "method_not_allowed", message: "Method not allowed" },
       });
+    }
+
+    for (const url of [
+      "/assets",
+      "/assets/missing-deadbeef.js",
+      "/assets/../package.json",
+      "/assets/%2e%2e%2findex.html",
+      "/assets/%2e%2e%5cpackage.json",
+      assetPath.slice("/assets".length),
+      "/index.html",
+      "/licenses.md",
+      "/package.json",
+    ]) {
+      const response = await server.inject({ method: "GET", url });
+      assert.equal(response.statusCode, 404, url);
+      assert.deepEqual(response.json(), { error: { code: "not_found", message: "Route not found" } });
+      assert.doesNotMatch(response.body, /<!doctype html|@ai-symphony|secret-session|provider detail/iu);
     }
 
     const unknown = await server.inject({ method: "GET", url: "/unknown" });

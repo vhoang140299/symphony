@@ -38,7 +38,8 @@ For a smaller Node.js implementation, see [node/README.md](node/README.md). It s
 and Codex, with in-memory, Linear, and GitHub Issues trackers plus an opt-in, host-controlled GitHub
 issue-to-pull-request flow and retry-label control for either agent. Starting with `node-v0.4.0`,
 Node release tags also provide an installable package tarball and checksum; it does not yet provide
-the full adapter and operational surface of the Elixir reference implementation.
+the full adapter and operational surface of the Elixir reference implementation. Its optional HTTP
+listener includes a privacy-filtered React operations dashboard.
 
 ---
 

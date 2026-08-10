@@ -13,14 +13,14 @@ an isolated workspace for each issue, and runs Claude Code or Codex through thei
 ## Current scope
 
 - Runtime: Node.js with strict TypeScript and ESM
-- CLI and tooling: Commander, Fastify for optional operational HTTP, pnpm, and Vitest
-  (Vite-powered)
+- CLI and tooling: Commander, Fastify for optional operational HTTP, a React dashboard built with
+  Vite, pnpm, and Vitest
 - Coding agents: Claude Code via `@anthropic-ai/claude-agent-sdk`, or Codex via `@openai/codex-sdk`
 - Trackers: in-memory issues; Linear polling with manual Claude tools, host-controlled handoff, and
   operator retry labels through the official SDK; or GitHub Issues polling with manual Claude tools,
   host-controlled PR delivery, and operator retry labels
-- Operations: structured logs, an in-process runtime snapshot, and an optional locally leased
-  checkpoint
+- Operations: structured logs, an in-process runtime snapshot, a privacy-filtered web dashboard, and an
+  optional locally leased checkpoint
 
 The in-memory tracker is for development and smoke tests. It does not persist state, synchronize
 with an issue service, or give Claude a tool for moving an issue to a new state. Active memory
@@ -68,8 +68,8 @@ symphony-node --help
 The tarball installs runtime dependencies from the npm registry but Symphony itself is distributed
 through GitHub Releases; this workflow does not publish the package to npm. Provide a reviewed
 `WORKFLOW.md`, then run `symphony-node ./WORKFLOW.md`. The artifact also contains the checked-in
-workflow examples, README, type declarations, Codex wrapper, Apache-2.0 license, and repository
-notice.
+workflow examples, README, dashboard bundle and third-party licenses, type declarations, Codex
+wrapper, Apache-2.0 license, and repository notice.
 
 ## Build from source
 
@@ -158,6 +158,9 @@ node dist/src/cli.js --port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
 reports the actual bound port. Listener changes require a restart. HTTP CLI flags are daemon-only
 and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server exposes:
 
+- `GET /`: serves a React dashboard with scheduler readiness, aggregate usage, current
+  running/retrying/blocked issues, automatic display refresh, and a button that queues an immediate
+  tracker poll. Eligible work can start when that poll runs.
 - `GET /healthz`: reports that the HTTP process is responding.
 - `GET /readyz`: reports ready only while the scheduler is initialized and running and no local
   fatal condition, such as a durable checkpoint failure, has stopped it. It does not test tracker
@@ -180,13 +183,15 @@ host delivery, and resets when the process restarts. Unknown routes and unsuppor
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.
 
-These endpoints have no authentication. Keep the default loopback binding; if you bind to a remote
-interface, add authentication and network access controls outside Symphony.
+The dashboard and API have no authentication. Keep the default loopback binding; if you bind to a
+remote interface, add authentication and network access controls outside Symphony. Dashboard issue
+links are limited to HTTP(S), and provider content is rendered as text rather than HTML.
 
 For development:
 
 ```bash
 pnpm run check
+pnpm run build:dashboard
 pnpm test
 pnpm test:watch
 ```
@@ -633,8 +638,8 @@ Additional trackers implement the `Tracker` contract under `src/trackers/` and r
 `kind` in the tracker registry. Additional coding agents follow the same pattern with the
 `AgentDriver` contract under `src/agents/`.
 
-The MVP deliberately has no database, durable queue, multi-node coordination, or dashboard. Add
-those only when the target deployment requires them.
+The MVP deliberately has no database, durable queue, or multi-node coordination. Add those only
+when the target deployment requires them.
 
 Approval or user-input requests fail closed and remain visible in `Orchestrator.snapshot()` until
 an embedding calls `retryBlocked()`, or the tracker moves the issue out of an active state. The CLI
