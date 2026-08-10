@@ -1250,12 +1250,13 @@ This prompt must never reach Claude.
 });
 
 test(
-  "CLI --once handles SIGTERM and removes its detached after_run process group",
+  "CLI --once waits for after_run before completing SIGTERM shutdown",
   { skip: process.platform === "win32", timeout: 5_000 },
   async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-signal-"));
     const workflowPath = path.join(directory, "WORKFLOW.md");
-    const hookPidsPath = path.join(directory, "hook-pids");
+    const hookMarkerPath = path.join(directory, "after-run.log");
+    const releaseHookPath = path.join(directory, "release-after-run");
     const workspaceRoot = path.join(directory, "workspaces");
     await writeFile(
       workflowPath,
@@ -1278,11 +1279,10 @@ workspace:
 hooks:
   before_run: exit 1
   after_run: |
-    printf '%s\\n' "$$" > ${JSON.stringify(hookPidsPath)}
-    sleep 60 &
-    printf '%s\\n' "$!" >> ${JSON.stringify(hookPidsPath)}
-    wait
-  timeout_ms: 60000
+    printf 'started\\n' > ${JSON.stringify(hookMarkerPath)}
+    while [ ! -f ${JSON.stringify(releaseHookPath)} ]; do sleep 0.02; done
+    printf 'completed\\n' >> ${JSON.stringify(hookMarkerPath)}
+  timeout_ms: 2000
 agent:
   max_concurrent_agents: 1
   max_turns: 1
@@ -1312,20 +1312,18 @@ This prompt must never reach Claude.
       child.once("error", reject);
       child.once("close", (code, signal) => resolve({ code, signal }));
     });
-    let hookPids: number[] = [];
-
     try {
-      hookPids = await waitForPids(hookPidsPath, 2, 2_000);
+      await waitForFileContents(hookMarkerPath, "started\n", 2_000);
       assert.equal(child.kill("SIGTERM"), true);
+      await writeFile(releaseHookPath, "release\n");
       const outcome = await closed;
 
       assert.deepEqual(outcome, { code: 143, signal: null });
       assert.equal(JSON.parse(stdout).running, 0);
       assert.match(stderr, /One-shot shutdown requested/);
-      for (const pid of hookPids) await waitForProcessExit(pid, 1_000);
+      assert.equal(await readFile(hookMarkerPath, "utf8"), "started\ncompleted\n");
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-      for (const pid of hookPids) terminateBestEffort(pid);
       await rm(directory, { recursive: true, force: true });
     }
   },
@@ -1345,49 +1343,17 @@ test("CLI reports a missing workflow on stderr and exits nonzero", async () => {
   );
 });
 
-async function waitForPids(filePath: string, count: number, timeoutMs: number): Promise<number[]> {
+async function waitForFileContents(filePath: string, expected: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const pids = (await readFile(filePath, "utf8"))
-        .trim()
-        .split("\n")
-        .map(Number)
-        .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
-      if (pids.length === count) return pids;
+      if ((await readFile(filePath, "utf8")) === expected) return;
     } catch {
       // The hook has not written the file yet.
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(`Timed out waiting for ${count} hook processes`);
-}
-
-async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  throw new Error(`Process ${pid} was left running`);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
-    throw error;
-  }
-}
-
-function terminateBestEffort(pid: number): void {
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // The process has already exited.
-  }
+  throw new Error(`Timed out waiting for ${JSON.stringify(expected)} in ${filePath}`);
 }
 
 function spawnCliDaemon(args: string[]) {

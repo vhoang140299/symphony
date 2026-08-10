@@ -1634,6 +1634,44 @@ test("reconciliation aborts a terminal issue, runs after_run, then removes its w
   await orchestrator.stop();
 });
 
+test("graceful shutdown runs after_run once before checkpointing the interrupted run", async () => {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "symphony-shutdown-after-run-")));
+  const issue = rawIssue("shutdown", "SHUTDOWN-1", 1, "2025-01-01T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [issue] });
+  const started = deferred<void>();
+  let driverExited = false;
+  const driver = new FakeDriver(async function* (context) {
+    yield event("session_started", { sessionId: "shutdown-session" });
+    started.resolve();
+    if (!context.signal.aborted) {
+      await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => resolve(), { once: true }));
+    }
+    driverExited = true;
+    yield event("turn_failed", { sessionId: "shutdown-session", summary: "aborted" });
+  });
+  const lifecyclePath = path.join(directory, "lifecycle.log");
+  const workflowPath = await writeWorkflow(directory, [issue], {
+    durable: true,
+    hooks: { after_run: `printf 'after_run\\n' >> ${shellQuote(lifecyclePath)}` },
+  });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await started.promise;
+  await orchestrator.stop();
+  await orchestrator.stop();
+
+  assert.equal(driverExited, true);
+  assert.equal(await readFile(lifecyclePath, "utf8"), "after_run\n");
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+  const checkpoint = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as {
+    claims: Array<{ kind: string; issueId: string }>;
+  };
+  assert.deepEqual(checkpoint.claims.map(({ kind, issueId }) => ({ kind, issueId })), [
+    { kind: "blocked", issueId: issue.id },
+  ]);
+});
+
 test("an early continuation retry wakes the scheduler before the regular poll interval", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-wake-retry-"));
   const issue = rawIssue("wake", "WAKE-1", 1, "2025-01-01T00:00:00Z");
@@ -2012,6 +2050,7 @@ async function writeWorkflow(
   directory: string,
   issues: Array<Record<string, unknown>>,
   options: {
+    durable?: boolean;
     maxConcurrentAgents?: number;
     maxAttempts?: number;
     hooks?: Record<string, string>;
@@ -2033,6 +2072,7 @@ async function writeWorkflow(
     polling: { interval_ms: options.pollIntervalMs ?? 60_000 },
     workspace: { root: "./workspaces" },
     hooks: { timeout_ms: 1_000, ...options.hooks },
+    ...(options.durable === true ? { state: { path: "./runs.json" } } : {}),
     agent: {
       max_concurrent_agents: options.maxConcurrentAgents ?? 1,
       max_turns: options.maxTurns ?? 1,

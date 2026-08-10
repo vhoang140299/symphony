@@ -264,8 +264,7 @@ export class Orchestrator {
     for (const entry of this.#running.values()) {
       this.#requestStop(entry, "shutdown", "Orchestrator is shutting down");
     }
-    const graceMs =
-      this.#shutdownGraceMs ?? Math.max(30_000, (this.#workflow?.config.hooks.timeoutMs ?? 0) + 1_000);
+    const graceMs = this.#shutdownGraceMs ?? 30_000 + (this.#workflow?.config.hooks.timeoutMs ?? 0);
     const deadlineMs = Date.now() + graceMs;
     let checkpointSafe = true;
     let timedOut = false;
@@ -1073,7 +1072,6 @@ export class Orchestrator {
           entry.workspacePath,
           entry.issue,
           entry.workflow.config,
-          this.#shutdownController.signal,
         );
       }
     }
