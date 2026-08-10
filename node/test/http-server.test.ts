@@ -8,10 +8,12 @@ const operationHeaders = { "x-symphony-operation": "1" };
 test("operations endpoints expose health and aggregate status without run details", async () => {
   let ready = false;
   let refreshes = 0;
+  const dispatchPauseRequests: boolean[] = [];
   const retryRequests: string[] = [];
   const snapshot: OrchestratorSnapshot = {
     startedAt: "2026-08-09T01:00:00.000Z",
     lastPollAt: "2026-08-09T01:01:00.000Z",
+    dispatchPaused: false,
     running: [
       {
         issueId: "secret-issue-id",
@@ -86,6 +88,13 @@ test("operations endpoints expose health and aggregate status without run detail
       retryRequests.push(identifier);
       return identifier === "BLOCKED-1";
     },
+    "127.0.0.1",
+    (paused) => {
+      dispatchPauseRequests.push(paused);
+      const changed = snapshot.dispatchPaused !== paused;
+      snapshot.dispatchPaused = paused;
+      return changed;
+    },
   );
 
   try {
@@ -121,6 +130,9 @@ test("operations endpoints expose health and aggregate status without run detail
       if (assetPath.endsWith(".js")) {
         assert.match(asset.body, /Model quota/iu);
         assert.match(asset.body, /Unavailable/iu);
+        assert.match(asset.body, /Pause new work/iu);
+        assert.match(asset.body, /Resume new work/iu);
+        assert.match(asset.body, /Draining/iu);
       }
       assert.doesNotMatch(
         asset.body,
@@ -180,6 +192,7 @@ test("operations endpoints expose health and aggregate status without run detail
     assert.deepEqual(stateBody, {
       startedAt: "2026-08-09T01:00:00.000Z",
       lastPollAt: "2026-08-09T01:01:00.000Z",
+      dispatchPaused: false,
       counts: { running: 1, retrying: 1, blocked: 1 },
       running: [
         {
@@ -246,10 +259,16 @@ test("operations endpoints expose health and aggregate status without run detail
       utilization: 7,
       secret: "private malformed rate limit",
     } as unknown as OrchestratorSnapshot["latestRateLimits"];
+    snapshot.dispatchPaused = "secret malformed pause state" as unknown as boolean;
     const stateWithMalformedRateLimit = await server.inject({ method: "GET", url: "/api/v1/state" });
     assert.equal(stateWithMalformedRateLimit.statusCode, 200);
     assert.equal(stateWithMalformedRateLimit.json().rateLimit, null);
-    assert.doesNotMatch(stateWithMalformedRateLimit.body, /secret-status|secret-window|private malformed/iu);
+    assert.equal(stateWithMalformedRateLimit.json().dispatchPaused, false);
+    assert.doesNotMatch(
+      stateWithMalformedRateLimit.body,
+      /secret-status|secret-window|private malformed|secret malformed pause/iu,
+    );
+    snapshot.dispatchPaused = false;
 
     for (const [identifier, status, row] of [
       ["acme/widget#7", "running", stateBody.running[0]],
@@ -287,8 +306,29 @@ test("operations endpoints expose health and aggregate status without run detail
     assert.deepEqual(refresh.json(), { queued: true });
     assert.equal(refreshes, 1);
 
+    const pause = await server.inject({ method: "POST", url: "/api/v1/pause", headers: operationHeaders });
+    assert.equal(pause.statusCode, 202);
+    assert.deepEqual(pause.json(), { dispatchPaused: true, changed: true });
+    assert.equal(refreshes, 1);
+    const pauseAgain = await server.inject({ method: "POST", url: "/api/v1/pause", headers: operationHeaders });
+    assert.equal(pauseAgain.statusCode, 202);
+    assert.deepEqual(pauseAgain.json(), { dispatchPaused: true, changed: false });
+    assert.equal(refreshes, 1);
+    const pausedState = await server.inject({ method: "GET", url: "/api/v1/state" });
+    assert.equal(pausedState.json().dispatchPaused, true);
+
+    const resume = await server.inject({ method: "POST", url: "/api/v1/resume", headers: operationHeaders });
+    assert.equal(resume.statusCode, 202);
+    assert.deepEqual(resume.json(), { dispatchPaused: false, changed: true });
+    assert.equal(refreshes, 2);
+    assert.deepEqual(dispatchPauseRequests, [true, true, false]);
+
     for (const [method, url, allow] of [
       ["GET", "/api/v1/refresh", "POST"],
+      ["GET", "/api/v1/pause", "POST"],
+      ["DELETE", "/api/v1/pause", "POST"],
+      ["GET", "/api/v1/resume", "POST"],
+      ["PATCH", "/api/v1/resume", "POST"],
       ["GET", "/api/v1/BLOCKED-1/retry", "POST"],
       ["DELETE", "/api/v1/BLOCKED-1/retry", "POST"],
       ["POST", "/status", "GET"],
@@ -341,6 +381,10 @@ test("operations server does not expose internal status errors", async () => {
     async () => {
       throw new Error("secret retry detail");
     },
+    "127.0.0.1",
+    () => {
+      throw new Error("secret dispatch detail");
+    },
   );
 
   try {
@@ -358,6 +402,12 @@ test("operations server does not expose internal status errors", async () => {
     assert.equal(retry.statusCode, 500);
     assert.deepEqual(retry.json(), { status: "error" });
     assert.doesNotMatch(retry.body, /secret|retry detail/iu);
+    for (const url of ["/api/v1/pause", "/api/v1/resume"]) {
+      const dispatch = await server.inject({ method: "POST", url, headers: operationHeaders });
+      assert.equal(dispatch.statusCode, 500);
+      assert.deepEqual(dispatch.json(), { status: "error" });
+      assert.doesNotMatch(dispatch.body, /secret|dispatch detail/iu);
+    }
   } finally {
     await server.close();
   }
@@ -368,9 +418,22 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
     () => assert.fail("snapshot must not be called"),
     () => true,
   );
+  let resumeWithoutRefreshChanges = 0;
+  const resumeWithoutRefresh = createOperationsServer(
+    () => assert.fail("snapshot must not be called"),
+    () => true,
+    undefined,
+    undefined,
+    "127.0.0.1",
+    () => {
+      resumeWithoutRefreshChanges += 1;
+      return true;
+    },
+  );
   let ready = true;
   let refreshes = 0;
   let retries = 0;
+  let dispatchChanges = 0;
   const server = createOperationsServer(
     () => assert.fail("snapshot must not be called"),
     () => ready,
@@ -379,6 +442,11 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
     },
     async () => {
       retries += 1;
+      return true;
+    },
+    "127.0.0.1",
+    () => {
+      dispatchChanges += 1;
       return true;
     },
   );
@@ -392,6 +460,31 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
       headers: operationHeaders,
     });
     assert.equal(missingRetryCallback.statusCode, 503);
+    for (const url of ["/api/v1/pause", "/api/v1/resume"]) {
+      const missingDispatchCallback = await unavailable.inject({ method: "POST", url, headers: operationHeaders });
+      assert.equal(missingDispatchCallback.statusCode, 503);
+      assert.deepEqual(missingDispatchCallback.json(), {
+        error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
+      });
+    }
+    const pauseWithoutRefresh = await resumeWithoutRefresh.inject({
+      method: "POST",
+      url: "/api/v1/pause",
+      headers: operationHeaders,
+    });
+    assert.equal(pauseWithoutRefresh.statusCode, 202);
+    assert.deepEqual(pauseWithoutRefresh.json(), { dispatchPaused: true, changed: true });
+    assert.equal(resumeWithoutRefreshChanges, 1);
+    const missingResumeRefresh = await resumeWithoutRefresh.inject({
+      method: "POST",
+      url: "/api/v1/resume",
+      headers: operationHeaders,
+    });
+    assert.equal(missingResumeRefresh.statusCode, 503);
+    assert.deepEqual(missingResumeRefresh.json(), {
+      error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
+    });
+    assert.equal(resumeWithoutRefreshChanges, 1);
     ready = false;
     const response = await server.inject({ method: "POST", url: "/api/v1/refresh", headers: operationHeaders });
     assert.equal(response.statusCode, 503);
@@ -405,8 +498,17 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
       error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
     });
     assert.equal(retries, 0);
+    for (const url of ["/api/v1/pause", "/api/v1/resume"]) {
+      const dispatch = await server.inject({ method: "POST", url, headers: operationHeaders });
+      assert.equal(dispatch.statusCode, 503);
+      assert.deepEqual(dispatch.json(), {
+        error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
+      });
+    }
+    assert.equal(dispatchChanges, 0);
   } finally {
     await unavailable.close();
+    await resumeWithoutRefresh.close();
     await server.close();
   }
 });
@@ -414,6 +516,7 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
 test("operations server rejects untrusted hosts and forged control requests", async () => {
   let refreshes = 0;
   let retries = 0;
+  const dispatchChanges: boolean[] = [];
   const server = createOperationsServer(
     () => assert.fail("snapshot must not be called"),
     () => true,
@@ -422,6 +525,11 @@ test("operations server rejects untrusted hosts and forged control requests", as
     },
     async () => {
       retries += 1;
+      return true;
+    },
+    "127.0.0.1",
+    (paused) => {
+      dispatchChanges.push(paused);
       return true;
     },
   );
@@ -451,8 +559,17 @@ test("operations server rejects untrusted hosts and forged control requests", as
       headers: { host: "localhost:4321", origin: "https://evil.example", ...operationHeaders },
     });
     assert.equal(forgedRetry.statusCode, 403);
+    for (const url of ["/api/v1/pause", "/api/v1/resume"]) {
+      const forgedDispatch = await server.inject({
+        method: "POST",
+        url,
+        headers: { host: "localhost:4321", origin: "https://evil.example", ...operationHeaders },
+      });
+      assert.equal(forgedDispatch.statusCode, 403);
+    }
     assert.equal(refreshes, 0);
     assert.equal(retries, 0);
+    assert.deepEqual(dispatchChanges, []);
 
     const curlRefresh = await server.inject({
       method: "POST",
@@ -466,8 +583,21 @@ test("operations server rejects untrusted hosts and forged control requests", as
       headers: { host: "localhost:4321", origin: "http://localhost:4321", ...operationHeaders },
     });
     assert.equal(browserRetry.statusCode, 202);
-    assert.equal(refreshes, 1);
+    const browserPause = await server.inject({
+      method: "POST",
+      url: "/api/v1/pause",
+      headers: { host: "localhost:4321", origin: "http://localhost:4321", ...operationHeaders },
+    });
+    assert.equal(browserPause.statusCode, 202);
+    const curlResume = await server.inject({
+      method: "POST",
+      url: "/api/v1/resume",
+      headers: { host: "127.0.0.1:4321", ...operationHeaders },
+    });
+    assert.equal(curlResume.statusCode, 202);
+    assert.equal(refreshes, 2);
     assert.equal(retries, 1);
+    assert.deepEqual(dispatchChanges, [true, false]);
   } finally {
     await server.close();
   }

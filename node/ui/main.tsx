@@ -66,6 +66,7 @@ interface DashboardState {
   generatedAt: string;
   startedAt: string | null;
   lastPollAt: string | null;
+  dispatchPaused: boolean;
   counts: {
     running: number;
     retrying: number;
@@ -119,6 +120,7 @@ function App() {
   const [ready, setReady] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [changingDispatch, setChangingDispatch] = useState(false);
   const [retryingBlockedIssue, setRetryingBlockedIssue] = useState<string | null>(null);
   const activeController = useRef<AbortController | null>(null);
 
@@ -189,6 +191,25 @@ function App() {
     }
   }
 
+  async function toggleDispatch() {
+    if (state === null) return;
+    const paused = !state.dispatchPaused;
+    setChangingDispatch(true);
+    setError(null);
+    try {
+      const response = await fetch(paused ? "/api/v1/pause" : "/api/v1/resume", {
+        method: "POST",
+        headers: operationHeaders,
+      });
+      if (!response.ok) throw new Error("dispatch control request failed");
+      await loadState(true);
+    } catch {
+      setError(actionFailedMessage);
+    } finally {
+      setChangingDispatch(false);
+    }
+  }
+
   return (
     <div className="shell">
       <header className="masthead">
@@ -199,6 +220,19 @@ function App() {
         </div>
         <div className="header-actions">
           <Readiness ready={ready} />
+          <button
+            type="button"
+            onClick={() => void toggleDispatch()}
+            disabled={state === null || changingDispatch || ready !== true}
+            aria-busy={changingDispatch}
+            title={state?.dispatchPaused === true
+              ? "Resume dispatching new work and queue an immediate tracker poll"
+              : "Pause dispatching new work; current runs continue"}
+          >
+            {changingDispatch
+              ? state?.dispatchPaused === true ? "Resuming…" : "Pausing…"
+              : state?.dispatchPaused === true ? "Resume new work" : "Pause new work"}
+          </button>
           <button
             type="button"
             onClick={() => void refreshNow()}
@@ -228,6 +262,7 @@ function App() {
               <Metric label="Running" value={formatNumber(state.counts.running)} tone="running" />
               <Metric label="Retrying" value={formatNumber(state.counts.retrying)} tone="retrying" />
               <Metric label="Blocked" value={formatNumber(state.counts.blocked)} tone="blocked" />
+              <Metric label="Dispatch" value={formatDispatch(state.dispatchPaused, state.counts.running)} />
               <Metric label="Total tokens" value={formatNumber(state.totals.totalTokens)} />
               <Metric label="Estimated cost" value={formatCurrency(state.totals.costUsd)} />
               <Metric label="Claimed runtime" value={formatDuration(state.totals.secondsRunning)} />
@@ -430,6 +465,11 @@ function formatRateLimit(rateLimit: RateLimit | null): string {
     rateLimit.utilization === null ? null : `${Math.round(rateLimit.utilization * 100)}%`,
     rateLimit.rateLimitType === null ? null : rateLimitTypeLabels[rateLimit.rateLimitType],
   ].filter((part): part is string => part !== null).join(" · ");
+}
+
+function formatDispatch(paused: boolean, running: number): string {
+  if (!paused) return "Active";
+  return running > 0 ? "Draining" : "Paused";
 }
 
 function formatDate(value: string | null): string {

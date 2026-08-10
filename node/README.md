@@ -160,8 +160,8 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
 
 - `GET /`: serves a React dashboard with scheduler readiness, aggregate usage, current
   running/retrying/blocked issues, automatic display refresh, and a button that queues an immediate
-  tracker poll. It also shows the latest normalized model quota status when the provider reports
-  one. Eligible work can start when that poll runs.
+  tracker poll. It also shows the latest normalized model quota status and controls for pausing or
+  resuming new dispatch. Eligible work can start when a poll runs and dispatch is active.
 - `GET /healthz`: reports that the HTTP process is responding.
 - `GET /readyz`: reports ready only while the scheduler is initialized and running and no local
   fatal condition, such as a durable checkpoint failure, has stopped it. It does not test tracker
@@ -171,13 +171,18 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
 - `GET /api/v1/state`: reports privacy-filtered running, retrying, and blocked entries, including
   issue IDs, identifiers and URLs, lifecycle timestamps, turn counts, safe last-event types,
   per-run token usage, retry details, normalized blocked reason codes, and aggregate token/runtime
-  totals. Its `rateLimit` field is `null` when unavailable; otherwise it contains only `status`,
-  `rateLimitType`, and `utilization`. Blocked reason codes are `agent_reported`, `operator_action_required`,
+  totals. `dispatchPaused` reports whether new dispatch is paused. Its `rateLimit` field is `null`
+  when unavailable; otherwise it contains only `status`, `rateLimitType`, and `utilization`. Blocked
+  reason codes are `agent_reported`, `operator_action_required`,
   `retry_budget_exhausted`, `run_interrupted`, `orchestrator_failure`, or `unknown`.
 - `GET /api/v1/<issue_identifier>`: returns the same allow-listed details for one currently running,
   retrying, or blocked issue, or a JSON `404` when it is absent.
 - `POST /api/v1/refresh`: queues an immediate coalesced poll while the scheduler is ready and returns
   `202`; otherwise it returns a JSON `503`.
+- `POST /api/v1/pause`: pauses dispatch of new agent runs and returns the resulting state plus whether
+  it changed.
+- `POST /api/v1/resume`: resumes new dispatch, queues an immediate coalesced poll, and returns the
+  resulting state plus whether it changed.
 - `POST /api/v1/<issue_identifier>/retry`: idempotently requests one additional run for a currently blocked,
   still-routable issue and returns `202`. It consumes the configured control retry label first so a
   later poll cannot schedule the same manual retry again. Missing/non-routable issues return `404`;
@@ -188,8 +193,15 @@ must also use the same authority as the request's `Host`. For example:
 
 ```bash
 curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/refresh
+curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/pause
+curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/resume
 curl -X POST -H 'X-Symphony-Operation: 1' http://127.0.0.1:3000/api/v1/OPS-123/retry
 ```
+
+Pausing affects only new dispatch. Tracker polling, issue reconciliation, and current runs continue;
+queued retries, including delivery retries, are retained but do not dispatch until resume.
+The control is in-process and intentionally has no configuration or persistence: every daemon
+restart begins with dispatch active.
 
 The normalized rate-limit `status` is `allowed`, `allowed_warning`, or `rejected`; `rateLimitType` is
 `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included`,
@@ -203,9 +215,9 @@ unsupported methods use JSON `404`/`405` responses.
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.
 
-The dashboard and API have no authentication. Its poll and retry controls can start agent work. All
-requests require a trusted `Host`: the configured listener host, the concrete local destination
-address, or a loopback alias when listening on loopback. A wildcard listener accepts its concrete
+The dashboard and API have no authentication. Its poll, retry, pause, and resume controls affect
+agent work. All requests require a trusted `Host`: the configured listener host, the concrete local
+destination address, or a loopback alias when listening on loopback. A wildcard listener accepts its concrete
 interface address, not an arbitrary DNS hostname. Keep the default loopback binding; if you bind to
 a remote or wildcard interface, add authentication and network access controls outside Symphony.
 A reverse proxy must preserve or rewrite a trusted `Host` and does not replace external

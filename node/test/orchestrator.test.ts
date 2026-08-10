@@ -8,6 +8,7 @@ import { WorkflowStore } from "../src/config/store.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, Issue, Tracker } from "../src/domain.js";
 import { createLogger, type AppLogger } from "../src/log.js";
 import { Orchestrator } from "../src/orchestrator.js";
+import { RunStateStore, type PersistedClaim } from "../src/state/store.js";
 import { MemoryTracker } from "../src/trackers/memory.js";
 import { workspaceKey } from "../src/workspace/manager.js";
 
@@ -1722,6 +1723,241 @@ test("graceful shutdown runs after_run once before checkpointing the interrupted
   assert.deepEqual(checkpoint.claims.map(({ kind, issueId, reasonCode }) => ({ kind, issueId, reasonCode })), [
     { kind: "blocked", issueId: issue.id, reasonCode: "run_interrupted" },
   ]);
+});
+
+test("dispatch pause drains current work and holds retries and candidates until resumed", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-dispatch-pause-"));
+  const first = rawIssue("first", "FIRST-1", 1, "2025-01-01T00:00:00Z");
+  const second = rawIssue("second", "SECOND-1", 2, "2025-01-02T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [first, second] });
+  const firstStarted = deferred<void>();
+  const finishFirst = deferred<void>();
+  const seen: string[] = [];
+  const driver = new FakeDriver(async function* (context) {
+    seen.push(context.issue.id);
+    if (seen.length === 1) {
+      firstStarted.resolve();
+      await finishFirst.promise;
+    } else {
+      tracker.setIssueState(context.issue.id, "Done");
+    }
+    yield event("turn_completed");
+  });
+  const workflowPath = await writeWorkflow(directory, [first, second], { pollIntervalMs: 60_000 });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    continuationDelayMs: 0,
+  });
+
+  await orchestrator.start();
+  await firstStarted.promise;
+  assert.equal(orchestrator.snapshot().dispatchPaused, false);
+  assert.equal(orchestrator.setDispatchPaused(true), true);
+  assert.equal(orchestrator.setDispatchPaused(true), false);
+  assert.equal(orchestrator.snapshot().dispatchPaused, true);
+  assert.equal(orchestrator.isReady(), true);
+
+  finishFirst.resolve();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
+  await orchestrator.pollOnce();
+  assert.deepEqual(seen, [first.id]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
+
+  assert.equal(orchestrator.setDispatchPaused(false), true);
+  assert.equal(orchestrator.setDispatchPaused(false), false);
+  assert.equal(orchestrator.snapshot().dispatchPaused, false);
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(seen, [first.id, first.id]);
+
+  await orchestrator.stop();
+  assert.throws(() => orchestrator.setDispatchPaused(true), /stopped orchestrator/u);
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("pausing during the final candidate refresh prevents a late spawn", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-dispatch-pause-race-"));
+  let current = linearIssue();
+  const finalRefreshStarted = deferred<void>();
+  const releaseFinalRefresh = deferred<void>();
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      if (states.includes("Done")) return [];
+      return current.state === "Todo" ? [current] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      finalRefreshStarted.resolve();
+      await releaseFinalRefresh.promise;
+      return ids.includes(current.id) ? [current] : [];
+    },
+  };
+  let runs = 0;
+  const driver = new FakeDriver(async function* () {
+    runs += 1;
+    current = { ...current, state: "Done" };
+    yield event("turn_completed");
+  });
+  const workflowPath = await writeWorkflow(directory, [
+    rawIssue(current.id, current.identifier, 1, "2025-01-01T00:00:00Z"),
+  ]);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  const poll = orchestrator.pollOnce();
+  await finalRefreshStarted.promise;
+  assert.equal(orchestrator.setDispatchPaused(true), true);
+  releaseFinalRefresh.resolve();
+  await poll;
+
+  assert.equal(runs, 0);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+  assert.equal(orchestrator.setDispatchPaused(false), true);
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(runs, 1);
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("pausing after a durable pre-run save rolls back candidate and retry claims", async () => {
+  for (const kind of ["candidate", "retry"] as const) {
+    const directory = await realpath(await mkdtemp(path.join(tmpdir(), `symphony-dispatch-pause-save-${kind}-`)));
+    const issue = rawIssue(kind, `${kind.toUpperCase()}-1`, 1, "2025-01-01T00:00:00Z");
+    const tracker = new MemoryTracker({ issues: [issue] });
+    let runs = 0;
+    const driver = new FakeDriver(async function* (context) {
+      runs += 1;
+      if (kind === "retry" && runs === 1) {
+        yield event("turn_failed", { summary: "queue retry" });
+        return;
+      }
+      tracker.setIssueState(context.issue.id, "Done");
+      yield event("turn_completed");
+    });
+    const workflowPath = await writeWorkflow(directory, [issue], { durable: true });
+    let now = Date.UTC(2026, 0, 1);
+    const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+      tracker,
+      driver,
+      failureBaseDelayMs: 10,
+      now: () => now,
+    });
+    const originalSave = RunStateStore.prototype.save;
+    let releaseBlockedSave: (() => void) | undefined;
+
+    try {
+      if (kind === "retry") {
+        await orchestrator.pollOnce();
+        await orchestrator.waitForCurrentRuns();
+        now += 10;
+      }
+      const dueAt = orchestrator.snapshot().retrying[0]?.dueAt;
+      const runningSaved = deferred<void>();
+      const releaseSave = deferred<void>();
+      releaseBlockedSave = () => releaseSave.resolve();
+      let blockRunningSave = true;
+      RunStateStore.prototype.save = async function (claims) {
+        await originalSave.call(this, claims);
+        if (blockRunningSave && claims.some((claim) => claim.kind === "running")) {
+          blockRunningSave = false;
+          runningSaved.resolve();
+          await releaseSave.promise;
+        }
+      };
+
+      const poll = orchestrator.pollOnce();
+      await withTimeout(runningSaved.promise, 1_000);
+      assert.equal(orchestrator.setDispatchPaused(true), true, kind);
+      releaseSave.resolve();
+      await poll;
+
+      assert.equal(runs, kind === "candidate" ? 0 : 1, kind);
+      const paused = orchestrator.snapshot();
+      assert.equal(paused.running.length, 0, kind);
+      assert.equal(paused.retrying.length, kind === "candidate" ? 0 : 1, kind);
+      assert.equal(paused.retrying[0]?.dueAt, dueAt, kind);
+      const checkpoint = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as {
+        claims: PersistedClaim[];
+      };
+      assert.deepEqual(
+        checkpoint.claims.map((claim) => ({ kind: claim.kind, issueId: claim.issueId })),
+        kind === "candidate" ? [] : [{ kind: "retrying", issueId: issue.id }],
+        kind,
+      );
+
+      assert.equal(orchestrator.setDispatchPaused(false), true, kind);
+      await orchestrator.pollOnce();
+      await orchestrator.waitForCurrentRuns();
+      assert.equal(runs, kind === "candidate" ? 1 : 2, kind);
+    } finally {
+      releaseBlockedSave?.();
+      RunStateStore.prototype.save = originalSave;
+      await orchestrator.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a paused overdue retry keeps its due time without spinning the scheduler", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-dispatch-pause-timer-"));
+  const issue = rawIssue("paused-retry", "PAUSED-RETRY-1", 1, "2025-01-01T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [issue] });
+  let runs = 0;
+  const driver = new FakeDriver(async function* () {
+    runs += 1;
+    yield event("turn_failed", { summary: "retry later" });
+  });
+  const workflowPath = await writeWorkflow(directory, [issue], { pollIntervalMs: 30 });
+  let nowCalls = 0;
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker,
+    driver,
+    failureBaseDelayMs: 20,
+    now: () => {
+      nowCalls += 1;
+      return Date.now();
+    },
+  });
+
+  await orchestrator.start();
+  await orchestrator.waitForCurrentRuns();
+  const dueAt = orchestrator.snapshot().retrying[0]?.dueAt;
+  assert.equal(orchestrator.setDispatchPaused(true), true);
+  nowCalls = 0;
+  await delay(110);
+
+  assert.equal(runs, 1);
+  assert.equal(orchestrator.snapshot().retrying[0]?.dueAt, dueAt);
+  assert.ok(nowCalls < 20, `paused scheduler called the clock ${nowCalls} times`);
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("dispatch pause is not persisted", async () => {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "symphony-dispatch-pause-state-")));
+  const workflowPath = await writeWorkflow(directory, [], { durable: true });
+  const first = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker({ issues: [] }),
+    driver: new FakeDriver(async function* () {
+      assert.fail("no work should be dispatched");
+    }),
+  });
+  await first.initialize();
+  assert.equal(first.setDispatchPaused(true), true);
+  await first.stop();
+  assert.doesNotMatch(await readFile(path.join(directory, "runs.json"), "utf8"), /dispatchPaused/u);
+
+  const replacement = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker({ issues: [] }),
+    driver: new FakeDriver(async function* () {
+      assert.fail("no work should be dispatched");
+    }),
+  });
+  await replacement.initialize();
+  assert.equal(replacement.snapshot().dispatchPaused, false);
+  await replacement.stop();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("an early continuation retry wakes the scheduler before the regular poll interval", async () => {

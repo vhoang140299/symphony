@@ -86,6 +86,7 @@ async function main(args: string[]): Promise<void> {
           },
           (identifier) => orchestrator.requestBlockedRetry(identifier),
           httpHost,
+          (paused) => orchestrator.setDispatchPaused(paused),
         );
   let stopPromise: Promise<void> | undefined;
   const requestStop = () => {

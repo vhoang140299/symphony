@@ -16,6 +16,7 @@ export function createOperationsServer(
   requestRefresh?: () => void,
   retryBlocked?: (issueIdentifier: string) => Promise<boolean>,
   listenerHost = "127.0.0.1",
+  setDispatchPaused?: (paused: boolean) => boolean,
 ): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 1_024, requestTimeout: 5_000 });
   const dashboardRoot = resolveDashboardRoot();
@@ -48,7 +49,10 @@ export function createOperationsServer(
   app.setErrorHandler((_error, _request, reply) => reply.code(500).send({ status: "error" }));
   app.setNotFoundHandler((request, reply) => {
     const requestPath = request.url.split("?", 1)[0];
-    const allowed = requestPath === "/api/v1/refresh" || /^\/api\/v1\/[^/]+\/retry$/u.test(requestPath ?? "")
+    const allowed = requestPath === "/api/v1/refresh" ||
+        requestPath === "/api/v1/pause" ||
+        requestPath === "/api/v1/resume" ||
+        /^\/api\/v1\/[^/]+\/retry$/u.test(requestPath ?? "")
       ? "POST"
       : requestPath === "/" ||
           requestPath === "/assets" ||
@@ -105,6 +109,7 @@ export function createOperationsServer(
       generatedAt: new Date().toISOString(),
       startedAt: current.startedAt,
       lastPollAt: current.lastPollAt,
+      dispatchPaused: current.dispatchPaused === true,
       counts: {
         running: current.running.length,
         retrying: current.retrying.length,
@@ -152,6 +157,37 @@ export function createOperationsServer(
     reply.code(202);
     return { queued: true };
   });
+  for (const [route, paused] of [["/api/v1/pause", true], ["/api/v1/resume", false]] as const) {
+    app.get(route, (_request, reply) =>
+      reply
+        .header("allow", "POST")
+        .code(405)
+        .send(errorPayload("method_not_allowed", "Method not allowed")));
+    app.post(route, (request, reply) => {
+      if (!isTrustedOperation(request.headers.host, request.headers.origin, request.headers["x-symphony-operation"])) {
+        return reply.code(403).send(errorPayload("forbidden", "Request not allowed"));
+      }
+      if (!isReady() || setDispatchPaused === undefined) {
+        return reply
+          .code(503)
+          .send(errorPayload("orchestrator_unavailable", "Orchestrator is unavailable"));
+      }
+      if (!paused) {
+        if (requestRefresh === undefined) {
+          return reply
+            .code(503)
+            .send(errorPayload("orchestrator_unavailable", "Orchestrator is unavailable"));
+        }
+        const changed = setDispatchPaused(false);
+        requestRefresh();
+        reply.code(202);
+        return { dispatchPaused: false, changed };
+      }
+      const changed = setDispatchPaused(true);
+      reply.code(202);
+      return { dispatchPaused: true, changed };
+    });
+  }
   app.post<{ Params: { issue_identifier: string } }>(
     "/api/v1/:issue_identifier/retry",
     async (request, reply) => {
