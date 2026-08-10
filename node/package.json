@@ -1,7 +1,22 @@
 {
   "name": "@ai-symphony/node",
   "version": "0.3.0",
-  "private": true,
+  "description": "TypeScript implementation of the Symphony coding-agent orchestrator",
+  "keywords": [
+    "ai",
+    "automation",
+    "coding-agent",
+    "orchestrator"
+  ],
+  "homepage": "https://github.com/vhoang140299/symphony/tree/main/node#readme",
+  "bugs": {
+    "url": "https://github.com/vhoang140299/symphony/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vhoang140299/symphony.git",
+    "directory": "node"
+  },
   "packageManager": "pnpm@11.20.0",
   "type": "module",
   "license": "Apache-2.0",
@@ -13,11 +28,26 @@
   "bin": {
     "symphony-node": "dist/src/cli.js"
   },
+  "files": [
+    "dist/src",
+    "codex-symphony-wrapper.mjs",
+    "NOTICE",
+    "WORKFLOW.md",
+    "WORKFLOW.codex.github.md",
+    "WORKFLOW.github.md"
+  ],
+  "publishConfig": {
+    "executableFiles": [
+      "./codex-symphony-wrapper.mjs"
+    ]
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "pnpm run build",
     "start": "node dist/src/cli.js",
     "test": "pnpm run build && vitest run",
+    "test:pack": "node scripts/packaging-smoke.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
