@@ -58,6 +58,7 @@ interface DashboardState {
 }
 
 const unavailableMessage = "Dashboard data is temporarily unavailable. Retrying automatically.";
+const actionFailedMessage = "The request could not be completed. Refresh and try again.";
 const numberFormatter = new Intl.NumberFormat();
 const currencyFormatter = new Intl.NumberFormat(undefined, {
   style: "currency",
@@ -75,6 +76,7 @@ function App() {
   const [ready, setReady] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [retryingBlockedIssue, setRetryingBlockedIssue] = useState<string | null>(null);
   const activeController = useRef<AbortController | null>(null);
 
   const loadState = useCallback(async (replaceActive = false) => {
@@ -124,6 +126,20 @@ function App() {
       setError(unavailableMessage);
     } finally {
       setRefreshing(false);
+    }
+  }
+
+  async function retryBlockedIssue(issue: BlockedIssue) {
+    setRetryingBlockedIssue(issue.issueId);
+    setError(null);
+    try {
+      const response = await fetch(`/api/v1/${encodeURIComponent(issue.identifier)}/retry`, { method: "POST" });
+      if (!response.ok) throw new Error("blocked retry request failed");
+      await loadState(true);
+    } catch {
+      setError(actionFailedMessage);
+    } finally {
+      setRetryingBlockedIssue(null);
     }
   }
 
@@ -246,6 +262,7 @@ function App() {
                     <tr>
                       <th scope="col">Issue</th>
                       <th scope="col">Blocked since</th>
+                      <th scope="col">Action</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -253,6 +270,19 @@ function App() {
                       <tr key={issue.issueId}>
                         <td><IssueReference identifier={issue.identifier} url={issue.issueUrl} /></td>
                         <td><Timestamp value={issue.blockedAt} /></td>
+                        <td>
+                          <button
+                            className="table-action"
+                            type="button"
+                            onClick={() => void retryBlockedIssue(issue)}
+                            disabled={retryingBlockedIssue !== null || ready !== true}
+                            aria-busy={retryingBlockedIssue === issue.issueId}
+                            aria-label={`Retry blocked issue ${issue.identifier} once`}
+                            title="Schedule one additional run; any configured retry label is consumed first"
+                          >
+                            {retryingBlockedIssue === issue.issueId ? "Retrying…" : "Retry once"}
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
