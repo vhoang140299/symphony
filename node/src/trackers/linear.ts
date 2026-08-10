@@ -672,8 +672,8 @@ function optionalAssignee(value: unknown): string | null {
   return assignee.toLowerCase() === "me" ? "me" : assignee;
 }
 
-function assigneeFilter(assignee: string | null): Record<string, unknown> | null {
-  if (assignee === null) return null;
+function assigneeFilter(assignee: string | null): Record<string, unknown> {
+  if (assignee === null) return {};
   return assignee === "me" ? { isMe: { eq: true } } : { id: { eq: assignee } };
 }
 
