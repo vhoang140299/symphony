@@ -52,6 +52,7 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
       continuation: 1,
       dueAtMs: 1_234,
       reason: "continuation",
+      error: null,
     },
     {
       kind: "retrying",
@@ -60,6 +61,7 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
       continuation: 0,
       dueAtMs: 5_678.5,
       reason: "failure",
+      error: "Host delivery failed",
       pendingDelivery: { completion, idempotencyKey: randomUUID() },
     },
     {
@@ -84,6 +86,23 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
   assert.deepEqual(Object.keys(envelope), ["version", "scope", "claims"]);
   assert.equal(envelope.version, 1);
   assert.equal(envelope.scope, scope);
+});
+
+posixTest("loads legacy retries without an error as null", async () => {
+  const { filePath } = await fixture();
+  const store = new RunStateStore(filePath, scope);
+  await store.acquireLease();
+  const legacy = {
+    kind: "retrying",
+    issueId: "legacy-retry",
+    attempt: 1,
+    continuation: 0,
+    dueAtMs: 1_234,
+    reason: "failure",
+  } as const;
+  await writeFile(filePath, `${JSON.stringify({ version: 1, scope, claims: [legacy] })}\n`, { mode: 0o600 });
+
+  assert.deepEqual(await store.load(), [{ ...legacy, error: null }]);
 });
 
 posixTest("inspects missing state without creating its parent or file", async () => {
@@ -252,6 +271,15 @@ posixTest("validates claim bounds, delivery UUIDs, and completion payloads", asy
     },
     { kind: "retrying", issueId: "retry", attempt: null, continuation: 0, dueAtMs: 0, reason: "failure" },
     { kind: "retrying", issueId: "retry", attempt: 0, continuation: 0, dueAtMs: invalidTimestampMs, reason: "failure" },
+    {
+      kind: "retrying",
+      issueId: "retry",
+      attempt: 0,
+      continuation: 0,
+      dueAtMs: 0,
+      reason: "failure",
+      error: "private provider failure",
+    },
     { kind: "blocked", issueId: "blocked", attempt: null, continuation: 0, blockedAtMs: invalidTimestampMs, summary: "waiting" },
     { kind: "blocked", issueId: "blocked", attempt: null, continuation: 0, blockedAtMs: 0, summary: "x".repeat(2_001) },
   ];

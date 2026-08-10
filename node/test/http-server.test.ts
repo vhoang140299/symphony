@@ -47,6 +47,7 @@ test("operations endpoints expose health and aggregate status without run detail
         attempt: 2,
         dueAt: "2026-08-09T01:02:00.000Z",
         reason: "failure",
+        error: "Agent run failed",
       },
     ],
     blocked: [
@@ -225,6 +226,7 @@ test("operations endpoints expose health and aggregate status without run detail
           attempt: 2,
           dueAt: "2026-08-09T01:02:00.000Z",
           reason: "failure",
+          error: "Agent run failed",
         },
       ],
       blocked: [
@@ -260,15 +262,23 @@ test("operations endpoints expose health and aggregate status without run detail
       secret: "private malformed rate limit",
     } as unknown as OrchestratorSnapshot["latestRateLimits"];
     snapshot.dispatchPaused = "secret malformed pause state" as unknown as boolean;
-    const stateWithMalformedRateLimit = await server.inject({ method: "GET", url: "/api/v1/state" });
-    assert.equal(stateWithMalformedRateLimit.statusCode, 200);
-    assert.equal(stateWithMalformedRateLimit.json().rateLimit, null);
-    assert.equal(stateWithMalformedRateLimit.json().dispatchPaused, false);
+    snapshot.retrying[0]!.error =
+      "private malformed retry error" as unknown as OrchestratorSnapshot["retrying"][number]["error"];
+    const stateWithMalformedValues = await server.inject({ method: "GET", url: "/api/v1/state" });
+    assert.equal(stateWithMalformedValues.statusCode, 200);
+    assert.equal(stateWithMalformedValues.json().rateLimit, null);
+    assert.equal(stateWithMalformedValues.json().dispatchPaused, false);
+    assert.equal(stateWithMalformedValues.json().retrying[0].error, null);
     assert.doesNotMatch(
-      stateWithMalformedRateLimit.body,
-      /secret-status|secret-window|private malformed|secret malformed pause/iu,
+      stateWithMalformedValues.body,
+      /secret-status|secret-window|private malformed|secret malformed pause|malformed retry error/iu,
     );
+    const retryWithMalformedError = await server.inject({ method: "GET", url: "/api/v1/RETRY-1" });
+    assert.equal(retryWithMalformedError.statusCode, 200);
+    assert.equal(retryWithMalformedError.json().error, null);
+    assert.doesNotMatch(retryWithMalformedError.body, /malformed retry error/iu);
     snapshot.dispatchPaused = false;
+    snapshot.retrying[0]!.error = "Agent run failed";
 
     for (const [identifier, status, row] of [
       ["acme/widget#7", "running", stateBody.running[0]],

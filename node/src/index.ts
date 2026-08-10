@@ -3,6 +3,7 @@ export { CodexAgentDriver, normalizeCodexUsage } from "./agents/codex.js";
 export { parseWorkflowConfig, type WorkflowConfig } from "./config/schema.js";
 export { WorkflowStore } from "./config/store.js";
 export { loadWorkflow, renderPrompt, type WorkflowDefinition } from "./config/workflow.js";
+export { normalizeRetryError } from "./domain.js";
 export type {
   AgentCompletion,
   AgentDriver,
@@ -19,6 +20,7 @@ export type {
   IssueStateMutationMode,
   PublishChangeInput,
   PublishedChange,
+  RetryError,
   Tracker,
 } from "./domain.js";
 export { createLogger, type AppLogger } from "./log.js";

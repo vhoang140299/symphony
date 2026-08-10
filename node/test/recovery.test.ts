@@ -281,6 +281,7 @@ posixTest("restores an already-admitted manual retry even when its attempt is at
       continuation: 0,
       dueAtMs: 0,
       reason: "continuation",
+      error: null,
     },
   ]);
   const contexts: AgentRunContext[] = [];
@@ -292,6 +293,8 @@ posixTest("restores an already-admitted manual retry even when its attempt is at
     }),
   });
 
+  await orchestrator.initialize();
+  assert.equal(orchestrator.snapshot().retrying[0]?.error, null);
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
 
@@ -418,6 +421,7 @@ posixTest("persists a partial delivery and resumes it with the same comment key 
   assert.deepEqual(checkpointKeys, commentKeys);
   const [pendingRetry] = await store.load();
   assert.equal(pendingRetry?.kind, "retrying");
+  assert.equal(pendingRetry?.kind === "retrying" ? pendingRetry.error : undefined, "Host delivery failed");
   assert.equal(
     pendingRetry !== undefined && "pendingDelivery" in pendingRetry
       ? pendingRetry.pendingDelivery?.idempotencyKey
@@ -637,6 +641,8 @@ posixTest("does not create a workspace or invoke the model for an undeliverable 
     failureBaseDelayMs: 10,
   });
 
+  await orchestrator.initialize();
+  assert.equal(orchestrator.snapshot().retrying[0]?.error, "Host delivery failed");
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
 

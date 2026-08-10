@@ -117,6 +117,19 @@ export function normalizeAgentRateLimit(value: unknown): AgentRateLimit | null {
   };
 }
 
+const retryErrors = [
+  "Agent run failed",
+  "Host delivery failed",
+  "Tracker refresh failed",
+  "No available orchestrator slots",
+] as const;
+
+export type RetryError = (typeof retryErrors)[number];
+
+export function normalizeRetryError(value: unknown): RetryError | null {
+  return retryErrors.find((candidate) => candidate === value) ?? null;
+}
+
 export const blockedReasonCodes = [
   "agent_reported",
   "operator_action_required",

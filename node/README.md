@@ -171,9 +171,11 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
 - `GET /api/v1/state`: reports privacy-filtered running, retrying, and blocked entries, including
   issue IDs, identifiers and URLs, lifecycle timestamps, turn counts, safe last-event types,
   per-run token usage, retry details, normalized blocked reason codes, and aggregate token/runtime
-  totals. `dispatchPaused` reports whether new dispatch is paused. Its `rateLimit` field is `null`
-  when unavailable; otherwise it contains only `status`, `rateLimitType`, and `utilization`. Blocked
-  reason codes are `agent_reported`, `operator_action_required`,
+  totals. A retry `error` is `null`, `Agent run failed`, `Host delivery failed`,
+  `Tracker refresh failed`, or `No available orchestrator slots`; it never contains raw provider
+  or agent errors. `dispatchPaused` reports whether new dispatch is paused. Its
+  `rateLimit` field is `null` when unavailable; otherwise it contains only `status`, `rateLimitType`,
+  and `utilization`. Blocked reason codes are `agent_reported`, `operator_action_required`,
   `retry_budget_exhausted`, `run_interrupted`, `orchestrator_failure`, or `unknown`.
 - `GET /api/v1/<issue_identifier>`: returns the same allow-listed details for one currently running,
   retrying, or blocked issue, or a JSON `404` when it is absent.

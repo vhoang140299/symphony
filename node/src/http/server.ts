@@ -3,7 +3,7 @@ import { isIPv4 } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
-import { normalizeAgentRateLimit } from "../domain.js";
+import { normalizeAgentRateLimit, normalizeRetryError } from "../domain.js";
 import type { OrchestratorSnapshot } from "../orchestrator.js";
 
 const contentSecurityPolicy =
@@ -277,6 +277,7 @@ function retryPayload(entry: OrchestratorSnapshot["retrying"][number]) {
     attempt: entry.attempt,
     dueAt: entry.dueAt,
     reason: entry.reason,
+    error: normalizeRetryError(entry.error),
   };
 }
 
