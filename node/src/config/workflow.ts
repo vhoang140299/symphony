@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { Liquid } from "liquidjs";
+import { Liquid, ParseError, TokenizationError, TokenKind } from "liquidjs";
 import { parse as parseYaml } from "yaml";
 import type { Issue } from "../domain.js";
 import { parseWorkflowConfig, type WorkflowConfig } from "./schema.js";
@@ -13,13 +13,32 @@ export interface WorkflowDefinition {
   promptTemplate: string;
 }
 
+export type WorkflowErrorCode =
+  | "missing_workflow_file"
+  | "workflow_parse_error"
+  | "workflow_front_matter_not_a_map"
+  | "template_parse_error"
+  | "template_render_error";
+
+export class WorkflowError extends Error {
+  constructor(readonly code: WorkflowErrorCode, message: string) {
+    super(message);
+    this.name = "WorkflowError";
+  }
+}
+
 const defaultPrompt = "You are working on issue {{ issue.identifier }}: {{ issue.title }}\n\n{{ issue.description }}";
 const liquid = new Liquid({ strictVariables: true, strictFilters: true });
 
 export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefinition> {
   const absolutePath = path.resolve(workflowPath);
   const workflowDirectory = path.dirname(absolutePath);
-  const content = await readFile(absolutePath, "utf8");
+  let content: string;
+  try {
+    content = await readFile(absolutePath, "utf8");
+  } catch {
+    throw new WorkflowError("missing_workflow_file", "Workflow file could not be read");
+  }
   const { config: rawConfig, promptTemplate } = parseWorkflowDocument(content);
   const config = parseWorkflowConfig(rawConfig);
   config.workspace.root = resolvePath(config.workspace.root, workflowDirectory);
@@ -48,21 +67,60 @@ export function parseWorkflowDocument(content: string): { config: unknown; promp
 
   const closingIndex = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
   if (closingIndex === -1) {
-    throw new Error("WORKFLOW.md starts with YAML front matter but has no closing ---");
+    throw new WorkflowError(
+      "workflow_parse_error",
+      "Workflow YAML front matter has no closing delimiter",
+    );
   }
 
   const yaml = lines.slice(1, closingIndex).join("\n");
+  let config: unknown;
+  try {
+    config = yaml.trim() === "" ? {} : parseYaml(yaml);
+  } catch {
+    throw new WorkflowError("workflow_parse_error", "Workflow YAML front matter could not be parsed");
+  }
+  if (!isRecord(config)) {
+    throw new WorkflowError(
+      "workflow_front_matter_not_a_map",
+      "Workflow YAML front matter must be a map",
+    );
+  }
+
   return {
-    config: parseYaml(yaml) ?? {},
+    config,
     promptTemplate: lines.slice(closingIndex + 1).join("\n").trim(),
   };
 }
 
 export async function renderPrompt(workflow: WorkflowDefinition, issue: Issue, attempt: number | null): Promise<string> {
-  return liquid.parseAndRender(workflow.promptTemplate, {
-    issue: issueForTemplate(issue),
-    attempt,
-  });
+  let template;
+  try {
+    template = liquid.parse(workflow.promptTemplate);
+  } catch (error) {
+    if (isOutputInterpolationError(error)) {
+      throw new WorkflowError("template_render_error", "Workflow prompt template could not be rendered");
+    }
+    throw new WorkflowError("template_parse_error", "Workflow prompt template could not be parsed");
+  }
+
+  try {
+    return await liquid.render(template, {
+      issue: issueForTemplate(issue),
+      attempt,
+    });
+  } catch {
+    throw new WorkflowError("template_render_error", "Workflow prompt template could not be rendered");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOutputInterpolationError(error: unknown): boolean {
+  return (error instanceof ParseError && error.token.kind === TokenKind.Output) ||
+    (error instanceof TokenizationError && error.token.getText().startsWith("{{"));
 }
 
 function resolvePath(value: string, workflowDirectory: string): string {
