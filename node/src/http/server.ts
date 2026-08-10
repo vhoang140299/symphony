@@ -12,6 +12,7 @@ export function createOperationsServer(
   snapshot: () => OrchestratorSnapshot,
   isReady: () => boolean,
   requestRefresh?: () => void,
+  retryBlocked?: (issueIdentifier: string) => Promise<boolean>,
 ): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 1_024, requestTimeout: 5_000 });
   const dashboardRoot = resolveDashboardRoot();
@@ -27,7 +28,7 @@ export function createOperationsServer(
   app.setErrorHandler((_error, _request, reply) => reply.code(500).send({ status: "error" }));
   app.setNotFoundHandler((request, reply) => {
     const requestPath = request.url.split("?", 1)[0];
-    const allowed = requestPath === "/api/v1/refresh"
+    const allowed = requestPath === "/api/v1/refresh" || /^\/api\/v1\/[^/]+\/retry$/u.test(requestPath ?? "")
       ? "POST"
       : requestPath === "/" ||
           requestPath === "/assets" ||
@@ -120,6 +121,21 @@ export function createOperationsServer(
     reply.code(202);
     return { queued: true };
   });
+  app.post<{ Params: { issue_identifier: string } }>(
+    "/api/v1/:issue_identifier/retry",
+    async (request, reply) => {
+      if (!isReady() || retryBlocked === undefined) {
+        return reply
+          .code(503)
+          .send(errorPayload("orchestrator_unavailable", "Orchestrator is unavailable"));
+      }
+      if (!(await retryBlocked(request.params.issue_identifier))) {
+        return reply.code(404).send(errorPayload("issue_not_found", "Issue not found"));
+      }
+      reply.code(202);
+      return { queued: true };
+    },
+  );
 
   return app;
 }

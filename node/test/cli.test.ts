@@ -88,6 +88,11 @@ test("workflow server.port 0 accepts a CLI host override and logs the actual eph
     const refresh = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/refresh`, { method: "POST" });
     assert.equal(refresh.status, 202);
     assert.deepEqual(await refresh.json(), { queued: true });
+    const retry = await fetch(`http://127.0.0.1:${String(started.http_port)}/api/v1/MISSING-1/retry`, {
+      method: "POST",
+    });
+    assert.equal(retry.status, 404);
+    assert.deepEqual(await retry.json(), { error: { code: "issue_not_found", message: "Issue not found" } });
     assert.equal(daemon.child.kill("SIGTERM"), true);
     assert.deepEqual(await daemon.closed, { code: 0, signal: null });
   } finally {

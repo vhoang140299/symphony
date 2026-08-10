@@ -151,6 +151,13 @@ button:disabled {
   opacity: 0.62;
 }
 
+.table-action {
+  min-height: 2.15rem;
+  padding: 0.4rem 0.7rem;
+  white-space: nowrap;
+  font-size: 0.8rem;
+}
+
 .status-line {
   display: flex;
   flex-wrap: wrap;

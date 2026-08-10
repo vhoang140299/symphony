@@ -84,6 +84,7 @@ async function main(args: string[]): Promise<void> {
           () => {
             void orchestrator.pollOnce().catch(() => undefined);
           },
+          (identifier) => orchestrator.requestBlockedRetry(identifier),
         );
   let stopPromise: Promise<void> | undefined;
   const requestStop = () => {

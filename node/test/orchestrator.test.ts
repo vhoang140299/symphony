@@ -1134,6 +1134,244 @@ test("max_attempts blocks continuations while manual retry preserves the session
   await orchestrator.stop();
 });
 
+test("manual retry refreshes a blocked issue without requiring its configured retry label", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-manual-retry-no-label-"));
+  const current = githubIssue();
+  let idRefreshes = 0;
+  let pauseRefresh = false;
+  let mutationCalls = 0;
+  let runs = 0;
+  const refreshStarted = deferred<void>();
+  const releaseRefresh = deferred<void>();
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      idRefreshes += 1;
+      if (pauseRefresh) {
+        pauseRefresh = false;
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      }
+      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async mutateIssue() {
+      mutationCalls += 1;
+    },
+  };
+  const driver = new FakeDriver(async function* () {
+    runs += 1;
+    yield event("turn_failed", { summary: "failed" });
+  });
+  const workflowPath = await writeDeliveryWorkflow(directory, "claude", {
+    delivery: false,
+    maxAttempts: 1,
+    retryLabel: "retry-me",
+  });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+  idRefreshes = 0;
+
+  pauseRefresh = true;
+  const poll = orchestrator.pollOnce();
+  await refreshStarted.promise;
+  const manualRetry = orchestrator.requestBlockedRetry(current.identifier);
+  releaseRefresh.resolve();
+
+  assert.equal(await manualRetry, true);
+  await poll;
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(idRefreshes, 3);
+  assert.equal(mutationCalls, 0);
+  assert.equal(runs, 2);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+  await orchestrator.stop();
+});
+
+test("reconciliation and manual retry consume one retry label and schedule one run", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-manual-retry-race-"));
+  let current = githubIssue();
+  let pauseRefresh = false;
+  let mutationCalls = 0;
+  let runs = 0;
+  const refreshStarted = deferred<void>();
+  const releaseRefresh = deferred<void>();
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      if (pauseRefresh) {
+        pauseRefresh = false;
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      }
+      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async mutateIssue(_target, mutation) {
+      assert.equal(mutation.kind, "remove_label");
+      if (mutation.kind !== "remove_label") throw new Error("unexpected mutation");
+      mutationCalls += 1;
+      current = {
+        ...current,
+        labels: current.labels.filter((label) => label.trim().toLowerCase() !== mutation.label.trim().toLowerCase()),
+      };
+    },
+  };
+  const driver = new FakeDriver(async function* () {
+    runs += 1;
+    yield event("turn_failed", { summary: `failed-${runs}` });
+  });
+  const workflowPath = await writeDeliveryWorkflow(directory, "claude", {
+    delivery: false,
+    maxAttempts: 1,
+    retryLabel: "retry-me",
+  });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  current = { ...current, labels: [...current.labels, "ReTrY-Me"] };
+  pauseRefresh = true;
+  const manualRetry = orchestrator.requestBlockedRetry(current.identifier);
+  await refreshStarted.promise;
+  const poll = orchestrator.pollOnce();
+  releaseRefresh.resolve();
+
+  assert.equal(await manualRetry, true);
+  await poll;
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(mutationCalls, 1);
+  assert.equal(runs, 2);
+  assert.deepEqual(current.labels, ["symphony"]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.equal(mutationCalls, 1);
+  assert.equal(runs, 2);
+  await orchestrator.stop();
+});
+
+test("manual retry releases stale blocked issues and only cleans terminal workspaces", async () => {
+  const scenarios = [
+    { name: "missing", update: () => undefined, workspaceRemoved: false },
+    { name: "unroutable", update: (issue: Issue) => ({ ...issue, dispatchable: false }), workspaceRemoved: false },
+    { name: "terminal", update: (issue: Issue) => ({ ...issue, state: "closed" }), workspaceRemoved: true },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const directory = await mkdtemp(path.join(tmpdir(), `symphony-manual-retry-${scenario.name}-`));
+    let current: Issue | undefined = githubIssue();
+    let runs = 0;
+    const tracker: Tracker = {
+      async fetchIssuesByStates(states) {
+        return current !== undefined && states.includes(current.state)
+          ? [{ ...current, labels: [...current.labels] }]
+          : [];
+      },
+      async fetchIssuesByIds(ids) {
+        return current !== undefined && ids.includes(current.id)
+          ? [{ ...current, labels: [...current.labels] }]
+          : [];
+      },
+      async mutateIssue() {},
+    };
+    const driver = new FakeDriver(async function* () {
+      runs += 1;
+      yield event("turn_failed", { summary: "failed" });
+    });
+    const workflowPath = await writeDeliveryWorkflow(directory, "claude", {
+      delivery: false,
+      maxAttempts: 1,
+      retryLabel: "retry-me",
+    });
+    const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+    await orchestrator.pollOnce();
+    await orchestrator.waitForCurrentRuns();
+    const issue = current;
+    assert.ok(issue);
+    const workspacePath = path.join(directory, "workspaces", workspaceKey(issue.identifier));
+    await access(workspacePath);
+    current = scenario.update(issue);
+
+    assert.equal(await orchestrator.requestBlockedRetry(issue.identifier), false, scenario.name);
+    assert.equal(runs, 1, scenario.name);
+    assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 }, scenario.name);
+    if (scenario.workspaceRemoved) await assert.rejects(access(workspacePath));
+    else await access(workspacePath);
+    await orchestrator.stop();
+  }
+});
+
+test("stop waits for a public blocked transition and prevents post-shutdown cleanup or scheduling", async () => {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "symphony-manual-retry-stop-")));
+  let current = githubIssue();
+  let pauseRefresh = false;
+  let runs = 0;
+  const refreshStarted = deferred<void>();
+  const releaseRefresh = deferred<void>();
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async fetchIssuesByIds(ids) {
+      if (pauseRefresh) {
+        pauseRefresh = false;
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      }
+      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+    },
+    async mutateIssue() {
+      throw new Error("retry label must not be consumed during shutdown");
+    },
+  };
+  const driver = new FakeDriver(async function* () {
+    runs += 1;
+    yield event("turn_failed", { summary: "failed" });
+  });
+  const workflowPath = await writeDeliveryWorkflow(directory, "claude", {
+    delivery: false,
+    durable: true,
+    maxAttempts: 1,
+    retryLabel: "retry-me",
+  });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  const workspacePath = path.join(directory, "workspaces", workspaceKey(current.identifier));
+  current = { ...current, state: "closed", labels: [...current.labels, "retry-me"] };
+  pauseRefresh = true;
+  const retry = orchestrator.requestBlockedRetry(current.identifier);
+  await refreshStarted.promise;
+  let stopped = false;
+  const stop = orchestrator.stop().then(() => {
+    stopped = true;
+  });
+  await delay(0);
+  assert.equal(stopped, false);
+  releaseRefresh.resolve();
+
+  assert.equal(await retry, false);
+  await stop;
+  assert.equal(stopped, true);
+  assert.equal(runs, 1);
+  await access(workspacePath);
+  const checkpoint = JSON.parse(await readFile(path.join(directory, "runs.json"), "utf8")) as {
+    claims: Array<{ kind: string; issueId: string }>;
+  };
+  assert.deepEqual(checkpoint.claims.map(({ kind, issueId }) => ({ kind, issueId })), [
+    { kind: "blocked", issueId: current.id },
+  ]);
+});
+
 test("a blocked retry label is consumed once before a captured-config manual run", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-control-retry-"));
   let current = githubIssue();
@@ -1730,7 +1968,13 @@ async function writeLinearDeliveryWorkflow(
 async function writeDeliveryWorkflow(
   directory: string,
   runtimeKind: "claude" | "codex",
-  options: { delivery?: boolean; maxAttempts?: number; retryLabel?: string; stallTimeoutMs?: number } = {},
+  options: {
+    delivery?: boolean;
+    durable?: boolean;
+    maxAttempts?: number;
+    retryLabel?: string;
+    stallTimeoutMs?: number;
+  } = {},
 ): Promise<string> {
   const workflowPath = path.join(directory, "WORKFLOW.md");
   const config = {
@@ -1746,6 +1990,7 @@ async function writeDeliveryWorkflow(
     polling: { interval_ms: 60_000 },
     workspace: { root: "./workspaces" },
     hooks: { timeout_ms: 1_000 },
+    ...(options.durable === true ? { state: { path: "./runs.json" } } : {}),
     agent: {
       max_concurrent_agents: 1,
       max_turns: 1,

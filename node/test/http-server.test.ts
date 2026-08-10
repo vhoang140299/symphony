@@ -6,6 +6,7 @@ import type { OrchestratorSnapshot } from "../src/orchestrator.js";
 test("operations endpoints expose health and aggregate status without run details", async () => {
   let ready = false;
   let refreshes = 0;
+  const retryRequests: string[] = [];
   const snapshot: OrchestratorSnapshot = {
     startedAt: "2026-08-09T01:00:00.000Z",
     lastPollAt: "2026-08-09T01:01:00.000Z",
@@ -69,6 +70,10 @@ test("operations endpoints expose health and aggregate status without run detail
     () => ready,
     () => {
       refreshes += 1;
+    },
+    async (identifier) => {
+      retryRequests.push(identifier);
+      return identifier === "BLOCKED-1";
     },
   );
 
@@ -222,6 +227,16 @@ test("operations endpoints expose health and aggregate status without run detail
     assert.equal(missing.statusCode, 404);
     assert.deepEqual(missing.json(), { error: { code: "issue_not_found", message: "Issue not found" } });
 
+    const retry = await server.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry" });
+    assert.equal(retry.statusCode, 202);
+    assert.deepEqual(retry.json(), { queued: true });
+    const retryMissing = await server.inject({ method: "POST", url: "/api/v1/MISSING-1/retry" });
+    assert.equal(retryMissing.statusCode, 404);
+    assert.deepEqual(retryMissing.json(), {
+      error: { code: "issue_not_found", message: "Issue not found" },
+    });
+    assert.deepEqual(retryRequests, ["BLOCKED-1", "MISSING-1"]);
+
     const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh" });
     assert.equal(refresh.statusCode, 202);
     assert.equal(refresh.headers["cache-control"], "no-store");
@@ -230,6 +245,8 @@ test("operations endpoints expose health and aggregate status without run detail
 
     for (const [method, url, allow] of [
       ["GET", "/api/v1/refresh", "POST"],
+      ["GET", "/api/v1/BLOCKED-1/retry", "POST"],
+      ["DELETE", "/api/v1/BLOCKED-1/retry", "POST"],
       ["POST", "/status", "GET"],
       ["POST", "/", "GET"],
       ["POST", "/assets", "GET"],
@@ -277,6 +294,9 @@ test("operations server does not expose internal status errors", async () => {
     () => {
       throw new Error("secret refresh detail");
     },
+    async () => {
+      throw new Error("secret retry detail");
+    },
   );
 
   try {
@@ -290,6 +310,10 @@ test("operations server does not expose internal status errors", async () => {
     assert.equal(refresh.statusCode, 500);
     assert.deepEqual(refresh.json(), { status: "error" });
     assert.doesNotMatch(refresh.body, /secret|refresh detail/iu);
+    const retry = await server.inject({ method: "POST", url: "/api/v1/SECRET-1/retry" });
+    assert.equal(retry.statusCode, 500);
+    assert.deepEqual(retry.json(), { status: "error" });
+    assert.doesNotMatch(retry.body, /secret|retry detail/iu);
   } finally {
     await server.close();
   }
@@ -302,17 +326,24 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
   );
   let ready = true;
   let refreshes = 0;
+  let retries = 0;
   const server = createOperationsServer(
     () => assert.fail("snapshot must not be called"),
     () => ready,
     () => {
       refreshes += 1;
     },
+    async () => {
+      retries += 1;
+      return true;
+    },
   );
 
   try {
     const missingCallback = await unavailable.inject({ method: "POST", url: "/api/v1/refresh" });
     assert.equal(missingCallback.statusCode, 503);
+    const missingRetryCallback = await unavailable.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry" });
+    assert.equal(missingRetryCallback.statusCode, 503);
     ready = false;
     const response = await server.inject({ method: "POST", url: "/api/v1/refresh" });
     assert.equal(response.statusCode, 503);
@@ -320,6 +351,12 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
       error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
     });
     assert.equal(refreshes, 0);
+    const retry = await server.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry" });
+    assert.equal(retry.statusCode, 503);
+    assert.deepEqual(retry.json(), {
+      error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
+    });
+    assert.equal(retries, 0);
   } finally {
     await unavailable.close();
     await server.close();

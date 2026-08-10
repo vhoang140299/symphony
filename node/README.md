@@ -174,6 +174,10 @@ and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server e
   retrying, or blocked issue, or a JSON `404` when it is absent.
 - `POST /api/v1/refresh`: queues an immediate coalesced poll while the scheduler is ready and returns
   `202`; otherwise it returns a JSON `503`.
+- `POST /api/v1/<issue_identifier>/retry`: idempotently requests one additional run for a currently blocked,
+  still-routable issue and returns `202`. It consumes the configured control retry label first so a
+  later poll cannot schedule the same manual retry again. Missing/non-routable issues return `404`;
+  an unavailable scheduler returns `503`.
 
 The API omits workspace paths, agent session IDs, blocked summaries, provider details, raw rate-limit
 payloads, and raw errors. `secondsRunning` is in-process claimed-run wall time, including hooks and
@@ -183,9 +187,10 @@ host delivery, and resets when the process restarts. Unknown routes and unsuppor
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.
 
-The dashboard and API have no authentication. Keep the default loopback binding; if you bind to a
-remote interface, add authentication and network access controls outside Symphony. Dashboard issue
-links are limited to HTTP(S), and provider content is rendered as text rather than HTML.
+The dashboard and API have no authentication. Its poll and retry controls can start agent work. Keep
+the default loopback binding; if you bind to a remote interface, add authentication and network
+access controls outside Symphony. Dashboard issue links are limited to HTTP(S), and provider
+content is rendered as text rather than HTML.
 
 For development:
 
@@ -643,7 +648,7 @@ when the target deployment requires them.
 
 Approval or user-input requests fail closed and remain visible in `Orchestrator.snapshot()` until
 an embedding calls `retryBlocked()`, or the tracker moves the issue out of an active state. The CLI
-does not yet provide an operator UI for this path.
+dashboard exposes the same one-shot retry through each blocked issue row.
 
 ## License
 

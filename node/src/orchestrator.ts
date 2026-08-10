@@ -167,6 +167,7 @@ export class Orchestrator {
   readonly #running = new Map<string, RunningEntry>();
   readonly #retrying = new Map<string, RetryEntry>();
   readonly #blocked = new Map<string, BlockedEntry>();
+  readonly #blockedTransitions = new Map<string, Promise<boolean>>();
   readonly #claimed = new Set<string>();
   readonly #shutdownController = new AbortController();
 
@@ -287,6 +288,15 @@ export class Orchestrator {
       timedOut = true;
       this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for the active poll");
     }
+    const blockedTransitions = Promise.allSettled([...this.#blockedTransitions.values()]);
+    outstanding.push(blockedTransitions);
+    const transitionWaitMs = Math.max(0, deadlineMs - Date.now());
+    if (!(await settlesWithin(blockedTransitions, transitionWaitMs))) {
+      checkpointSafe = false;
+      timedOut = true;
+      this.#stateWritesFrozen = true;
+      this.#logger.error({ grace_ms: graceMs }, "Shutdown timed out waiting for blocked retry transitions");
+    }
     for (const entry of this.#running.values()) {
       this.#requestStop(entry, "shutdown", "Orchestrator is shutting down");
     }
@@ -392,24 +402,19 @@ export class Orchestrator {
       ([issueId, entry]) => issueId === issueIdOrIdentifier || entry.issue.identifier === issueIdOrIdentifier,
     );
     if (!found) return false;
+    return this.#scheduleBlockedRetry(found[0], found[1], found[1].issue);
+  }
 
-    const [issueId, entry] = found;
-    this.#blocked.delete(issueId);
-    this.#retrying.set(issueId, {
-      issue: entry.issue,
-      workflow: entry.workflow,
-      tracker: entry.tracker,
-      driver: entry.driver,
-      attempt: (entry.attempt ?? 0) + 1,
-      continuation: entry.continuation,
-      sessionId: entry.sessionId,
-      dueAtMs: this.#now(),
-      reason: "continuation",
-    });
-    this.#assertClaimInvariant();
-    await this.#persistState();
-    this.#wakeForRetry();
-    return true;
+  async requestBlockedRetry(issueIdOrIdentifier: string): Promise<boolean> {
+    this.#requirePersistenceHealthy();
+    if (this.#shuttingDown || this.#stateWritesFrozen) {
+      throw new Error("A stopped orchestrator cannot retry blocked work");
+    }
+    const found = [...this.#blocked.entries()].find(
+      ([issueId, entry]) => issueId === issueIdOrIdentifier || entry.issue.identifier === issueIdOrIdentifier,
+    );
+    if (!found) return false;
+    return this.#transitionBlocked(found[0], found[1], false);
   }
 
   snapshot(): OrchestratorSnapshot {
@@ -790,29 +795,63 @@ export class Orchestrator {
     }
 
     for (const [issueId, entry] of [...this.#blocked.entries()]) {
-      let refreshed: Issue | undefined;
       try {
-        [refreshed] = await entry.tracker.fetchIssuesByIds([issueId]);
+        await this.#transitionBlocked(issueId, entry, true);
       } catch (error) {
+        if (error instanceof Error && error.message === "Blocked retry label removal failed") {
+          this.#logger.warn(
+            { issue_id: issueId, issue_identifier: entry.issue.identifier },
+            "Blocked retry label removal failed; claim retained",
+          );
+          continue;
+        }
         this.#logger.warn({ error, issue_id: issueId }, "Blocked issue reconciliation failed");
-        continue;
       }
-      if (!refreshed) {
+    }
+  }
+
+  async #transitionBlocked(
+    issueId: string,
+    entry: BlockedEntry,
+    requireRetryLabel: boolean,
+  ): Promise<boolean> {
+    const pending = this.#blockedTransitions.get(issueId);
+    if (pending !== undefined) {
+      const transitioned = await pending;
+      if (transitioned || requireRetryLabel || this.#blocked.get(issueId) !== entry) return transitioned;
+      return this.#transitionBlocked(issueId, entry, false);
+    }
+
+    let transition!: Promise<boolean>;
+    transition = (async () => {
+      if (this.#blocked.get(issueId) !== entry || this.#shuttingDown || this.#stateWritesFrozen) return false;
+
+      const refreshed = (await entry.tracker.fetchIssuesByIds([issueId])).find((issue) => issue.id === issueId);
+      if (this.#blocked.get(issueId) !== entry || this.#shuttingDown || this.#stateWritesFrozen) return false;
+      if (refreshed === undefined) {
         await this.#release(issueId);
-        continue;
+        return false;
       }
+
       entry.issue = refreshed;
       const classification = classifyIssue(refreshed, entry.workflow.config);
       if (classification === "terminal") {
         await this.#removeWorkspace(refreshed, entry.workflow.config);
+        if (this.#blocked.get(issueId) === entry && !this.#shuttingDown && !this.#stateWritesFrozen) {
+          await this.#release(issueId);
+        }
+        return false;
+      }
+      if (classification !== "routable") {
         await this.#release(issueId);
-      } else if (classification !== "routable") {
-        await this.#release(issueId);
-      } else {
-        const retryLabel = entry.workflow.config.control?.retryLabel;
-        if (retryLabel === undefined || !refreshed.labels.some((label) => sameLabel(label, retryLabel))) continue;
-        if (this.#shuttingDown) return;
-        if (this.#blocked.get(issueId) !== entry) continue;
+        return false;
+      }
+
+      const retryLabel = entry.workflow.config.control?.retryLabel;
+      const hasRetryLabel = retryLabel !== undefined
+        && refreshed.labels.some((label) => sameLabel(label, retryLabel));
+      if (requireRetryLabel && !hasRetryLabel) return false;
+      if (hasRetryLabel) {
         const mutateIssue = requireValue(
           entry.tracker.mutateIssue?.bind(entry.tracker),
           "Configured control labels require tracker mutation support",
@@ -824,26 +863,44 @@ export class Orchestrator {
             this.#shutdownController.signal,
           );
         } catch {
-          this.#logger.warn(
-            { issue_id: issueId, issue_identifier: refreshed.identifier },
-            "Blocked retry label removal failed; claim retained",
-          );
-          continue;
+          throw new Error("Blocked retry label removal failed");
         }
-        if (this.#shuttingDown) return;
-        if (!(await this.retryBlocked(issueId))) {
-          this.#logger.warn(
-            { issue_id: issueId, issue_identifier: refreshed.identifier },
-            "Retry label was removed after the blocked claim changed; no retry scheduled",
-          );
-          continue;
-        }
+        if (this.#blocked.get(issueId) !== entry || this.#shuttingDown || this.#stateWritesFrozen) return false;
+      }
+
+      const transitioned = await this.#scheduleBlockedRetry(issueId, entry, refreshed);
+      if (transitioned && hasRetryLabel) {
         this.#logger.info(
           { issue_id: issueId, issue_identifier: refreshed.identifier },
           "Blocked retry label consumed; manual run scheduled",
         );
       }
-    }
+      return transitioned;
+    })().finally(() => {
+      if (this.#blockedTransitions.get(issueId) === transition) this.#blockedTransitions.delete(issueId);
+    });
+    this.#blockedTransitions.set(issueId, transition);
+    return transition;
+  }
+
+  async #scheduleBlockedRetry(issueId: string, entry: BlockedEntry, issue: Issue): Promise<boolean> {
+    if (this.#blocked.get(issueId) !== entry || this.#shuttingDown || this.#stateWritesFrozen) return false;
+    this.#blocked.delete(issueId);
+    this.#retrying.set(issueId, {
+      issue,
+      workflow: entry.workflow,
+      tracker: entry.tracker,
+      driver: entry.driver,
+      attempt: (entry.attempt ?? 0) + 1,
+      continuation: entry.continuation,
+      sessionId: entry.sessionId,
+      dueAtMs: this.#now(),
+      reason: "continuation",
+    });
+    this.#assertClaimInvariant();
+    await this.#persistState();
+    this.#wakeForRetry();
+    return true;
   }
 
   async #dispatchDueRetries(): Promise<void> {
