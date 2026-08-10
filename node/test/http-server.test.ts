@@ -3,6 +3,8 @@ import { test } from "vitest";
 import { createOperationsServer } from "../src/http/server.js";
 import type { OrchestratorSnapshot } from "../src/orchestrator.js";
 
+const operationHeaders = { "x-symphony-operation": "1" };
+
 test("operations endpoints expose health and aggregate status without run details", async () => {
   let ready = false;
   let refreshes = 0;
@@ -227,17 +229,21 @@ test("operations endpoints expose health and aggregate status without run detail
     assert.equal(missing.statusCode, 404);
     assert.deepEqual(missing.json(), { error: { code: "issue_not_found", message: "Issue not found" } });
 
-    const retry = await server.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry" });
+    const retry = await server.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry", headers: operationHeaders });
     assert.equal(retry.statusCode, 202);
     assert.deepEqual(retry.json(), { queued: true });
-    const retryMissing = await server.inject({ method: "POST", url: "/api/v1/MISSING-1/retry" });
+    const retryMissing = await server.inject({
+      method: "POST",
+      url: "/api/v1/MISSING-1/retry",
+      headers: operationHeaders,
+    });
     assert.equal(retryMissing.statusCode, 404);
     assert.deepEqual(retryMissing.json(), {
       error: { code: "issue_not_found", message: "Issue not found" },
     });
     assert.deepEqual(retryRequests, ["BLOCKED-1", "MISSING-1"]);
 
-    const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh" });
+    const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh", headers: operationHeaders });
     assert.equal(refresh.statusCode, 202);
     assert.equal(refresh.headers["cache-control"], "no-store");
     assert.deepEqual(refresh.json(), { queued: true });
@@ -306,11 +312,11 @@ test("operations server does not expose internal status errors", async () => {
       assert.deepEqual(response.json(), { status: "error" });
       assert.doesNotMatch(response.body, /secret|snapshot detail/iu);
     }
-    const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh" });
+    const refresh = await server.inject({ method: "POST", url: "/api/v1/refresh", headers: operationHeaders });
     assert.equal(refresh.statusCode, 500);
     assert.deepEqual(refresh.json(), { status: "error" });
     assert.doesNotMatch(refresh.body, /secret|refresh detail/iu);
-    const retry = await server.inject({ method: "POST", url: "/api/v1/SECRET-1/retry" });
+    const retry = await server.inject({ method: "POST", url: "/api/v1/SECRET-1/retry", headers: operationHeaders });
     assert.equal(retry.statusCode, 500);
     assert.deepEqual(retry.json(), { status: "error" });
     assert.doesNotMatch(retry.body, /secret|retry detail/iu);
@@ -340,18 +346,22 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
   );
 
   try {
-    const missingCallback = await unavailable.inject({ method: "POST", url: "/api/v1/refresh" });
+    const missingCallback = await unavailable.inject({ method: "POST", url: "/api/v1/refresh", headers: operationHeaders });
     assert.equal(missingCallback.statusCode, 503);
-    const missingRetryCallback = await unavailable.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry" });
+    const missingRetryCallback = await unavailable.inject({
+      method: "POST",
+      url: "/api/v1/BLOCKED-1/retry",
+      headers: operationHeaders,
+    });
     assert.equal(missingRetryCallback.statusCode, 503);
     ready = false;
-    const response = await server.inject({ method: "POST", url: "/api/v1/refresh" });
+    const response = await server.inject({ method: "POST", url: "/api/v1/refresh", headers: operationHeaders });
     assert.equal(response.statusCode, 503);
     assert.deepEqual(response.json(), {
       error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
     });
     assert.equal(refreshes, 0);
-    const retry = await server.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry" });
+    const retry = await server.inject({ method: "POST", url: "/api/v1/BLOCKED-1/retry", headers: operationHeaders });
     assert.equal(retry.statusCode, 503);
     assert.deepEqual(retry.json(), {
       error: { code: "orchestrator_unavailable", message: "Orchestrator is unavailable" },
@@ -359,6 +369,108 @@ test("refresh reports an unavailable or unready orchestrator without invoking th
     assert.equal(retries, 0);
   } finally {
     await unavailable.close();
+    await server.close();
+  }
+});
+
+test("operations server rejects untrusted hosts and forged control requests", async () => {
+  let refreshes = 0;
+  let retries = 0;
+  const server = createOperationsServer(
+    () => assert.fail("snapshot must not be called"),
+    () => true,
+    () => {
+      refreshes += 1;
+    },
+    async () => {
+      retries += 1;
+      return true;
+    },
+  );
+
+  try {
+    const untrustedHost = await server.inject({ method: "GET", url: "/healthz", headers: { host: "evil.example" } });
+    assert.equal(untrustedHost.statusCode, 403);
+    assert.deepEqual(untrustedHost.json(), { error: { code: "forbidden", message: "Request not allowed" } });
+
+    for (const headers of [
+      { host: "evil.example", ...operationHeaders },
+      { host: "localhost:4321" },
+      { host: "localhost:4321", "x-symphony-operation": "0" },
+      { host: "localhost:4321", origin: "null", ...operationHeaders },
+      { host: "localhost:4321", origin: "https://evil.example", ...operationHeaders },
+      { host: "localhost:4321", origin: "http://localhost:9999", ...operationHeaders },
+      { host: "localhost:4321", origin: "http://localhost:4321/", ...operationHeaders },
+      { host: "localhost:4321", origin: "not-an-origin", ...operationHeaders },
+    ]) {
+      const response = await server.inject({ method: "POST", url: "/api/v1/refresh", headers });
+      assert.equal(response.statusCode, 403);
+      assert.deepEqual(response.json(), { error: { code: "forbidden", message: "Request not allowed" } });
+    }
+    const forgedRetry = await server.inject({
+      method: "POST",
+      url: "/api/v1/BLOCKED-1/retry",
+      headers: { host: "localhost:4321", origin: "https://evil.example", ...operationHeaders },
+    });
+    assert.equal(forgedRetry.statusCode, 403);
+    assert.equal(refreshes, 0);
+    assert.equal(retries, 0);
+
+    const curlRefresh = await server.inject({
+      method: "POST",
+      url: "/api/v1/refresh",
+      headers: { host: "127.0.0.1:4321", ...operationHeaders },
+    });
+    assert.equal(curlRefresh.statusCode, 202);
+    const browserRetry = await server.inject({
+      method: "POST",
+      url: "/api/v1/BLOCKED-1/retry",
+      headers: { host: "localhost:4321", origin: "http://localhost:4321", ...operationHeaders },
+    });
+    assert.equal(browserRetry.statusCode, 202);
+    assert.equal(refreshes, 1);
+    assert.equal(retries, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("operations server trusts an explicitly configured listener host", async () => {
+  const server = createOperationsServer(
+    () => assert.fail("snapshot must not be called"),
+    () => true,
+    undefined,
+    undefined,
+    "192.0.2.10",
+  );
+
+  try {
+    const trusted = await server.inject({ method: "GET", url: "/healthz", headers: { host: "192.0.2.10:4321" } });
+    assert.equal(trusted.statusCode, 200);
+    const untrusted = await server.inject({ method: "GET", url: "/healthz", headers: { host: "evil.example" } });
+    assert.equal(untrusted.statusCode, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("operations server normalizes IPv4-mapped listener addresses", async () => {
+  const server = createOperationsServer(
+    () => assert.fail("snapshot must not be called"),
+    () => true,
+    undefined,
+    undefined,
+    "::FFFF:192.0.2.10",
+  );
+
+  try {
+    const response = await server.inject({
+      method: "GET",
+      url: "/healthz",
+      headers: { host: "192.0.2.10:4321" },
+    });
+    assert.equal(response.statusCode, 200);
+  } finally {
     await server.close();
   }
 });
