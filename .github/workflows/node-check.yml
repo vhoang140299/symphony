@@ -37,3 +37,6 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Test packed CLI
+        run: pnpm run test:pack

@@ -1,8 +1,8 @@
 # Symphony Node
 
-This directory contains a small TypeScript implementation of
-[`SPEC.md`](../SPEC.md). It polls a tracker, creates an isolated workspace for each issue, and runs
-Claude Code or Codex through their official SDKs.
+This directory contains a small TypeScript implementation of the
+[`SPEC.md`](https://github.com/vhoang140299/symphony/blob/main/SPEC.md). It polls a tracker, creates
+an isolated workspace for each issue, and runs Claude Code or Codex through their official SDKs.
 
 > [!WARNING]
 > This is a developer MVP for trusted local environments. It can let coding agents edit files and
@@ -49,7 +49,29 @@ Do not commit API keys in `WORKFLOW.md`, because the agent can read files in its
 The checked-in sample issue is intentionally `dispatchable: false`. Before the first agent run,
 customize the issue, configure the clone hook, and set `dispatchable: true`.
 
-## Install and run
+## Install a release artifact
+
+Starting with `node-v0.4.0`, each Node release includes an installable package tarball and matching
+SHA-256 checksum. Download and verify the artifact before installing it globally:
+
+```bash
+NODE_VERSION=0.4.0
+gh release download "node-v$NODE_VERSION" --repo vhoang140299/symphony \
+  --pattern "symphony-node-v$NODE_VERSION.tgz" \
+  --pattern "symphony-node-v$NODE_VERSION.tgz.sha256"
+sha256sum -c "symphony-node-v$NODE_VERSION.tgz.sha256" # Linux
+# shasum -a 256 -c "symphony-node-v$NODE_VERSION.tgz.sha256" # macOS
+pnpm add --global "./symphony-node-v$NODE_VERSION.tgz"
+symphony-node --help
+```
+
+The tarball installs runtime dependencies from the npm registry but Symphony itself is distributed
+through GitHub Releases; this workflow does not publish the package to npm. Provide a reviewed
+`WORKFLOW.md`, then run `symphony-node ./WORKFLOW.md`. The artifact also contains the checked-in
+workflow examples, README, type declarations, Codex wrapper, Apache-2.0 license, and repository
+notice.
+
+## Build from source
 
 ```bash
 cd node
@@ -620,4 +642,5 @@ does not yet provide an operator UI for this path.
 
 ## License
 
-This implementation uses the repository's [Apache License 2.0](../LICENSE).
+This implementation uses the repository's
+[Apache License 2.0](https://github.com/vhoang140299/symphony/blob/main/LICENSE).
