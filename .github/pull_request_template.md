@@ -18,5 +18,6 @@
 
 #### Test Plan
 
-- [ ] `make -C elixir all`
+- [ ] `make -C elixir all` (if Elixir files changed)
+- [ ] `pnpm --dir node test` (if Node files changed)
 - [ ] <!-- Additional targeted checks (list below) -->

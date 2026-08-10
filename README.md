@@ -25,21 +25,15 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 > Implement Symphony according to the following spec:
 > https://github.com/openai/symphony/blob/main/SPEC.md
 
-### Option 2. Use our experimental reference implementation
+### Option 2. Use an experimental implementation
 
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
-help with the setup:
+Choose the implementation that fits your environment. Both follow [SPEC.md](SPEC.md) and keep
+independent toolchains and release tags:
 
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
-
-For a smaller Node.js implementation, see [node/README.md](node/README.md). It supports Claude Code
-and Codex, with in-memory, Linear, and GitHub Issues trackers plus an opt-in, host-controlled GitHub
-issue-to-pull-request flow and retry-label control for either agent. Starting with `node-v0.4.0`,
-Node release tags also provide an installable package tarball and checksum; it does not yet provide
-the full adapter and operational surface of the Elixir reference implementation. Its optional HTTP
-listener includes a privacy-filtered React operations dashboard.
+- [Node.js/TypeScript](node/README.md) — setup: `cd node && mise trust && mise install && mise exec
+  -- pnpm install --frozen-lockfile`; validate: `mise exec -- pnpm test`; releases: `node-v*`.
+- [Elixir](elixir/README.md) — setup: `cd elixir && mise trust && mise install && mise exec -- make
+  setup`; validate: `mise exec -- make all`; releases: `v*`.
 
 ---
 
