@@ -5,12 +5,25 @@ import path from "node:path";
 import { test } from "vitest";
 import { parseWorkflowConfig } from "../src/config/schema.js";
 import { WorkflowStore } from "../src/config/store.js";
-import { loadWorkflow, renderPrompt } from "../src/config/workflow.js";
+import {
+  loadWorkflow,
+  renderPrompt,
+  WorkflowError,
+  type WorkflowErrorCode,
+} from "../src/config/workflow.js";
 import type { Issue } from "../src/domain.js";
 import { createLogger } from "../src/log.js";
 import { workflowScopeHash } from "../src/state/scope.js";
 
-const logger = createLogger("silent");
+function workflowError(code: WorkflowErrorCode): (error: unknown) => boolean {
+  return (error) => {
+    assert.ok(error instanceof WorkflowError);
+    assert.equal(error.code, code);
+    assert.notEqual(error.message, "");
+    assert.equal(error.cause, undefined);
+    return true;
+  };
+}
 
 test("loads required tracker config, resolves workspace relative to WORKFLOW.md, and renders strict Liquid", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-"));
@@ -32,7 +45,29 @@ Work on {{ issue.identifier }} (attempt {{ attempt }}).
   assert.equal(await renderPrompt(workflow, sampleIssue, 2), "Work on TEST-1 (attempt 2).");
 
   workflow.promptTemplate = "{{ issue.missing_field }}";
-  await assert.rejects(renderPrompt(workflow, sampleIssue, null));
+  await assert.rejects(renderPrompt(workflow, sampleIssue, null), workflowError("template_render_error"));
+
+  workflow.promptTemplate = "{{ issue.title | unknown_filter }}";
+  await assert.rejects(renderPrompt(workflow, sampleIssue, null), workflowError("template_render_error"));
+
+  workflow.promptTemplate = "{{ issue.title";
+  await assert.rejects(renderPrompt(workflow, sampleIssue, null), workflowError("template_render_error"));
+
+  workflow.promptTemplate = "{% if issue.title";
+  await assert.rejects(renderPrompt(workflow, sampleIssue, null), workflowError("template_parse_error"));
+});
+
+test("exposes stable workflow load error codes", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-errors-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+
+  await assert.rejects(loadWorkflow(workflowPath), workflowError("missing_workflow_file"));
+
+  await writeFile(workflowPath, "---\ntracker: [\n---\nPrompt.\n");
+  await assert.rejects(loadWorkflow(workflowPath), workflowError("workflow_parse_error"));
+
+  await writeFile(workflowPath, "---\n- tracker\n---\nPrompt.\n");
+  await assert.rejects(loadWorkflow(workflowPath), workflowError("workflow_front_matter_not_a_map"));
 });
 
 test("resolves optional state paths with the workspace path rules", async () => {
@@ -90,11 +125,17 @@ test("rejects a workflow without tracker.kind", async () => {
 test("invalid hot reload retains the last known-good workflow", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-reload-"));
   const workflowPath = path.join(directory, "WORKFLOW.md");
+  let reloadLog = "";
+  const reloadLogger = createLogger("error", {
+    write(message: string) {
+      reloadLog += message;
+    },
+  });
   await writeFile(workflowPath, "---\ntracker:\n  kind: memory\n---\nOriginal prompt.\n");
-  const store = new WorkflowStore(workflowPath, logger);
+  const store = new WorkflowStore(workflowPath, reloadLogger);
   const original = await store.initialize();
 
-  await writeFile(workflowPath, "---\ntracker: [invalid]\n---\nBroken prompt.\n");
+  await writeFile(workflowPath, "---\ntracker: [WORKFLOW_RELOAD_SECRET_SENTINEL\n---\nBroken prompt.\n");
   assert.equal(await store.initialize(), original);
   const later = new Date(Date.now() + 2_000);
   await utimes(workflowPath, later, later);
@@ -102,6 +143,8 @@ test("invalid hot reload retains the last known-good workflow", async () => {
 
   assert.equal(refreshed, original);
   assert.equal(store.current().promptTemplate, "Original prompt.");
+  assert.match(reloadLog, /Workflow reload failed/);
+  assert.doesNotMatch(reloadLog, /WORKFLOW_RELOAD_SECRET_SENTINEL/);
 });
 
 test("uses SPEC agent defaults and accepts max_turns as the canonical turn limit", async () => {

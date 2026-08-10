@@ -317,6 +317,10 @@ Useful prompt values include `issue.identifier`, `issue.title`, `issue.descripti
 `issue.state`, `issue.labels`, and `attempt`. Configuration is reloaded when the file changes; an
 invalid reload keeps the last known-good configuration.
 
+Workflow loading and prompt rendering expose a stable `WorkflowError.code`: `missing_workflow_file`,
+`workflow_parse_error`, `workflow_front_matter_not_a_map`, `template_parse_error`, or
+`template_render_error`. Schema, path-safety, and adapter validation errors remain separate.
+
 [`WORKFLOW.github.md`](WORKFLOW.github.md) and
 [`WORKFLOW.codex.github.md`](WORKFLOW.codex.github.md) are host-delivery GitHub issue-to-PR profiles
 for Claude and Codex. Copy one before editing; the default `WORKFLOW.md` remains an inert local
