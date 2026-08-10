@@ -116,15 +116,25 @@ supervised `--once` run for the real agent path. Doctor output omits paths, toke
 variable names, account details, prompts, and raw underlying errors. `--doctor`, `--preflight`, and
 `--once` are mutually exclusive.
 
-For local health checks and aggregate runtime status, opt the continuous daemon into its Fastify
-server:
+For local health checks and runtime inspection, opt the continuous daemon into its Fastify server
+from `WORKFLOW.md`:
 
-```bash
-node dist/src/cli.js --http-port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
+```yaml
+server:
+  port: 3000
+  host: 127.0.0.1
 ```
 
-`--http-host` defaults to `127.0.0.1`. The HTTP flags are daemon-only and cannot be combined with
-`--once`, `--preflight`, or `--doctor`. The read-only server exposes:
+or override the workflow port from the CLI:
+
+```bash
+node dist/src/cli.js --port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
+```
+
+`--port` overrides `server.port`; `--http-port` remains an alias. `--http-host` overrides
+`server.host`, whose default is `127.0.0.1`. Port `0` requests an ephemeral port and the startup log
+reports the actual bound port. Listener changes require a restart. HTTP CLI flags are daemon-only
+and cannot be combined with `--once`, `--preflight`, or `--doctor`. The server exposes:
 
 - `GET /healthz`: reports that the HTTP process is responding.
 - `GET /readyz`: reports ready only while the scheduler is initialized and running and no local
@@ -133,8 +143,17 @@ node dist/src/cli.js --http-port 3000 --http-host 127.0.0.1 ./WORKFLOW.md
 - `GET /status`: reports timestamps, aggregate run-state counts, and usage totals. It omits issue
   identifiers, workspace paths, agent session IDs, provider details, and raw errors.
 - `GET /api/v1/state`: reports privacy-filtered running, retrying, and blocked entries, including
-  issue IDs and identifiers, lifecycle timestamps, retry details, and usage totals. It omits
-  workspace paths, agent session IDs, blocked summaries, provider details, and raw errors.
+  issue IDs, identifiers and URLs, lifecycle timestamps, turn counts, safe last-event types,
+  per-run token usage, retry details, and aggregate token/runtime totals.
+- `GET /api/v1/<issue_identifier>`: returns the same allow-listed details for one currently running,
+  retrying, or blocked issue, or a JSON `404` when it is absent.
+- `POST /api/v1/refresh`: queues an immediate coalesced poll while the scheduler is ready and returns
+  `202`; otherwise it returns a JSON `503`.
+
+The API omits workspace paths, agent session IDs, blocked summaries, provider details, raw rate-limit
+payloads, and raw errors. `secondsRunning` is in-process claimed-run wall time, including hooks and
+host delivery, and resets when the process restarts. Unknown routes and unsupported methods use JSON
+`404`/`405` responses.
 
 Fatal durable checkpoint errors close the operations server and exit the daemon nonzero. Transient
 tracker polling errors remain retryable and do not make the scheduler unready.

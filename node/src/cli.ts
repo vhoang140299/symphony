@@ -12,7 +12,7 @@ import { runPreflight } from "./preflight.js";
 async function main(args: string[]): Promise<void> {
   const parsed = parseArguments(args);
   if (parsed === undefined) return;
-  const { once, preflight, doctor, httpHost, httpPort, workflowPath } = parsed;
+  const { once, preflight, doctor, httpHost: httpHostOverride, httpPort: httpPortOverride, workflowPath } = parsed;
   if (doctor) {
     const result = await runDoctor(workflowPath);
     process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -24,7 +24,8 @@ async function main(args: string[]): Promise<void> {
     return;
   }
   const logger = createLogger(undefined, once ? process.stderr : undefined);
-  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger);
+  const workflowStore = new WorkflowStore(workflowPath, logger);
+  const orchestrator = new Orchestrator(workflowStore, logger);
   if (once) {
     let completed = false;
     let interruptedSignal: NodeJS.Signals | undefined;
@@ -68,10 +69,22 @@ async function main(args: string[]): Promise<void> {
     return;
   }
 
+  const workflow = await workflowStore.initialize();
+  const httpPort = httpPortOverride ?? workflow.config.server?.port;
+  if (httpHostOverride !== undefined && httpPort === undefined) {
+    throw new InvalidArgumentError("option '--http-host <HOST>' requires '--port', '--http-port', or server.port");
+  }
+  const httpHost = httpHostOverride ?? workflow.config.server?.host ?? "127.0.0.1";
   const operationsServer =
     httpPort === undefined
       ? undefined
-      : createOperationsServer(() => orchestrator.snapshot(), () => orchestrator.isReady());
+      : createOperationsServer(
+          () => orchestrator.snapshot(),
+          () => orchestrator.isReady(),
+          () => {
+            void orchestrator.pollOnce().catch(() => undefined);
+          },
+        );
   let stopPromise: Promise<void> | undefined;
   const requestStop = () => {
     stopPromise ??= stopServices(operationsServer, orchestrator);
@@ -83,9 +96,12 @@ async function main(args: string[]): Promise<void> {
     void requestStop();
   });
   let fatalError: Error | undefined;
+  let boundHttpPort = httpPort;
   try {
     if (operationsServer && httpPort !== undefined) {
       await operationsServer.listen({ host: httpHost, port: httpPort });
+      const address = operationsServer.server.address();
+      if (address !== null && typeof address === "object") boundHttpPort = address.port;
     }
     if (stopPromise) return await stopPromise;
     await orchestrator.start();
@@ -93,7 +109,7 @@ async function main(args: string[]): Promise<void> {
     logger.info(
       {
         workflow_path: workflowPath,
-        ...(httpPort === undefined ? {} : { http_host: httpHost, http_port: httpPort }),
+        ...(boundHttpPort === undefined ? {} : { http_host: httpHost, http_port: boundHttpPort }),
       },
       "Symphony Node started",
     );
@@ -132,7 +148,7 @@ function parseArguments(args: string[]):
       once: boolean;
       preflight: boolean;
       doctor: boolean;
-      httpHost: string;
+      httpHost: string | undefined;
       httpPort: number | undefined;
       workflowPath: string;
     }
@@ -140,7 +156,7 @@ function parseArguments(args: string[]):
   const executionModes = ["once", "preflight", "doctor"];
   const command = new Command()
     .name("symphony-node")
-    .usage("[--once | --preflight | --doctor] [--http-port <PORT> [--http-host <HOST>]] [WORKFLOW]")
+    .usage("[--once | --preflight | --doctor] [--port <PORT> | --http-port <PORT>] [--http-host <HOST>] [WORKFLOW]")
     .argument("[WORKFLOW]", "workflow file", "WORKFLOW.md")
     .addOption(new Option("--once", "poll once and exit").conflicts(["preflight", "doctor"]))
     .addOption(
@@ -149,12 +165,17 @@ function parseArguments(args: string[]):
     )
     .addOption(new Option("--doctor", "inspect local readiness without side effects").conflicts(["once", "preflight"]))
     .addOption(
-      new Option("--http-port <PORT>", "serve operational HTTP endpoints in daemon mode")
+      new Option("--port <PORT>", "serve operational HTTP endpoints in daemon mode; overrides server.port")
         .argParser(parsePort)
-        .conflicts(executionModes),
+        .conflicts([...executionModes, "httpPort"]),
     )
     .addOption(
-      new Option("--http-host <HOST>", "listen host (default: 127.0.0.1; requires --http-port)")
+      new Option("--http-port <PORT>", "alias for --port")
+        .argParser(parsePort)
+        .conflicts([...executionModes, "port"]),
+    )
+    .addOption(
+      new Option("--http-host <HOST>", "listen host; overrides server.host (default: 127.0.0.1)")
         .argParser(parseHost)
         .conflicts(executionModes),
     )
@@ -173,24 +194,22 @@ function parseArguments(args: string[]):
     doctor?: boolean;
     httpHost?: string;
     httpPort?: number;
+    port?: number;
   }>();
-  if (options.httpHost !== undefined && options.httpPort === undefined) {
-    throw new InvalidArgumentError("option '--http-host <HOST>' requires option '--http-port <PORT>'");
-  }
   return {
     once: options.once ?? false,
     preflight: options.preflight ?? false,
     doctor: options.doctor ?? false,
-    httpHost: options.httpHost ?? "127.0.0.1",
-    httpPort: options.httpPort,
+    httpHost: options.httpHost,
+    httpPort: options.port ?? options.httpPort,
     workflowPath: path.resolve(String(command.processedArgs[0])),
   };
 }
 
 function parsePort(value: string): number {
   const port = Number(value);
-  if (!/^\d+$/u.test(value) || !Number.isSafeInteger(port) || port < 1 || port > 65_535) {
-    throw new InvalidArgumentError("expected an integer between 1 and 65535");
+  if (!/^\d+$/u.test(value) || !Number.isSafeInteger(port) || port < 0 || port > 65_535) {
+    throw new InvalidArgumentError("expected an integer between 0 and 65535");
   }
   return port;
 }

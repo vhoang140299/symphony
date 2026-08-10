@@ -58,7 +58,8 @@ test("dispatches by priority without duplicate claims and accumulates absolute u
   assert.equal(new Set(seen).size, 2);
   const canonicalRoot = await realpath(path.join(directory, "workspaces"));
   assert.ok(workspaces.every((workspace) => workspace.startsWith(canonicalRoot)));
-  assert.deepEqual(orchestrator.snapshot().totals, {
+  const { secondsRunning, ...totals } = orchestrator.snapshot().totals;
+  assert.deepEqual(totals, {
     inputTokens: 20,
     outputTokens: 10,
     cacheReadInputTokens: 4,
@@ -66,8 +67,109 @@ test("dispatches by priority without duplicate claims and accumulates absolute u
     totalTokens: 36,
     costUsd: 0.02,
   });
+  assert.ok(secondsRunning >= 0);
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
   await orchestrator.stop();
+});
+
+test("snapshots live per-run metrics and scopes session ids to known lifecycle logs", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-orchestrator-metrics-"));
+  const issueUrl = "https://tracker.example/issues/METRICS-1";
+  const issue = { ...rawIssue("metrics", "METRICS-1", 1, "2025-01-01T00:00:00Z"), url: issueUrl };
+  const tracker = new MemoryTracker({ issues: [issue] });
+  const secondTurnActive = deferred<void>();
+  const finishSecondTurn = deferred<void>();
+  const logs: Array<{ bindings: Record<string, unknown>; message: string }> = [];
+  const metricsLogger = {
+    info(bindings: Record<string, unknown>, message: string) {
+      logs.push({ bindings, message });
+    },
+  } as unknown as AppLogger;
+  let turn = 0;
+  const driver = new FakeDriver(async function* () {
+    turn += 1;
+    yield event("session_started", { sessionId: "metrics-session" });
+    yield event("usage_updated", {
+      usage: turn === 1
+        ? {
+            inputTokens: 10,
+            outputTokens: 5,
+            cacheReadInputTokens: 2,
+            cacheCreationInputTokens: 1,
+            totalTokens: 18,
+            costUsd: 1,
+          }
+        : {
+            inputTokens: 7,
+            outputTokens: 3,
+            cacheReadInputTokens: 1,
+            cacheCreationInputTokens: 0,
+            totalTokens: 11,
+            costUsd: 2,
+          },
+    });
+    if (turn === 1) {
+      yield event("turn_completed", { sessionId: "metrics-session" });
+      return;
+    }
+    yield event("activity", { sessionId: "metrics-session" });
+    secondTurnActive.resolve();
+    await finishSecondTurn.promise;
+    yield event("turn_completed", { sessionId: "metrics-session" });
+  });
+  const workflowPath = await writeWorkflow(directory, [issue], { maxTurns: 2 });
+  let now = Date.UTC(2026, 0, 1);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, metricsLogger), metricsLogger, {
+    tracker,
+    driver,
+    now: () => now,
+    continuationDelayMs: 60_000,
+  });
+
+  await orchestrator.pollOnce();
+  await secondTurnActive.promise;
+  now += 2_500;
+
+  const running = orchestrator.snapshot();
+  const active = running.running[0];
+  assert.deepEqual({
+    issueUrl: active?.issueUrl,
+    turnCount: active?.turnCount,
+    secondsRunning: active?.secondsRunning,
+    lastEvent: active?.lastEvent,
+  }, {
+    issueUrl,
+    turnCount: 2,
+    secondsRunning: 2.5,
+    lastEvent: "activity",
+  });
+  assert.deepEqual(active?.usage, {
+    inputTokens: 17,
+    outputTokens: 8,
+    cacheReadInputTokens: 3,
+    cacheCreationInputTokens: 1,
+    totalTokens: 29,
+    costUsd: 3,
+  });
+  assert.equal(running.totals.secondsRunning, 2.5);
+  assert.equal(
+    Object.hasOwn(logs.find((entry) => entry.message === "Agent run started")?.bindings ?? {}, "session_id"),
+    false,
+  );
+
+  finishSecondTurn.resolve();
+  await orchestrator.waitForCurrentRuns();
+
+  const completed = orchestrator.snapshot();
+  assert.equal(completed.running.length, 0);
+  assert.equal(completed.retrying[0]?.issueUrl, issueUrl);
+  assert.equal(completed.totals.secondsRunning, 2.5);
+  assert.equal(
+    logs.find((entry) => entry.message === "Continuation scheduled")?.bindings.session_id,
+    "metrics-session",
+  );
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("binds provider operations to the current issue and owned workspace", async () => {

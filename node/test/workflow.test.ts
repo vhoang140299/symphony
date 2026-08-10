@@ -95,6 +95,7 @@ test("invalid hot reload retains the last known-good workflow", async () => {
   const original = await store.initialize();
 
   await writeFile(workflowPath, "---\ntracker: [invalid]\n---\nBroken prompt.\n");
+  assert.equal(await store.initialize(), original);
   const later = new Date(Date.now() + 2_000);
   await utimes(workflowPath, later, later);
   const refreshed = await store.refresh();
@@ -134,6 +135,30 @@ test("keeps state optional and validates its strict shape", () => {
     tracker: { kind: "memory" },
     state: { path: "checkpoint.json", extra: true },
   }), /unrecognized|extra/i);
+});
+
+test("keeps the operations listener opt-in and validates its strict address", () => {
+  assert.equal(parseWorkflowConfig({ tracker: { kind: "memory" } }).server, undefined);
+  assert.deepEqual(
+    parseWorkflowConfig({ tracker: { kind: "memory" }, server: { port: 0 } }).server,
+    { port: 0, host: "127.0.0.1" },
+  );
+  assert.deepEqual(
+    parseWorkflowConfig({ tracker: { kind: "memory" }, server: { port: 65_535, host: " localhost " } }).server,
+    { port: 65_535, host: "localhost" },
+  );
+  assert.deepEqual(
+    parseWorkflowConfig({ tracker: { kind: "memory" }, server: { host: "localhost" } }).server,
+    { host: "localhost" },
+  );
+  for (const port of [-1, 65_536, 1.5, "3000"]) {
+    assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, server: { port } }));
+  }
+  assert.throws(() => parseWorkflowConfig({ tracker: { kind: "memory" }, server: { host: " " } }));
+  assert.throws(
+    () => parseWorkflowConfig({ tracker: { kind: "memory" }, server: { port: 3000, extra: true } }),
+    /unrecognized|extra/i,
+  );
 });
 
 test("uses tracker-specific state defaults and preserves explicit states", () => {
