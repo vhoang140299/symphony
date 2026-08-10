@@ -1,6 +1,12 @@
 import { LinearClient, type LinearClientOptions } from "@linear/sdk";
 import { z } from "zod";
-import type { BlockerRef, Issue, IssueMutation, Tracker } from "../domain.js";
+import type {
+  BlockerRef,
+  Issue,
+  IssueMutation,
+  IssueMutationOptions,
+  Tracker,
+} from "../domain.js";
 
 const DEFAULT_ENDPOINT = "https://api.linear.app/graphql";
 const DEFAULT_API_KEY_REFERENCE = "$LINEAR_API_KEY";
@@ -253,6 +259,10 @@ export class LinearTracker implements Tracker {
   }
 
   async fetchIssuesByIds(ids: string[]): Promise<Issue[]> {
+    return this.#fetchIssuesByIds(ids);
+  }
+
+  async #fetchIssuesByIds(ids: string[], signal?: AbortSignal): Promise<Issue[]> {
     const uniqueIds = normalizeInputs(ids, "issue id");
     if (uniqueIds.length === 0) return [];
 
@@ -265,7 +275,7 @@ export class LinearTracker implements Tracker {
         projectSlug: this.#settings.projectSlug,
         first: batch.length,
         relationFirst: PAGE_SIZE,
-      });
+      }, signal);
       const nodes = issueNodes(data);
       const byId = new Map<string, Issue>();
 
@@ -289,7 +299,12 @@ export class LinearTracker implements Tracker {
     return issues;
   }
 
-  async mutateIssue(issue: Issue, mutation: IssueMutation, signal: AbortSignal): Promise<void> {
+  async mutateIssue(
+    issue: Issue,
+    mutation: IssueMutation,
+    signal: AbortSignal,
+    options: IssueMutationOptions = {},
+  ): Promise<void> {
     const validated = validateMutation(mutation);
     const boundIssue = bindLinearIssue(issue);
     if (signal.aborted) throw new Error("Linear issue mutation was aborted");
@@ -323,8 +338,17 @@ export class LinearTracker implements Tracker {
           validated.state,
           context.teamId,
         );
-        if (current.stateId === stateId) return;
+        if (options.requireUnchanged === true) {
+          const [refreshed] = await this.#fetchIssuesByIds([context.issueId], operationSignal);
+          if (refreshed === undefined || !sameRoutingSnapshot(issue, refreshed)) {
+            throw new Error("Linear issue changed before state mutation");
+          }
+          if (normalizeState(refreshed.state) === normalizeState(validated.state)) return;
+        } else if (current.stateId === stateId) {
+          return;
+        }
         operationSignal.throwIfAborted();
+        // ponytail: Linear has no conditional update; revalidate as close to this write as its API permits.
         assertIssuePayload(
           await client.updateIssue(context.issueId, { stateId }),
           context.issueId,
@@ -363,13 +387,17 @@ export class LinearTracker implements Tracker {
     }
   }
 
-  async #request(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async #request(
+    query: string,
+    variables: Record<string, unknown>,
+    signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  ): Promise<Record<string, unknown>> {
     let response: unknown;
     try {
       const client = this.#clientFactory({
         apiKey: this.#settings.apiKey,
         apiUrl: this.#settings.endpoint,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal,
       });
       response = await client.client.rawRequest(query, variables);
     } catch {
@@ -804,6 +832,35 @@ function optionalTimestamp(value: unknown): string | null {
 
 function normalizeState(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function sameRoutingSnapshot(expected: Issue, current: Issue): boolean {
+  if (
+    expected.id !== current.id ||
+    expected.identifier !== current.identifier ||
+    expected.updatedAt === null ||
+    current.updatedAt === null ||
+    Date.parse(expected.updatedAt) !== Date.parse(current.updatedAt)
+  ) return false;
+
+  return routingFingerprint(expected) === routingFingerprint(current);
+}
+
+function routingFingerprint(issue: Issue): string {
+  const labels = issue.labels.map(normalizeState).sort();
+  const blockedBy = issue.blockedBy
+    .map(({ id, identifier, state }) => JSON.stringify([
+      id,
+      identifier,
+      state === null ? null : normalizeState(state),
+    ]))
+    .sort();
+  return JSON.stringify({
+    state: normalizeState(issue.state),
+    labels,
+    blockedBy,
+    dispatchable: issue.dispatchable,
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

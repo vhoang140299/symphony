@@ -1236,6 +1236,7 @@ export class Orchestrator {
           entry.issue,
           { kind: "set_state", state: delivery.reviewState },
           entry.controller.signal,
+          { requireUnchanged: true },
         );
         return { kind: "release", summary: "Issue handed off for human review" };
       }

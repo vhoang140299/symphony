@@ -548,6 +548,76 @@ test("makes typed Linear mutations convergent and fails closed on ambiguous targ
   );
 });
 
+test("revalidates guarded Linear state mutations immediately before writing", async () => {
+  const finalIssue = (overrides: Record<string, unknown> = {}) => rawIssue("issue-1", {
+    identifier: "SYM-1",
+    labels: { nodes: [] },
+    ...overrides,
+  });
+  const mutationClient = (
+    write: () => void,
+    stateId = "state-todo",
+  ): Partial<Omit<LinearClientLike, "client">> => ({
+    issue: async () => currentLinearIssue({ stateId }),
+    workflowStates: async () => ({
+      nodes: [{ id: "state-review", name: "Review", teamId: "team-1" }],
+      pageInfo: { hasNextPage: false },
+    }),
+    updateIssue: async () => {
+      write();
+      return { success: true, issueId: "issue-1" };
+    },
+  });
+
+  let writes = 0;
+  const matching = createTracker(
+    () => issuePage([finalIssue()]),
+    {},
+    undefined,
+    mutationClient(() => { writes += 1; }, "state-review"),
+  );
+  await matching.tracker.mutateIssue(
+    boundIssue(),
+    { kind: "set_state", state: "Review" },
+    new AbortController().signal,
+    { requireUnchanged: true },
+  );
+  assert.equal(writes, 1);
+  assert.equal(matching.requests.length, 1);
+  assert.equal(matching.clientOptions.length, 2);
+  assert.equal(matching.clientOptions[0]?.signal, matching.clientOptions[1]?.signal);
+
+  const activeBlocker = {
+    type: "blocks",
+    issue: { id: "blocker-1", identifier: "SYM-9", state: { name: "In Progress" } },
+  };
+  const drifted = [
+    { issue: finalIssue({ state: { name: "Done" } }) },
+    { issue: finalIssue({ labels: { nodes: [{ name: "backend" }] } }) },
+    { issue: finalIssue({ inverseRelations: { nodes: [activeBlocker], pageInfo: { hasNextPage: false } } }) },
+    { issue: finalIssue({ updatedAt: "2026-01-03T00:00:00Z" }) },
+    { issue: finalIssue({ state: { name: "Done" } }), sdkStateId: "state-review" },
+  ];
+  for (const { issue: current, sdkStateId } of drifted) {
+    const guarded = createTracker(
+      () => issuePage([current]),
+      {},
+      undefined,
+      mutationClient(() => { writes += 1; }, sdkStateId),
+    ).tracker;
+    await assert.rejects(
+      guarded.mutateIssue(
+        boundIssue(),
+        { kind: "set_state", state: "Review" },
+        new AbortController().signal,
+        { requireUnchanged: true },
+      ),
+      /Linear issue mutation failed/,
+    );
+  }
+  assert.equal(writes, 1, "routing drift must never reach updateIssue");
+});
+
 test("rejects stale, aborted, and invalid Linear mutation results without leaking provider data", async () => {
   const secret = "linear-secret-body";
   let writes = 0;
