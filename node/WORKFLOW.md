@@ -36,6 +36,7 @@ agent:
   max_retry_backoff_ms: 300000
 
 runtime:
+  # Select Codex here with `kind: codex`; top-level `codex:` blocks are not supported.
   kind: claude
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000

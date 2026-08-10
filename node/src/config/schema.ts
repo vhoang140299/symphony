@@ -125,6 +125,13 @@ const rawWorkflowConfigSchema = z
   })
   .passthrough()
   .superRefine((value, context) => {
+    if (Object.hasOwn(value, "codex")) {
+      context.addIssue({
+        code: "custom",
+        path: ["codex"],
+        message: "Top-level codex configuration is unsupported; use runtime.kind: codex and runtime.options",
+      });
+    }
     if (value.delivery === undefined && value.control === undefined) return;
     const githubDelivery = value.delivery !== undefined && "queue_label" in value.delivery
       ? value.delivery

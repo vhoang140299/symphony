@@ -310,6 +310,10 @@ runtime:
     model_reasoning_effort: high
 ```
 
+The Elixir implementation's top-level `codex:` block is not compatible with this SDK-based runtime
+and is rejected. Use `runtime.kind: codex` and the supported `runtime.options` instead; Symphony
+does not translate free-form Codex commands or pass-through sandbox policies.
+
 The Codex adapter starts or resumes an SDK thread in the issue workspace with `workspace-write`,
 approval policy `never`, login shells and subagents disabled, a minimal command environment, and
 network and web search disabled. Optional settings are `model`,

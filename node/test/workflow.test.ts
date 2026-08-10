@@ -222,6 +222,21 @@ test("accepts supported coding-agent runtimes and rejects unknown kinds during c
   );
 });
 
+test("rejects legacy top-level codex configuration instead of defaulting to Claude", () => {
+  const legacyConfig = {
+    tracker: { kind: "memory" },
+    codex: { command: "codex app-server" },
+  };
+  assert.throws(
+    () => parseWorkflowConfig(legacyConfig),
+    /top-level codex.*runtime\.kind: codex.*runtime\.options/i,
+  );
+  assert.throws(
+    () => parseWorkflowConfig({ ...legacyConfig, runtime: { kind: "codex" } }),
+    /top-level codex.*runtime\.kind: codex.*runtime\.options/i,
+  );
+});
+
 test("host delivery is explicit, label-bound, and keeps tracker credentials out of the agent", () => {
   const config = {
     tracker: {

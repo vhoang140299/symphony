@@ -11,7 +11,7 @@ import { test } from "vitest";
 import { loadWorkflow } from "../src/config/workflow.js";
 import { configuredExecutableCandidates, runDoctor } from "../src/doctor.js";
 import type { Issue } from "../src/domain.js";
-import { summarizePreflight } from "../src/preflight.js";
+import { runPreflight, summarizePreflight } from "../src/preflight.js";
 
 const execFileAsync = promisify(execFile);
 const cliPath = fileURLToPath(new URL("../dist/src/cli.js", import.meta.url));
@@ -920,6 +920,34 @@ test("CLI --doctor reports invalid workflows with generic redacted JSON", async 
         return true;
       },
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("preflight and doctor reject legacy top-level codex configuration", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-cli-legacy-codex-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  await writeFile(
+    workflowPath,
+    "---\ntracker:\n  kind: memory\n  provider: { issues: [] }\ncodex:\n  command: codex app-server\n---\n",
+  );
+
+  try {
+    await assert.rejects(
+      runPreflight(workflowPath),
+      /top-level codex.*runtime\.kind: codex.*runtime\.options/i,
+    );
+
+    const report = await runDoctor(workflowPath);
+    assert.equal(report.ok, false);
+    assert.equal(report.tracker, null);
+    assert.equal(report.runtime, null);
+    assert.deepEqual(report.checks[0], {
+      id: "workflow.config",
+      status: "error",
+      summary: "workflow configuration is invalid",
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
