@@ -1,6 +1,6 @@
 {
   "name": "@ai-symphony/node",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "packageManager": "pnpm@11.20.0",
   "type": "module",
