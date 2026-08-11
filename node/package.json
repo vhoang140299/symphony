@@ -16,6 +16,7 @@
     "start": "node packages/cli/dist/cli.js",
     "test": "pnpm run build && vitest run",
     "test:integration:github": "vitest run --reporter=verbose packages/trackers/test/github-live.test.ts",
+    "test:integration:github:codex": "pnpm run build && vitest run --reporter=verbose packages/trackers/test/github-live.test.ts -t \"completes a real GitHub issue with Codex\"",
     "test:watch": "vitest"
   },
   "devDependencies": {
