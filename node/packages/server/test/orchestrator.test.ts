@@ -73,6 +73,38 @@ test("dispatches by priority without duplicate claims and accumulates absolute u
   await orchestrator.stop();
 });
 
+test("dispatches a renamed issue from the final ID refresh", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-candidate-rename-"));
+  const fixture = rawIssue("renamed", "OLD-1", 1, "2025-01-01T00:00:00Z");
+  const [stale] = await new MemoryTracker({ issues: [fixture] }).fetchIssuesByIds([fixture.id]);
+  assert.ok(stale);
+  let current: Issue = { ...stale, identifier: "NEW-1" };
+  const tracker: Tracker = {
+    async fetchIssuesByStates() {
+      return [stale];
+    },
+    async fetchIssuesByIds(ids) {
+      return ids.includes(current.id) ? [current] : [];
+    },
+  };
+  const seen: string[] = [];
+  const driver = new FakeDriver(async function* (context) {
+    seen.push(context.issue.identifier);
+    current = { ...current, state: "Done" };
+    yield event("turn_completed");
+  });
+  const workflowPath = await writeWorkflow(directory, [fixture]);
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.deepEqual(seen, ["NEW-1"]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
 test("dispatches a prototype-named state without an explicit per-state limit", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-state-capacity-own-key-"));
   const issue = { ...rawIssue("own-key", "OWN-KEY-1", 1, "2025-01-01T00:00:00Z"), state: "constructor" };

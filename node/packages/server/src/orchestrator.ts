@@ -1122,7 +1122,7 @@ export class Orchestrator {
       }
       if (this.#shuttingDown || this.#dispatchPaused) return;
       if (
-        !sameIssueIdentity(candidate, issue)
+        issue === undefined
         || !isRoutable(issue, workflow.config)
         || !this.#hasCapacity(issue, workflow.config)
       ) continue;
