@@ -188,6 +188,14 @@ test("normalizes per-state concurrency limits and ignores invalid entries", () =
   });
 
   assert.deepEqual(config.agent.maxConcurrentAgentsByState, { todo: 2, "in progress": 3 });
+  const prototypeStateLimits = parseWorkflowConfig({
+    tracker: { kind: "memory" },
+    agent: {
+      max_concurrent_agents_by_state: Object.fromEntries([["__proto__", 2]]),
+    },
+  }).agent.maxConcurrentAgentsByState;
+  assert.equal(Object.hasOwn(prototypeStateLimits, "__proto__"), true);
+  assert.equal(prototypeStateLimits["__proto__"], 2);
   for (const maxConcurrentAgentsByState of [null, [], "invalid", 1]) {
     assert.throws(() => parseWorkflowConfig({
       tracker: { kind: "memory" },

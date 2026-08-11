@@ -95,6 +95,36 @@ test("dispatches a prototype-named state without an explicit per-state limit", a
   await rm(directory, { recursive: true, force: true });
 });
 
+test("honors an explicit limit for a prototype-named state", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-state-capacity-proto-key-"));
+  const issues = [
+    { ...rawIssue("proto-key-1", "PROTO-1", 1, "2025-01-01T00:00:00Z"), state: "__proto__" },
+    { ...rawIssue("proto-key-2", "PROTO-2", 2, "2025-01-02T00:00:00Z"), state: "__proto__" },
+  ];
+  const tracker = new MemoryTracker({ issues });
+  const release = deferred<void>();
+  const driver = new FakeDriver(async function* (context) {
+    await release.promise;
+    tracker.setIssueState(context.issue.id, "Done");
+    yield event("turn_completed");
+  });
+  const workflowPath = await writeWorkflow(directory, issues, {
+    activeStates: ["__proto__"],
+    maxConcurrentAgents: 2,
+    maxConcurrentAgentsByState: Object.fromEntries([["__proto__", 1]]),
+  });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
+
+  await orchestrator.pollOnce();
+  const running = orchestrator.snapshot().running.length;
+  release.resolve();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.equal(running, 1);
+  await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
 test("snapshots only normalized model rate-limit fields", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-orchestrator-rate-limit-"));
   const issue = rawIssue("rate-limit", "RATE-1", 1, "2025-01-01T00:00:00Z");
@@ -2632,6 +2662,7 @@ async function writeWorkflow(
     activeStates?: string[];
     durable?: boolean;
     maxConcurrentAgents?: number;
+    maxConcurrentAgentsByState?: Record<string, number>;
     maxAttempts?: number;
     hooks?: Record<string, string>;
     maxTurns?: number;
@@ -2655,6 +2686,9 @@ async function writeWorkflow(
     ...(options.durable === true ? { state: { path: "./runs.json" } } : {}),
     agent: {
       max_concurrent_agents: options.maxConcurrentAgents ?? 1,
+      ...(options.maxConcurrentAgentsByState === undefined
+        ? {}
+        : { max_concurrent_agents_by_state: options.maxConcurrentAgentsByState }),
       max_turns: options.maxTurns ?? 1,
       ...(options.maxAttempts === undefined ? {} : { max_attempts: options.maxAttempts }),
       max_retry_backoff_ms: 1_000,

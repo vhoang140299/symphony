@@ -60,7 +60,7 @@ const agentSchema = z
     max_continuations: positiveInteger.optional(),
     max_attempts: positiveInteger.optional(),
     max_retry_backoff_ms: positiveInteger.default(300_000),
-    max_concurrent_agents_by_state: z.record(z.string(), z.unknown()).default({}),
+    max_concurrent_agents_by_state: z.custom<Record<string, unknown>>(z.util.isPlainObject).default({}),
   })
   .superRefine((value, context) => {
     if (
