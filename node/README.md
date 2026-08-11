@@ -60,6 +60,21 @@ Tests are Vitest projects, one per package. Cross-package specifiers are aliased
 sources in [`vitest.config.ts`](vitest.config.ts), so `pnpm test:watch` needs no build. `pnpm test`
 still builds first because the CLI suite exercises the compiled `packages/cli/dist/cli.js`.
 
+The real GitHub tracker smoke test is opt-in and must target a disposable repository with Issues
+enabled. It creates one isolated issue, reads it through the production adapter, closes it, and
+reports as skipped unless explicitly enabled:
+
+```bash
+SYMPHONY_RUN_GITHUB_LIVE_E2E=1 \
+SYMPHONY_LIVE_GITHUB_REPO=owner/disposable-repo \
+GITHUB_TOKEN="$GITHUB_TOKEN" \
+pnpm test:integration:github
+```
+
+The test always attempts to close the issue in cleanup. GitHub does not support deleting issues,
+so the closed issue remains as an audit record. This profile does not start an agent or publish a
+pull request.
+
 Example workflow profiles are in [`workflows/`](workflows).
 
 ## Relationship to the Elixir implementation
