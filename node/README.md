@@ -75,24 +75,6 @@ The test always attempts to close the issue in cleanup. GitHub does not support 
 so the closed issue remains as an audit record. This profile does not start an agent or publish a
 pull request.
 
-The full GitHub/Codex profile additionally requires `gh`, an authenticated file-based Codex login,
-and a private disposable repository whose default branch is `main`. It copies only `auth.json` from
-`CODEX_HOME` (or `~/.codex`) into a mode-`0700` temporary profile, runs one issue with one Codex turn
-and one attempt, verifies the published pull request, then closes the issue and pull request and
-deletes the generated branch:
-
-```bash
-SYMPHONY_RUN_GITHUB_CODEX_LIVE_E2E=1 \
-SYMPHONY_LIVE_GITHUB_REPO=owner/disposable-private-repo \
-GITHUB_TOKEN="$GITHUB_TOKEN" \
-pnpm test:integration:github:codex
-```
-
-The repository's `main` ref must remain unchanged. Cleanup failures fail the test; closed issues and
-pull requests remain as audit records. The temporary Codex profile and workspace are removed during
-normal cleanup; after an abrupt process or host termination, remove any stale
-`symphony-github-codex-live-*` directory from the operating system's temporary directory.
-
 Example workflow profiles are in [`workflows/`](workflows).
 
 ## Relationship to the Elixir implementation
