@@ -601,20 +601,11 @@ posixTest("keeps a recovered Linear handoff pending when its owned workspace is 
   await orchestrator.stop();
 });
 
-posixTest("fails Linear pending-delivery recovery when mutation support is missing", async () => {
+posixTest("fails Linear delivery startup without mutation support when no pending result exists", async () => {
   const root = await fixture("symphony-recovery-linear-missing-mutate-");
   const issue = linearIssue();
   const workflowPath = await writeLinearDeliveryWorkflow(root);
   const { workflowStore, definition, store } = await durableStore(workflowPath);
-  await seedState(store, [
-    {
-      kind: "running",
-      issueId: issue.id,
-      attempt: null,
-      continuation: 0,
-      pendingDelivery: { completion, idempotencyKey },
-    },
-  ]);
   let trackerCalls = 0;
   let modelCalls = 0;
   const orchestrator = new Orchestrator(workflowStore, logger, {
@@ -641,7 +632,165 @@ posixTest("fails Linear pending-delivery recovery when mutation support is missi
   assert.equal(trackerCalls, 0);
   assert.equal(modelCalls, 0);
   await assert.rejects(access(definition.config.workspace.root), isMissing);
-  assert.equal((await store.load()).length, 1);
+  assert.deepEqual(await store.load(), []);
+});
+
+posixTest("fails Linear delivery startup when the persisted result is no longer visible", async () => {
+  const root = await fixture("symphony-recovery-linear-missing-result-");
+  const issue = linearIssue();
+  const workflowPath = await writeLinearDeliveryWorkflow(root);
+  const { workflowStore, store } = await durableStore(workflowPath);
+  await seedState(store, [
+    {
+      kind: "running",
+      issueId: issue.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+  ]);
+  let trackerCalls = 0;
+  let modelCalls = 0;
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker: {
+      async fetchIssuesByStates() {
+        trackerCalls += 1;
+        return [];
+      },
+      async fetchIssuesByIds() {
+        trackerCalls += 1;
+        return [];
+      },
+    },
+    driver: driverFrom(async function* () {
+      modelCalls += 1;
+      yield event("turn_completed");
+    }),
+  });
+
+  await assert.rejects(
+    orchestrator.pollOnce(),
+    /Configured host delivery requires the tracker capabilities for its delivery kind/,
+  );
+  assert.equal(trackerCalls, 1);
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(await store.load(), []);
+});
+
+posixTest("recovers only pending delivery until missing tracker capability is repaired", async () => {
+  const root = await fixture("symphony-recovery-linear-capability-repair-");
+  let pending = linearIssue();
+  let candidate = {
+    ...linearIssue(),
+    id: "linear-issue-2",
+    identifier: "LIN-2",
+    title: "A separate candidate",
+  };
+  let freshCandidate = {
+    ...linearIssue(),
+    id: "linear-issue-3",
+    identifier: "LIN-3",
+    title: "An unclaimed candidate",
+  };
+  const workflowPath = await writeLinearDeliveryWorkflow(root);
+  const { workflowStore, definition, store } = await durableStore(workflowPath);
+  let now = Date.UTC(2026, 0, 1);
+  await seedState(store, [
+    {
+      kind: "running",
+      issueId: pending.id,
+      attempt: null,
+      continuation: 0,
+      pendingDelivery: { completion, idempotencyKey },
+    },
+    {
+      kind: "retrying",
+      issueId: candidate.id,
+      attempt: 1,
+      continuation: 0,
+      dueAtMs: now,
+      reason: "failure",
+      error: "Agent run failed",
+    },
+  ]);
+  const workspaceManager = new WorkspaceManager(logger);
+  await workspaceManager.createForIssue(pending, definition.config);
+  await workspaceManager.createForIssue(candidate, definition.config);
+
+  const deliveryStarted = deferred<void>();
+  const releaseDelivery = deferred<void>();
+  const operations: string[] = [];
+  const driverIssues: string[] = [];
+  const tracker: Tracker = {
+    async fetchIssuesByStates(states) {
+      return [pending, candidate, freshCandidate].filter((issue) => states.includes(issue.state));
+    },
+    async fetchIssuesByIds(ids) {
+      return [pending, candidate, freshCandidate].filter((issue) => ids.includes(issue.id));
+    },
+  };
+  const orchestrator = new Orchestrator(workflowStore, logger, {
+    tracker,
+    driver: driverFrom(async function* (context) {
+      driverIssues.push(context.issue.id);
+      if (context.issue.id === candidate.id) candidate = { ...candidate, state: "Done" };
+      if (context.issue.id === freshCandidate.id) freshCandidate = { ...freshCandidate, state: "Done" };
+      yield event("turn_completed", { completion });
+    }),
+    now: () => now,
+  });
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+
+  assert.deepEqual(driverIssues, []);
+  const retained = await store.load();
+  assert.equal(retained.length, 2);
+  const pendingClaim = retained.find(
+    (claim) => "pendingDelivery" in claim && claim.pendingDelivery !== undefined,
+  );
+  assert.equal(
+    pendingClaim !== undefined && "pendingDelivery" in pendingClaim
+      ? pendingClaim.pendingDelivery?.idempotencyKey
+      : undefined,
+    idempotencyKey,
+  );
+  const retainedRetry = retained.find(({ issueId }) => issueId === candidate.id);
+  assert.equal(retainedRetry?.kind, "retrying");
+  if (retainedRetry?.kind === "retrying") assert.equal(retainedRetry.error, "Agent run failed");
+
+  tracker.mutateIssue = async (_issue, mutation) => {
+    if (mutation.kind === "comment") {
+      assert.equal(mutation.idempotencyKey, idempotencyKey);
+      operations.push(`comment:${mutation.idempotencyKey}`);
+      deliveryStarted.resolve();
+      await releaseDelivery.promise;
+      return;
+    }
+    if (mutation.kind === "set_state") {
+      operations.push(`state:${mutation.state}`);
+      pending = { ...pending, state: mutation.state };
+      return;
+    }
+    assert.fail(`Unexpected mutation ${mutation.kind}`);
+  };
+  now += 60_000;
+  const repairPoll = orchestrator.pollOnce();
+  await deliveryStarted.promise;
+  await repairPoll;
+  assert.deepEqual(driverIssues, []);
+
+  releaseDelivery.resolve();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(operations, [`comment:${idempotencyKey}`, "state:Human Review"]);
+  assert.equal(pending.state, "Human Review");
+
+  now += 1_000;
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(driverIssues, [candidate.id]);
+  assert.deepEqual(await store.load(), []);
+  await orchestrator.stop();
 });
 
 posixTest("does not create a workspace or invoke the model for an undeliverable recovered result", async () => {

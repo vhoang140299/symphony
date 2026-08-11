@@ -392,6 +392,8 @@ resumes on schedule, a pending delivery resumes host-only without another model 
 run dispatched before the crash becomes blocked for manual retry. It does store bounded blocked
 summaries plus pending-delivery summary and verification text; these fields are agent-generated and
 can quote issue or repository content, so treat the checkpoint as sensitive despite mode `0600`.
+If the recovered delivery capability is unavailable, Symphony remains up for reconciliation but
+holds ordinary retries and new agent dispatch until a valid delivery configuration is reloaded.
 The checkpoint never stores tracker credentials, model tokens, rendered prompts, raw provider
 events, or agent sessions.
 

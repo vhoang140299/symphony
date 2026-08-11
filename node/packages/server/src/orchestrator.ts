@@ -205,6 +205,7 @@ export class Orchestrator {
   #startedAtMs: number | undefined;
   #lastPollAtMs: number | undefined;
   #dispatchPaused = false;
+  #deliveryRecoveryOnly = false;
   #totals = zeroUsage();
   #completedRuntimeMs = 0;
   #latestRateLimits: AgentRateLimit | null = null;
@@ -352,14 +353,14 @@ export class Orchestrator {
     try {
       const workflow = await this.#workflowStore.initialize();
       if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
-      this.#applyWorkflow(workflow);
+      this.#applyWorkflow(workflow, true);
       if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
       if (this.#stateStore !== undefined) {
         await this.#stateStore.acquireLease();
       }
       if (this.#shuttingDown) throw new Error("A stopped orchestrator cannot be restarted");
       this.#startedAtMs = this.#now();
-      await this.#recoverState();
+      await this.#recoverState(trackerCapabilityError(workflow, this.#requireTracker()));
       if (!this.#shuttingDown) await this.#cleanupTerminalWorkspaces();
       if (this.#shuttingDown && this.#stateWritesFrozen) this.#clearClaims();
     } catch (error) {
@@ -375,6 +376,7 @@ export class Orchestrator {
       this.#stateStore = undefined;
       this.#statePath = undefined;
       this.#scopeHash = undefined;
+      this.#deliveryRecoveryOnly = false;
       this.#startedAtMs = undefined;
       this.#persistenceFailure = undefined;
       throw error;
@@ -508,6 +510,15 @@ export class Orchestrator {
       }
     }
 
+    const workflow = this.#requireWorkflow();
+    const tracker = this.#requireTracker();
+    if (trackerCapabilityError(workflow, tracker) === undefined) {
+      const hasPendingDelivery = [...this.#retrying.values()].some(
+        ({ pendingDelivery }) => pendingDelivery !== undefined,
+      );
+      this.#deliveryRecoveryOnly = hasPendingDelivery && !supportsHostDelivery(workflow, tracker);
+    }
+
     if (this.#shuttingDown) return;
     await this.#reconcile();
     this.#requirePersistenceHealthy();
@@ -520,7 +531,7 @@ export class Orchestrator {
     this.#assertClaimInvariant();
   }
 
-  #applyWorkflow(workflow: WorkflowDefinition): void {
+  #applyWorkflow(workflow: WorkflowDefinition, deferCapabilityValidation = false): void {
     const tracker = this.#trackerOverride ?? createTracker(
       workflow.config.tracker.kind,
       workflow.config.tracker.provider,
@@ -532,16 +543,8 @@ export class Orchestrator {
     if (driver.kind !== workflow.config.runtime.kind) {
       throw new Error(`Runtime driver ${driver.kind} does not match configured kind ${workflow.config.runtime.kind}`);
     }
-    if (workflow.config.control !== undefined && tracker.mutateIssue === undefined) {
-      throw new Error("Configured control labels require tracker mutation support");
-    }
-    if (
-      workflow.config.delivery !== undefined &&
-      (tracker.mutateIssue === undefined ||
-        (workflow.config.delivery.kind === "github_pr" && tracker.publishIssueChange === undefined))
-    ) {
-      throw new Error("Configured host delivery requires the tracker capabilities for its delivery kind");
-    }
+    const capabilityError = trackerCapabilityError(workflow, tracker);
+    if (capabilityError !== undefined && !deferCapabilityValidation) throw capabilityError;
     if (this.#workflow !== undefined) {
       if (statePath !== this.#statePath) {
         throw new Error("Workflow reload cannot change durable state.path");
@@ -560,9 +563,13 @@ export class Orchestrator {
     }
   }
 
-  async #recoverState(): Promise<void> {
+  async #recoverState(capabilityError?: Error): Promise<void> {
+    this.#deliveryRecoveryOnly = false;
     const store = this.#stateStore;
-    if (store === undefined) return;
+    if (store === undefined) {
+      if (capabilityError !== undefined) throw capabilityError;
+      return;
+    }
 
     let claims: PersistedClaim[];
     try {
@@ -570,6 +577,10 @@ export class Orchestrator {
     } catch (error) {
       throw this.#failPersistence(error);
     }
+    const hasPendingDelivery = claims.some(
+      (claim) => "pendingDelivery" in claim && claim.pendingDelivery !== undefined,
+    );
+    if (capabilityError !== undefined && !hasPendingDelivery) throw capabilityError;
     if (claims.length === 0) return;
 
     const workflow = this.#requireWorkflow();
@@ -661,8 +672,13 @@ export class Orchestrator {
       this.#claimed.add(issue.id);
     }
 
+    const hasRecoveredPendingDelivery = [...this.#retrying.values()].some(
+      ({ pendingDelivery }) => pendingDelivery !== undefined,
+    );
+    this.#deliveryRecoveryOnly = hasRecoveredPendingDelivery && !supportsHostDelivery(workflow, tracker);
     this.#assertClaimInvariant();
     if (changed) await this.#persistState();
+    if (capabilityError !== undefined && !hasRecoveredPendingDelivery) throw capabilityError;
   }
 
   async #persistState(): Promise<void> {
@@ -1026,6 +1042,11 @@ export class Orchestrator {
 
     for (const [issueId, retry] of due) {
       if (this.#shuttingDown || this.#dispatchPaused) return;
+      if (this.#deliveryRecoveryOnly && retry.pendingDelivery === undefined) {
+        retry.dueAtMs = this.#now() + this.#requireWorkflow().config.polling.intervalMs;
+        await this.#persistState();
+        continue;
+      }
       const session = this.#sessionForTrackerScope(retry.trackerScopeHash);
       if (
         session === undefined
@@ -1090,7 +1111,7 @@ export class Orchestrator {
   }
 
   async #dispatchCandidates(failOnTrackerError: boolean): Promise<void> {
-    if (this.#dispatchPaused) return;
+    if (this.#dispatchPaused || this.#deliveryRecoveryOnly) return;
     const workflow = this.#requireWorkflow();
     if (this.#running.size >= workflow.config.agent.maxConcurrentAgents) return;
     const tracker = this.#requireTracker();
@@ -1959,6 +1980,16 @@ function supportsHostDelivery(workflow: WorkflowDefinition, tracker: Tracker): b
   return delivery !== undefined
     && tracker.mutateIssue !== undefined
     && (delivery.kind !== "github_pr" || tracker.publishIssueChange !== undefined);
+}
+
+function trackerCapabilityError(workflow: WorkflowDefinition, tracker: Tracker): Error | undefined {
+  if (workflow.config.control !== undefined && tracker.mutateIssue === undefined) {
+    return new Error("Configured control labels require tracker mutation support");
+  }
+  if (workflow.config.delivery !== undefined && !supportsHostDelivery(workflow, tracker)) {
+    return new Error("Configured host delivery requires the tracker capabilities for its delivery kind");
+  }
+  return undefined;
 }
 
 function finiteNonNegative(value: number): number {
