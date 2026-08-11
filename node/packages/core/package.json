@@ -1,0 +1,26 @@
+{
+  "name": "@ai-symphony/core",
+  "version": "0.6.0",
+  "description": "Domain model, workflow config, run state and workspace primitives shared by every Symphony package",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "liquidjs": "10.28.0",
+    "pino": "10.3.1",
+    "yaml": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:"
+  }
+}

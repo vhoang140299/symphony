@@ -1,0 +1,25 @@
+{
+  "name": "@ai-symphony/trackers",
+  "version": "0.6.0",
+  "description": "GitHub, Linear and in-memory issue trackers for the Symphony orchestrator",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@ai-symphony/core": "workspace:*",
+    "@linear/sdk": "89.0.0",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:"
+  }
+}

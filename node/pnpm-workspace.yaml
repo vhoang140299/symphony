@@ -1,0 +1,12 @@
+packages:
+  - packages/*
+
+# Shared versions for dependencies more than one package needs, so they can never
+# drift apart. Packages reference them with "catalog:".
+catalog:
+  "@types/node": 24.13.3
+  typescript: 7.0.2
+  vite: 8.2.1
+  vitest: 4.1.10
+  yaml: 2.9.0
+  zod: 4.4.3

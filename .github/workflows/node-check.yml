@@ -32,8 +32,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Type-check
+        run: pnpm run check
+
       - name: Test
         run: pnpm test
-
-      - name: Test packed CLI
-        run: pnpm run test:pack
