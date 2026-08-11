@@ -22,13 +22,13 @@ import type { AppLogger } from "@ai-symphony/core/log.js";
 import { classifyIssue, isRoutable, selectRoutableIssues } from "@ai-symphony/core/routing.js";
 import { RunStateStore, type PersistedClaim } from "@ai-symphony/core/state/store.js";
 import { workflowScopeHash, workflowTrackerScopeHash } from "@ai-symphony/core/state/scope.js";
+import { scheduleLongTimeout } from "@ai-symphony/core/system.js";
 import { createAgentDriver } from "@ai-symphony/agents/registry.js";
 import { createTracker } from "@ai-symphony/trackers/registry.js";
 import { WorkspaceManager, workspaceKey } from "@ai-symphony/core/workspace/manager.js";
 
 const continuationPrompt =
   "Continue working on the same issue. Inspect the current workspace, finish any remaining work, and verify the result.";
-const maxTimerDelayMs = 2_147_483_647;
 
 const zeroUsage = (): AgentUsage => ({
   inputTokens: 0,
@@ -195,7 +195,7 @@ export class Orchestrator {
     this.#resolveFatalError = resolve;
   });
   #stateWritesFrozen = false;
-  #timer: NodeJS.Timeout | undefined;
+  #cancelPollTimer: (() => void) | undefined;
   #initializationPromise: Promise<void> | undefined;
   #pollPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
@@ -268,8 +268,8 @@ export class Orchestrator {
     this.#shuttingDown = true;
     this.#stopPromise = Promise.resolve().then(() => this.#finishStop());
     this.#shutdownController.abort(new Error("Orchestrator is shutting down"));
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
+    this.#cancelPollTimer?.();
+    this.#cancelPollTimer = undefined;
     return this.#stopPromise;
   }
 
@@ -723,8 +723,8 @@ export class Orchestrator {
     }
     this.#started = false;
     this.#startupComplete = false;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
+    this.#cancelPollTimer?.();
+    this.#cancelPollTimer = undefined;
     for (const entry of this.#running.values()) {
       this.#requestStop(
         entry,
@@ -1298,10 +1298,10 @@ export class Orchestrator {
     let terminal: AgentEvent | undefined;
     let terminalCount = 0;
     const timeoutMs = entry.workflow.config.runtime.turnTimeoutMs;
-    let timeout: NodeJS.Timeout | undefined;
+    let cancelTimeout: (() => void) | undefined;
     const resetTimeout = () => {
-      if (timeout) clearTimeout(timeout);
-      timeout = setTimeout(() => {
+      cancelTimeout?.();
+      cancelTimeout = scheduleLongTimeout(() => {
         this.#requestStop(entry, "turn_timeout", `No agent stream activity for ${timeoutMs}ms`);
       }, timeoutMs);
     };
@@ -1410,7 +1410,7 @@ export class Orchestrator {
         }
       }
     } finally {
-      if (timeout) clearTimeout(timeout);
+      cancelTimeout?.();
     }
 
     if (entry.stopReason) {
@@ -1805,32 +1805,25 @@ export class Orchestrator {
     return stateCount < stateLimit;
   }
 
-  #scheduleNextPoll(remainingDelayMs?: number): void {
+  #scheduleNextPoll(): void {
     if (!this.#started || this.#shuttingDown || this.#persistenceFailure !== undefined) return;
-    if (this.#timer) clearTimeout(this.#timer);
-    let delayMs = remainingDelayMs;
-    if (delayMs === undefined) {
-      const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
-      delayMs = intervalMs;
-      if (!this.#dispatchPaused) {
-        let nextRetryAt = Infinity;
-        for (const { dueAtMs } of this.#retrying.values()) {
-          nextRetryAt = Math.min(nextRetryAt, dueAtMs);
-        }
-        const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
-        delayMs = Math.min(intervalMs, retryDelayMs);
+    this.#cancelPollTimer?.();
+    const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
+    let delayMs = intervalMs;
+    if (!this.#dispatchPaused) {
+      let nextRetryAt = Infinity;
+      for (const { dueAtMs } of this.#retrying.values()) {
+        nextRetryAt = Math.min(nextRetryAt, dueAtMs);
       }
+      const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
+      delayMs = Math.min(intervalMs, retryDelayMs);
     }
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      if (delayMs > maxTimerDelayMs) {
-        this.#scheduleNextPoll(delayMs - maxTimerDelayMs);
-        return;
-      }
+    this.#cancelPollTimer = scheduleLongTimeout(() => {
+      this.#cancelPollTimer = undefined;
       void this.pollOnce()
         .catch((error: unknown) => this.#logger.error({ error }, "Poll cycle failed"))
         .finally(() => this.#scheduleNextPoll());
-    }, Math.min(delayMs, maxTimerDelayMs));
+    }, delayMs);
   }
 
   #wakeForRetry(): void {
@@ -1984,14 +1977,14 @@ function requireValue<T>(value: T | undefined, message: string): T {
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   if (timeoutMs <= 0) return false;
   return new Promise<boolean>((resolve) => {
-    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    const cancelTimeout = scheduleLongTimeout(() => resolve(false), timeoutMs);
     promise.then(
       () => {
-        clearTimeout(timeout);
+        cancelTimeout();
         resolve(true);
       },
       () => {
-        clearTimeout(timeout);
+        cancelTimeout();
         resolve(true);
       },
     );

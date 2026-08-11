@@ -15,6 +15,7 @@ import { z } from "zod";
 import { agentCompletionOutputSchema, parseAgentCompletionJson } from "@ai-symphony/core/completion.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, AgentUsage } from "@ai-symphony/core/domain.js";
 import { resolveGitExecutable } from "@ai-symphony/core/publish/git.js";
+import { scheduleLongTimeout } from "@ai-symphony/core/system.js";
 import { isPathContained, pickEnvironment } from "./environment.js";
 
 const codexOptionsSchema = z
@@ -71,7 +72,7 @@ export class CodexAgentDriver implements AgentDriver {
     let commandTempPath: string | undefined;
     let sessionId = context.sessionId;
     let lastCompletedAgentMessage: string | undefined;
-    let readTimeout: NodeJS.Timeout | undefined;
+    let cancelReadTimeout: (() => void) | undefined;
     let readTimeoutSummary: string | undefined;
 
     try {
@@ -155,7 +156,7 @@ export class CodexAgentDriver implements AgentDriver {
       if (readTimeoutController !== undefined && configured.read_timeout_ms !== undefined) {
         const timeoutMs = configured.read_timeout_ms;
         const summary = `Codex startup timed out after ${timeoutMs}ms`;
-        readTimeout = setTimeout(() => {
+        cancelReadTimeout = scheduleLongTimeout(() => {
           readTimeoutSummary = summary;
           readTimeoutController.abort(new Error(summary));
         }, timeoutMs);
@@ -172,9 +173,9 @@ export class CodexAgentDriver implements AgentDriver {
 
       for await (const event of stream) {
         streamSignal.throwIfAborted();
-        if (readTimeout !== undefined) {
-          clearTimeout(readTimeout);
-          readTimeout = undefined;
+        if (cancelReadTimeout !== undefined) {
+          cancelReadTimeout();
+          cancelReadTimeout = undefined;
         }
         if (event.type === "thread.started") {
           sessionId = event.thread_id;
@@ -262,7 +263,7 @@ export class CodexAgentDriver implements AgentDriver {
         });
       }
     } finally {
-      if (readTimeout !== undefined) clearTimeout(readTimeout);
+      cancelReadTimeout?.();
       if (commandTempPath !== undefined) await removeCodexCommandTemp(commandTempPath);
     }
   }

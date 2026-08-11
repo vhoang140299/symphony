@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import type { WorkflowConfig } from "../config/schema.js";
 import type { Issue } from "../domain.js";
 import type { AppLogger } from "../log.js";
-import { isNodeError, terminateProcessTreeBestEffort } from "../system.js";
+import { isNodeError, scheduleLongTimeout, terminateProcessTreeBestEffort } from "../system.js";
 
 export interface Workspace {
   path: string;
@@ -323,7 +323,7 @@ async function runHook(
   if (signal?.aborted) throw new Error(`${name} hook aborted`);
 
   let terminationKind: "aborted" | "timeout" | undefined;
-  let timeout: NodeJS.Timeout | undefined;
+  let cancelTimeout: (() => void) | undefined;
   let forceKill: NodeJS.Timeout | undefined;
   const child = spawn("bash", ["-lc", script], {
     cwd,
@@ -366,7 +366,7 @@ async function runHook(
     const onAbort = () => terminate("aborted");
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
-    timeout = setTimeout(() => terminate("timeout"), timeoutMs);
+    cancelTimeout = scheduleLongTimeout(() => terminate("timeout"), timeoutMs);
 
     let outcome = await Promise.race([childOutcome, terminationOutcome]);
     if (terminationKind && outcome.kind !== terminationKind) outcome = await terminationOutcome;
@@ -381,7 +381,7 @@ async function runHook(
       throw new Error(`${name} hook exited with code ${String(outcome.exitCode)}: ${stderr.trim()}`);
     }
   } finally {
-    if (timeout) clearTimeout(timeout);
+    cancelTimeout?.();
     if (forceKill) clearTimeout(forceKill);
   }
 }
