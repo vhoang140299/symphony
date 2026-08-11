@@ -1810,7 +1810,10 @@ export class Orchestrator {
     const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
     let delayMs = intervalMs;
     if (!this.#dispatchPaused) {
-      const nextRetryAt = Math.min(...[...this.#retrying.values()].map((entry) => entry.dueAtMs));
+      let nextRetryAt = Infinity;
+      for (const { dueAtMs } of this.#retrying.values()) {
+        nextRetryAt = Math.min(nextRetryAt, dueAtMs);
+      }
       const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
       delayMs = Math.min(intervalMs, retryDelayMs);
     }

@@ -2254,38 +2254,56 @@ test("dispatch pause is not persisted", async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-test("an early continuation retry wakes the scheduler before the regular poll interval", async () => {
+test("the earliest retry wakes the scheduler before the regular poll interval", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-wake-retry-"));
-  const issue = rawIssue("wake", "WAKE-1", 1, "2025-01-01T00:00:00Z");
-  const tracker = new MemoryTracker({ issues: [issue] });
-  const secondRun = deferred<void>();
-  let runs = 0;
-  let resumedSession: string | undefined;
+  const later = rawIssue("later", "LATER-1", 1, "2025-01-01T00:00:00Z");
+  const earlier = rawIssue("earlier", "EARLIER-1", 2, "2025-01-02T00:00:00Z");
+  const tracker = new MemoryTracker({ issues: [later, earlier] });
+  const earlierRetried = deferred<void>();
+  const seen: string[] = [];
+  let earlierRuns = 0;
   const driver = new FakeDriver(async function* (context) {
-    runs += 1;
-    yield event("session_started", { sessionId: "wake-session" });
-    if (runs === 2) {
-      resumedSession = context.sessionId;
-      tracker.setIssueState(context.issue.id, "Done");
-      secondRun.resolve();
+    seen.push(context.issue.id);
+    if (context.issue.id === later.id) {
+      yield event("turn_failed", { summary: "retry later" });
+      return;
     }
-    yield event("turn_completed", { sessionId: "wake-session" });
+    earlierRuns += 1;
+    if (earlierRuns === 2) {
+      tracker.setIssueState(earlier.id, "Done");
+      earlierRetried.resolve();
+    }
+    yield event("turn_completed");
   });
-  const workflowPath = await writeWorkflow(directory, [issue], { pollIntervalMs: 60_000 });
+  const workflowPath = await writeWorkflow(directory, [later, earlier], { pollIntervalMs: 60_000 });
+  const baseNow = Date.UTC(2026, 0, 1);
+  let nowOffsetMs = 0;
   const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
     tracker,
     driver,
+    failureBaseDelayMs: 1_000,
     continuationDelayMs: 30,
+    now: () => baseNow + nowOffsetMs,
   });
 
   await orchestrator.start();
-  await withTimeout(secondRun.promise, 1_000);
+  await orchestrator.waitForCurrentRuns();
+  assert.deepEqual(seen, [later.id]);
+
+  await orchestrator.pollOnce();
+  await orchestrator.waitForCurrentRuns();
+  const retries = orchestrator.snapshot().retrying;
+  assert.deepEqual(retries.map(({ issueId }) => issueId), [later.id, earlier.id]);
+  assert.ok(Date.parse(retries[0]?.dueAt ?? "") > Date.parse(retries[1]?.dueAt ?? ""));
+
+  nowOffsetMs = 100;
+  await withTimeout(earlierRetried.promise, 500);
   await orchestrator.waitForCurrentRuns();
 
-  assert.equal(runs, 2);
-  assert.equal(resumedSession, "wake-session");
-  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 0 });
+  assert.deepEqual(seen, [later.id, earlier.id, earlier.id]);
+  assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
   await orchestrator.stop();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("turn timeout measures stream silence instead of total runtime", async () => {
