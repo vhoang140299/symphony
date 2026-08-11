@@ -124,6 +124,29 @@ test("rejects a workflow without tracker.kind", async () => {
   await assert.rejects(loadWorkflow(workflowPath), /tracker/i);
 });
 
+test("reloads changed workflow content when mtime and size are unchanged", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-fingerprint-"));
+  const workflowPath = path.join(directory, "WORKFLOW.md");
+  const original = "---\ntracker:\n  kind: memory\n---\nOriginal prompt.\n";
+  const changed = original.replace("Original", "Changed!");
+  const timestamp = new Date(1_700_000_000_000);
+
+  try {
+    assert.equal(Buffer.byteLength(changed), Buffer.byteLength(original));
+    await writeFile(workflowPath, original);
+    await utimes(workflowPath, timestamp, timestamp);
+    const store = new WorkflowStore(workflowPath, createLogger("silent"));
+    await store.initialize();
+
+    await writeFile(workflowPath, changed);
+    await utimes(workflowPath, timestamp, timestamp);
+
+    assert.equal((await store.refresh()).promptTemplate, "Changed! prompt.");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("invalid hot reload retains the last known-good workflow", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-workflow-reload-"));
   const workflowPath = path.join(directory, "WORKFLOW.md");

@@ -30,16 +30,19 @@ export class WorkflowError extends Error {
 const defaultPrompt = "You are working on issue {{ issue.identifier }}: {{ issue.title }}\n\n{{ issue.description }}";
 const liquid = new Liquid({ strictVariables: true, strictFilters: true });
 
-export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefinition> {
+export async function readWorkflowSource(workflowPath: string): Promise<{ path: string; content: string }> {
   const absolutePath = path.resolve(workflowPath);
-  const workflowDirectory = path.dirname(absolutePath);
-  let content: string;
   try {
-    content = await readFile(absolutePath, "utf8");
+    return { path: absolutePath, content: await readFile(absolutePath, "utf8") };
   } catch {
     throw new WorkflowError("missing_workflow_file", "Workflow file could not be read");
   }
-  const { config: rawConfig, promptTemplate } = parseWorkflowDocument(content);
+}
+
+export function parseWorkflowSource(source: { path: string; content: string }): WorkflowDefinition {
+  const absolutePath = source.path;
+  const workflowDirectory = path.dirname(absolutePath);
+  const { config: rawConfig, promptTemplate } = parseWorkflowDocument(source.content);
   const config = parseWorkflowConfig(rawConfig);
   config.workspace.root = resolvePath(config.workspace.root, workflowDirectory);
   if (config.state !== undefined) {
@@ -53,6 +56,10 @@ export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefini
     config,
     promptTemplate: promptTemplate || defaultPrompt,
   };
+}
+
+export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefinition> {
+  return parseWorkflowSource(await readWorkflowSource(workflowPath));
 }
 
 function parseWorkflowDocument(content: string): { config: unknown; promptTemplate: string } {

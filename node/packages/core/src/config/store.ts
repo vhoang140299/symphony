@@ -1,12 +1,12 @@
-import { stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import type { AppLogger } from "../log.js";
-import { loadWorkflow, type WorkflowDefinition } from "./workflow.js";
+import { parseWorkflowSource, readWorkflowSource, type WorkflowDefinition } from "./workflow.js";
 
 export class WorkflowStore {
   readonly #path: string;
   readonly #logger: AppLogger;
   #workflow: WorkflowDefinition | null = null;
-  #mtimeMs = -1;
+  #fingerprint = "";
 
   constructor(workflowPath: string, logger: AppLogger) {
     this.#path = workflowPath;
@@ -15,10 +15,10 @@ export class WorkflowStore {
 
   async initialize(): Promise<WorkflowDefinition> {
     if (this.#workflow) return this.#workflow;
-    const workflow = await loadWorkflow(this.#path);
-    const mtimeMs = (await stat(workflow.path)).mtimeMs;
+    const source = await readWorkflowSource(this.#path);
+    const workflow = parseWorkflowSource(source);
     this.#workflow = workflow;
-    this.#mtimeMs = mtimeMs;
+    this.#fingerprint = fingerprint(source.content);
     return workflow;
   }
 
@@ -29,20 +29,21 @@ export class WorkflowStore {
 
   async refresh(): Promise<WorkflowDefinition> {
     const current = this.current();
-    let nextMtimeMs: number;
+    let source: { path: string; content: string };
     try {
-      nextMtimeMs = (await stat(current.path)).mtimeMs;
+      source = await readWorkflowSource(current.path);
     } catch (error) {
-      this.#logger.error({ error }, "Unable to stat workflow; retaining last known good config");
+      this.#logger.error({ error }, "Unable to read workflow; retaining last known good config");
       return current;
     }
 
-    if (nextMtimeMs === this.#mtimeMs) return current;
+    const nextFingerprint = fingerprint(source.content);
+    if (nextFingerprint === this.#fingerprint) return current;
 
     try {
-      const workflow = await loadWorkflow(current.path);
+      const workflow = parseWorkflowSource(source);
       this.#workflow = workflow;
-      this.#mtimeMs = nextMtimeMs;
+      this.#fingerprint = nextFingerprint;
       this.#logger.info({ workflow_path: workflow.path }, "Workflow reloaded");
       return workflow;
     } catch (error) {
@@ -50,4 +51,8 @@ export class WorkflowStore {
       return current;
     }
   }
+}
+
+function fingerprint(source: string): string {
+  return createHash("sha256").update(source).digest("hex");
 }
