@@ -268,7 +268,9 @@ dispatch. State inputs are trimmed, lowercased, and deduplicated; `all` expands 
 State pages use `per_page=100`, `sort=created`, and `direction=asc`, with a maximum of 1,000 pages.
 A validated `rel=next` link is followed even after a short page; without a Link header, a full page
 falls back to the next numeric page. Pagination rejects loops, credentials, a different origin or
-path, fragments, invalid syntax, and multiple next targets. One 30-second deadline covers each REST
+path, fragments, invalid syntax, and multiple next targets. GitHub's same-origin canonical
+`/repositories/<id>/...` Links are rebound to the configured repository path before they are
+followed. One 30-second deadline covers each REST
 request and its body read, redirects fail closed, and the adapter performs no retry.
 
 ID inputs are deduplicated and fetched serially, one GET per unique issue. HTTP 404 responses are

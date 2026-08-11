@@ -942,14 +942,30 @@ function nextPageUrl(
       "GitHub pagination Link must use the configured API origin",
     );
   }
-  if (next.pathname !== expected.pathname) {
-    throw new TrackerError(
-      "tracker_pagination",
-      `GitHub pagination Link must use the configured ${resource} path`,
-    );
-  }
   if (next.hash !== "") {
     throw new TrackerError("tracker_pagination", "GitHub pagination Link must not contain a fragment");
+  }
+  if (next.pathname !== expected.pathname) {
+    const configured = /^(.*)\/repos\/[^/]+\/[^/]+(\/issues(?:\/[1-9]\d*\/comments)?)$/.exec(
+      expected.pathname,
+    );
+    const canonical = /^(.*)\/repositories\/[1-9]\d*(\/issues(?:\/[1-9]\d*\/comments)?)$/.exec(
+      next.pathname,
+    );
+    if (
+      configured === null ||
+      canonical === null ||
+      canonical[1] !== configured[1] ||
+      canonical[2] !== configured[2]
+    ) {
+      throw new TrackerError(
+        "tracker_pagination",
+        `GitHub pagination Link must use the configured ${resource} path`,
+      );
+    }
+    const search = next.search;
+    next = new URL(expected);
+    next.search = search;
   }
   return next;
 }

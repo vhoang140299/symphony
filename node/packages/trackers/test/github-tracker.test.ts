@@ -108,7 +108,7 @@ test("follows a validated next Link even when the current page is short", async 
     const url = new URL(input instanceof Request ? input.url : input.toString());
     urls.push(url);
     if (urls.length === 1) {
-      const next = "https://github.example/api/v3/repos/acme/widget/issues?state=all&per_page=100&page=2";
+      const next = "https://github.example/api/v3/repositories/123/issues?state=all&per_page=100&page=2&after=opaque-cursor";
       return Response.json([rawIssue(1)], { headers: { Link: `<${next}>; rel="next"` } });
     }
     return Response.json([rawIssue(2, { state: "closed" })]);
@@ -121,7 +121,9 @@ test("follows a validated next Link even when the current page is short", async 
   const issues = await tracker.fetchIssuesByStates(["all"]);
   assert.deepEqual(issues.map(({ id }) => id), ["1", "2"]);
   assert.equal(urls.length, 2);
+  assert.equal(urls[1]?.pathname, "/api/v3/repos/acme/widget/issues");
   assert.equal(urls[1]?.searchParams.get("page"), "2");
+  assert.equal(urls[1]?.searchParams.get("after"), "opaque-cursor");
 });
 
 test("rejects unsafe pagination Links and detects loops", async () => {
@@ -132,6 +134,10 @@ test("rejects unsafe pagination Links and detects loops", async () => {
     },
     {
       link: "https://github.example/api/v3/repos/acme/other/issues?page=2",
+      error: /must use the configured repository issues path/,
+    },
+    {
+      link: "https://github.example/api/v3/repositories/123/issues/7/comments?page=2",
       error: /must use the configured repository issues path/,
     },
     {
@@ -647,7 +653,7 @@ test("scans every validated comment page before updating a marker match", async 
         calls.push({ url, method: init?.method });
         if (init?.method === "PATCH") return new Response(null, { status: 200 });
         if (url.searchParams.get("page") === "1") {
-          const next = "https://github.example/api/v3/repos/acme/widget/issues/7/comments?per_page=100&page=2";
+          const next = "https://github.example/api/v3/repositories/123/issues/7/comments?per_page=100&page=2";
           return Response.json(
             Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: `Comment ${index + 1}` })),
             { headers: { Link: `<${next}>; rel=\"next\"` } },
@@ -667,6 +673,7 @@ test("scans every validated comment page before updating a marker match", async 
     );
 
     assert.deepEqual(calls.map(({ method }) => method), ["GET", "GET", "PATCH"]);
+    assert.equal(calls[1]?.url.pathname, "/api/v3/repos/acme/widget/issues/7/comments");
     assert.equal(calls[1]?.url.searchParams.get("page"), "2");
     assert.equal(calls[2]?.url.pathname, "/api/v3/repos/acme/widget/issues/comments/501");
   } finally {
