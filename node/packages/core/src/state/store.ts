@@ -165,7 +165,13 @@ export class RunStateStore {
   async #write(contents: string): Promise<void> {
     await validateParent(this.#directory);
     await this.#lease.assertOwned();
-    await this.#readExisting();
+    const existing = await this.#readExisting();
+    if (
+      existing !== undefined &&
+      contents === `${JSON.stringify({ version: 1, scope: this.#scopeHash, claims: existing })}\n`
+    ) {
+      return;
+    }
     const temporaryPath = path.join(this.#directory, `.symphony-state-${randomUUID()}.tmp`);
     let handle;
     try {

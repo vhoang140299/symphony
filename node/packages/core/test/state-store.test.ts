@@ -88,6 +88,29 @@ posixTest("round-trips every claim variant with secure permissions", async () =>
   assert.equal(envelope.scope, scope);
 });
 
+posixTest("does not rewrite unchanged state and still persists changes", async () => {
+  const { filePath } = await fixture();
+  const store = new RunStateStore(filePath, scope);
+  const claim = {
+    kind: "running",
+    issueId: "issue",
+    attempt: null,
+    continuation: 0,
+  } satisfies PersistedClaim;
+  await store.acquireLease();
+  await store.save([claim]);
+  const before = await lstat(filePath);
+
+  await store.save([claim]);
+  const after = await lstat(filePath);
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+
+  const changed = [{ ...claim, continuation: 1 }];
+  await store.save(changed);
+  assert.deepEqual(await store.load(), changed);
+});
+
 posixTest("loads legacy retries without an error as null", async () => {
   const { filePath } = await fixture();
   const store = new RunStateStore(filePath, scope);
