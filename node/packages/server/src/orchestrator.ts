@@ -582,17 +582,7 @@ export class Orchestrator {
     } catch (error) {
       throw new Error("Unable to refresh persisted issues", { cause: error });
     }
-    const requestedIds = new Set(claimIds);
-    const issuesById = new Map<string, Issue>();
-    for (const issue of refreshedIssues) {
-      if (!requestedIds.has(issue.id)) {
-        throw new Error(`Tracker returned unexpected issue ${issue.id} while refreshing persisted issues`);
-      }
-      if (issuesById.has(issue.id)) {
-        throw new Error(`Tracker returned duplicate issue ${issue.id} while refreshing persisted issues`);
-      }
-      issuesById.set(issue.id, issue);
-    }
+    const issuesById = mapIssuesById(claimIds, refreshedIssues, "refreshing persisted issues");
 
     let changed = false;
     for (const claim of claims) {
@@ -856,9 +846,48 @@ export class Orchestrator {
       }
     }
 
-    for (const [issueId, entry] of [...this.#blocked.entries()]) {
+    const blockedEntries = [...this.#blocked.entries()];
+    const currentScopeHash = workflowTrackerScopeHash(this.#requireWorkflow());
+    const batchSession = requireValue(
+      this.#sessionForTrackerScope(currentScopeHash),
+      "Current tracker session is unavailable",
+    );
+    const batchEntries = blockedEntries.filter(
+      ([issueId, entry]) =>
+        !this.#blockedTransitions.has(issueId) && entry.trackerScopeHash === currentScopeHash,
+    );
+    const batchIssueIds = batchEntries.map(([issueId]) => issueId);
+    let batch: Promise<Map<string, Issue>> | undefined;
+    const issueFromBatch = async (issueId: string): Promise<Issue | undefined> => {
+      batch ??= Promise.resolve()
+        .then(() => batchSession.tracker.fetchIssuesByIds(batchIssueIds))
+        .then((issues) => mapIssuesById(batchIssueIds, issues, "reconciling blocked issues"));
+      return (await batch).get(issueId);
+    };
+
+    const batchTransitions = new Map<string, Promise<boolean>>();
+    let previousTransition = Promise.resolve();
+    for (const [issueId, entry] of batchEntries) {
+      const prefetchedIssue = previousTransition.then(() => issueFromBatch(issueId));
+      const transition = this.#transitionBlocked(
+        issueId,
+        entry,
+        true,
+        { issue: prefetchedIssue, session: batchSession },
+      );
+      batchTransitions.set(issueId, transition);
+      previousTransition = transition.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
+
+    for (const [issueId, entry] of blockedEntries) {
       try {
-        await this.#transitionBlocked(issueId, entry, true);
+        await (
+          batchTransitions.get(issueId)
+          ?? this.#transitionBlocked(issueId, entry, true)
+        );
       } catch (error) {
         if (error instanceof Error && error.message === "Blocked retry label removal failed") {
           this.#logger.warn(
@@ -879,6 +908,7 @@ export class Orchestrator {
     issueId: string,
     entry: BlockedEntry,
     requireRetryLabel: boolean,
+    prefetched?: { issue: Promise<Issue | undefined>; session: SessionConfig },
   ): Promise<boolean> {
     const pending = this.#blockedTransitions.get(issueId);
     if (pending !== undefined) {
@@ -891,13 +921,19 @@ export class Orchestrator {
     transition = (async () => {
       if (this.#blocked.get(issueId) !== entry || this.#shuttingDown || this.#stateWritesFrozen) return false;
 
-      const session = this.#sessionForTrackerScope(entry.trackerScopeHash);
+      const session = prefetched?.session ?? this.#sessionForTrackerScope(entry.trackerScopeHash);
       if (session === undefined) {
         await this.#release(issueId);
         return false;
       }
-      const refreshed = (await session.tracker.fetchIssuesByIds([issueId]))
-        .find((issue) => sameIssueIdentity(entry.issue, issue));
+      let refreshed: Issue | undefined;
+      if (prefetched === undefined) {
+        refreshed = (await session.tracker.fetchIssuesByIds([issueId]))
+          .find((issue) => sameIssueIdentity(entry.issue, issue));
+      } else {
+        const prefetchedIssue = await prefetched.issue;
+        refreshed = sameIssueIdentity(entry.issue, prefetchedIssue) ? prefetchedIssue : undefined;
+      }
       if (this.#blocked.get(issueId) !== entry || this.#shuttingDown || this.#stateWritesFrozen) return false;
       if (!this.#isCurrentSession(session)) return false;
       if (refreshed === undefined) {
@@ -1840,6 +1876,25 @@ function sameLabel(left: string, right: string): boolean {
 
 function sameIssueIdentity(expected: Issue, actual: Issue | undefined): actual is Issue {
   return actual !== undefined && actual.id === expected.id && actual.identifier === expected.identifier;
+}
+
+function mapIssuesById(
+  requestedIds: readonly string[],
+  issues: readonly Issue[],
+  context: string,
+): Map<string, Issue> {
+  const requested = new Set(requestedIds);
+  const issuesById = new Map<string, Issue>();
+  for (const issue of issues) {
+    if (!requested.has(issue.id)) {
+      throw new Error(`Tracker returned unexpected issue ${issue.id} while ${context}`);
+    }
+    if (issuesById.has(issue.id)) {
+      throw new Error(`Tracker returned duplicate issue ${issue.id} while ${context}`);
+    }
+    issuesById.set(issue.id, issue);
+  }
+  return issuesById;
 }
 
 function publishInputFor(issue: Issue, completion: AgentCompletion): PublishChangeInput {

@@ -330,6 +330,7 @@ posixTest("batches recovery and retries from the beginning after invalid refresh
   await seedState(store, persisted);
   const refreshes: string[][] = [];
   let refreshAttempt = 0;
+  let failBlockedRefresh = false;
   const tracker: Tracker = {
     async fetchIssuesByStates() {
       return [];
@@ -337,6 +338,7 @@ posixTest("batches recovery and retries from the beginning after invalid refresh
     async fetchIssuesByIds(ids) {
       refreshes.push([...ids]);
       refreshAttempt += 1;
+      if (failBlockedRefresh) throw new Error("blocked reconciliation failed");
       if (refreshAttempt === 1) throw new Error("transient tracker failure");
       if (refreshAttempt === 2) return [firstIssue, { ...secondIssue, id: "rogue" }];
       if (refreshAttempt === 3) return [firstIssue, firstIssue];
@@ -371,7 +373,26 @@ posixTest("batches recovery and retries from the beginning after invalid refresh
     Object.fromEntries(orchestrator.snapshot().blocked.map(({ issueId, reasonCode }) => [issueId, reasonCode])),
     { first: "run_interrupted", second: "unknown" },
   );
-  assert.deepEqual((await store.load()).map(({ kind }) => kind), ["blocked", "blocked"]);
+  const recoveredClaims = await store.load();
+  const recoveredBlocked = orchestrator.snapshot().blocked;
+  assert.deepEqual(recoveredClaims.map(({ kind }) => kind), ["blocked", "blocked"]);
+
+  refreshes.length = 0;
+  failBlockedRefresh = true;
+  await orchestrator.pollOnce();
+  assert.deepEqual(refreshes.map((ids) => [...ids].sort()), [["first", "second"]]);
+  assert.deepEqual(orchestrator.snapshot().blocked, recoveredBlocked);
+  assert.deepEqual(await store.load(), recoveredClaims);
+
+  refreshes.length = 0;
+  failBlockedRefresh = false;
+  await orchestrator.pollOnce();
+  assert.deepEqual(refreshes.map((ids) => [...ids].sort()), [["first", "second"]]);
+  assert.deepEqual(
+    Object.fromEntries(orchestrator.snapshot().blocked.map(({ issueId, reasonCode }) => [issueId, reasonCode])),
+    { first: "run_interrupted", second: "unknown" },
+  );
+  assert.deepEqual(await store.load(), recoveredClaims);
   await orchestrator.stop();
 });
 

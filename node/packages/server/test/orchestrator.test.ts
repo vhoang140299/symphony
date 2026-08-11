@@ -1606,7 +1606,10 @@ test("a blocked retry label uses the reloaded control config", async () => {
 test("a failed retry-label removal retains the blocked claim without leaking the provider error", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-control-retry-failure-"));
   let current = githubIssue();
+  let pauseRefresh = false;
   let mutationCalls = 0;
+  const refreshStarted = deferred<void>();
+  const releaseRefresh = deferred<void>();
   const warnings: Array<{ bindings: Record<string, unknown>; message: string }> = [];
   const retryLogger = {
     debug() {},
@@ -1621,7 +1624,13 @@ test("a failed retry-label removal retains the blocked claim without leaking the
       return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
     },
     async fetchIssuesByIds(ids) {
-      return ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+      const issues = ids.includes(current.id) ? [{ ...current, labels: [...current.labels] }] : [];
+      if (pauseRefresh) {
+        pauseRefresh = false;
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      }
+      return issues;
     },
     async mutateIssue(_target, mutation) {
       mutationCalls += 1;
@@ -1649,7 +1658,16 @@ test("a failed retry-label removal retains the blocked claim without leaking the
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
   current = { ...current, labels: [...current.labels, "retry-me"] };
-  await orchestrator.pollOnce();
+  pauseRefresh = true;
+  const poll = orchestrator.pollOnce();
+  await refreshStarted.promise;
+  const manualRetry = assert.rejects(
+    orchestrator.requestBlockedRetry(current.identifier),
+    /Blocked retry label removal failed/,
+  );
+  await delay(0);
+  releaseRefresh.resolve();
+  await Promise.all([poll, manualRetry]);
   await orchestrator.waitForCurrentRuns();
 
   assert.equal(runs, 1);
