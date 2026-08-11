@@ -929,8 +929,8 @@ export class Orchestrator {
       }
       let refreshed: Issue | undefined;
       if (prefetched === undefined) {
-        refreshed = (await session.tracker.fetchIssuesByIds([issueId]))
-          .find((issue) => sameIssueIdentity(entry.issue, issue));
+        const issue = await fetchIssueById(session.tracker, issueId);
+        refreshed = sameIssueIdentity(entry.issue, issue) ? issue : undefined;
       } else {
         const prefetchedIssue = await prefetched.issue;
         refreshed = sameIssueIdentity(entry.issue, prefetchedIssue) ? prefetchedIssue : undefined;
@@ -1041,7 +1041,7 @@ export class Orchestrator {
       }
       let issue: Issue | undefined;
       try {
-        [issue] = await session.tracker.fetchIssuesByIds([issueId]);
+        issue = await fetchIssueById(session.tracker, issueId);
       } catch (error) {
         if (this.#shuttingDown || this.#dispatchPaused) return;
         this.#logger.warn(
@@ -1111,7 +1111,7 @@ export class Orchestrator {
 
       let issue: Issue | undefined;
       try {
-        [issue] = await tracker.fetchIssuesByIds([candidate.id]);
+        issue = await fetchIssueById(tracker, candidate.id);
       } catch (error) {
         this.#logger.warn(
           { error, issue_id: candidate.id, issue_identifier: candidate.identifier },
@@ -1257,7 +1257,7 @@ export class Orchestrator {
 
       let refreshed: Issue | undefined;
       try {
-        [refreshed] = await entry.tracker.fetchIssuesByIds([entry.issue.id]);
+        refreshed = await fetchIssueById(entry.tracker, entry.issue.id);
       } catch (error) {
         return { kind: "failure", error };
       }
@@ -1432,7 +1432,7 @@ export class Orchestrator {
   async #retryDelivery(entry: RunningEntry, pendingDelivery: PendingDelivery): Promise<RunOutcome> {
     let refreshed: Issue | undefined;
     try {
-      [refreshed] = await entry.tracker.fetchIssuesByIds([entry.issue.id]);
+      refreshed = await fetchIssueById(entry.tracker, entry.issue.id);
     } catch (error) {
       return { kind: "delivery_failure", error, pendingDelivery };
     }
@@ -1554,7 +1554,7 @@ export class Orchestrator {
   async #refreshDeliveryIssue(entry: RunningEntry): Promise<RunOutcome | undefined> {
     const issueId = entry.issue.id;
     const identifier = entry.issue.identifier;
-    const [refreshed] = await entry.tracker.fetchIssuesByIds([issueId]);
+    const refreshed = await fetchIssueById(entry.tracker, issueId);
     entry.controller.signal.throwIfAborted();
     if (refreshed === undefined) {
       return { kind: "release", summary: "Issue disappeared during host delivery" };
@@ -1896,6 +1896,14 @@ function mapIssuesById(
     issuesById.set(issue.id, issue);
   }
   return issuesById;
+}
+
+async function fetchIssueById(tracker: Tracker, issueId: string): Promise<Issue | undefined> {
+  return mapIssuesById(
+    [issueId],
+    await tracker.fetchIssuesByIds([issueId]),
+    `refreshing issue ${issueId}`,
+  ).get(issueId);
 }
 
 function publishInputFor(issue: Issue, completion: AgentCompletion): PublishChangeInput {

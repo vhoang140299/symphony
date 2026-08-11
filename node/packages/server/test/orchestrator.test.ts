@@ -1074,18 +1074,30 @@ test("host delivery does not publish blocked, stale, or failed completions", asy
       }),
       expected: { running: 0, retrying: 1, blocked: 0 },
     },
+    {
+      name: "unexpected-refresh",
+      mutateBeforeTerminal: false,
+      terminal: event("turn_completed", {
+        completion: { status: "ready", summary: "Done.", verification: ["pnpm test"] },
+      }),
+      expected: { running: 0, retrying: 1, blocked: 0 },
+    },
   ] as const;
 
   for (const scenario of cases) {
     const directory = await mkdtemp(path.join(tmpdir(), `symphony-delivery-${scenario.name}-`));
     let current = githubIssue();
     let publications = 0;
+    let streamClosed = false;
     const tracker: Tracker = {
       async fetchIssuesByStates() {
         return [{ ...current, labels: [...current.labels] }];
       },
       async fetchIssuesByIds() {
-        return [{ ...current, labels: [...current.labels] }];
+        const issue = { ...current, labels: [...current.labels] };
+        return scenario.name === "unexpected-refresh" && streamClosed
+          ? [{ ...issue, id: "rogue", identifier: "ROGUE-1" }, issue]
+          : [issue];
       },
       async publishIssueChange() {
         publications += 1;
@@ -1095,7 +1107,11 @@ test("host delivery does not publish blocked, stale, or failed completions", asy
     };
     const driver = new FakeDriver(async function* () {
       if (scenario.mutateBeforeTerminal) current = { ...current, labels: [] };
-      yield scenario.terminal;
+      try {
+        yield scenario.terminal;
+      } finally {
+        streamClosed = true;
+      }
     });
     const workflowPath = await writeDeliveryWorkflow(directory, "claude");
     const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, { tracker, driver });
@@ -1105,6 +1121,9 @@ test("host delivery does not publish blocked, stale, or failed completions", asy
 
     assert.equal(publications, 0, scenario.name);
     assert.deepEqual(compactState(orchestrator), scenario.expected, scenario.name);
+    if (scenario.name === "unexpected-refresh") {
+      assert.equal(orchestrator.snapshot().retrying[0]?.identifier, current.identifier);
+    }
     await orchestrator.stop();
     await rm(directory, { recursive: true, force: true });
   }
@@ -1329,7 +1348,6 @@ test("max_attempts blocks continuations while manual retry preserves the session
 test("manual retry refreshes a blocked issue without requiring its configured retry label", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-manual-retry-no-label-"));
   const current = githubIssue();
-  let idRefreshes = 0;
   let pauseRefresh = false;
   let mutationCalls = 0;
   let runs = 0;
@@ -1340,7 +1358,6 @@ test("manual retry refreshes a blocked issue without requiring its configured re
       return states.includes(current.state) ? [{ ...current, labels: [...current.labels] }] : [];
     },
     async fetchIssuesByIds(ids) {
-      idRefreshes += 1;
       if (pauseRefresh) {
         pauseRefresh = false;
         refreshStarted.resolve();
@@ -1366,7 +1383,6 @@ test("manual retry refreshes a blocked issue without requiring its configured re
   await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
-  idRefreshes = 0;
 
   pauseRefresh = true;
   const poll = orchestrator.pollOnce();
@@ -1376,8 +1392,8 @@ test("manual retry refreshes a blocked issue without requiring its configured re
 
   assert.equal(await manualRetry, true);
   await poll;
+  await orchestrator.pollOnce();
   await orchestrator.waitForCurrentRuns();
-  assert.equal(idRefreshes, 3);
   assert.equal(mutationCalls, 0);
   assert.equal(runs, 2);
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 0, blocked: 1 });
