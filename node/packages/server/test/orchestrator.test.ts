@@ -1817,7 +1817,7 @@ test("control retry labels require host mutation support and cannot be mutated b
   await orchestrator.stop();
 });
 
-test("full capacity batches running reconciliation without fetching candidates", async () => {
+test("full capacity validates running reconciliation batches without fetching candidates", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "symphony-reconcile-batch-"));
   const first: Issue = {
     ...linearIssue(),
@@ -1835,6 +1835,7 @@ test("full capacity batches running reconciliation without fetching candidates",
   };
   const issues = new Map([first, second].map((issue) => [issue.id, issue]));
   const refreshes: string[][] = [];
+  let invalidRefresh: "unexpected" | "duplicate" | null = null;
   let candidateFetches = 0;
   const tracker: Tracker = {
     async fetchIssuesByStates(states) {
@@ -1843,6 +1844,8 @@ test("full capacity batches running reconciliation without fetching candidates",
     },
     async fetchIssuesByIds(ids) {
       refreshes.push([...ids]);
+      if (invalidRefresh === "unexpected") return [{ ...first, id: "unexpected" }];
+      if (invalidRefresh === "duplicate") return [first, { ...first, state: "Done" }];
       return ids.flatMap((id) => {
         const issue = issues.get(id);
         return issue === undefined ? [] : [issue];
@@ -1851,8 +1854,10 @@ test("full capacity batches running reconciliation without fetching candidates",
   };
   const bothStarted = deferred<void>();
   const finishRuns = deferred<void>();
+  const signals: AbortSignal[] = [];
   let started = 0;
-  const driver = new FakeDriver(async function* () {
+  const driver = new FakeDriver(async function* (context) {
+    signals.push(context.signal);
     started += 1;
     if (started === 2) bothStarted.resolve();
     await finishRuns.promise;
@@ -1868,10 +1873,18 @@ test("full capacity batches running reconciliation without fetching candidates",
   await withTimeout(bothStarted.promise, 1_000);
   refreshes.length = 0;
   candidateFetches = 0;
+  invalidRefresh = "unexpected";
+  await orchestrator.pollOnce();
+  invalidRefresh = "duplicate";
   await orchestrator.pollOnce();
 
-  assert.deepEqual(refreshes, [[first.id, second.id]]);
+  assert.deepEqual(refreshes, [
+    [first.id, second.id],
+    [first.id, second.id],
+  ]);
+  assert.equal(signals.every((signal) => !signal.aborted), true);
   assert.equal(candidateFetches, 0);
+  invalidRefresh = null;
   issues.set(first.id, { ...first, state: "Done" });
   issues.set(second.id, { ...second, state: "Done" });
   finishRuns.resolve();

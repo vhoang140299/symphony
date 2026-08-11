@@ -816,9 +816,11 @@ export class Orchestrator {
     }
 
     for (const [tracker, entries] of runningByTracker) {
-      let refreshedIssues: Issue[];
+      const requestedIds = entries.map(({ issue }) => issue.id);
+      let refreshedById: Map<string, Issue>;
       try {
-        refreshedIssues = await tracker.fetchIssuesByIds(entries.map(({ issue }) => issue.id));
+        const refreshedIssues = await tracker.fetchIssuesByIds(requestedIds);
+        refreshedById = mapIssuesById(requestedIds, refreshedIssues, "reconciling running issues");
       } catch (error) {
         for (const entry of entries) {
           this.#logger.warn(
@@ -829,7 +831,6 @@ export class Orchestrator {
         continue;
       }
 
-      const refreshedById = new Map(refreshedIssues.map((issue) => [issue.id, issue]));
       for (const entry of entries) {
         const issueId = entry.issue.id;
         if (this.#running.get(issueId) !== entry) continue;
