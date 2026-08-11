@@ -4,28 +4,96 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+catalogs:
+  default:
+    '@types/node':
+      specifier: 24.13.3
+      version: 24.13.3
+    typescript:
+      specifier: 7.0.2
+      version: 7.0.2
+    vite:
+      specifier: 8.2.1
+      version: 8.2.1
+    vitest:
+      specifier: 4.1.10
+      version: 4.1.10
+    yaml:
+      specifier: 2.9.0
+      version: 2.9.0
+    zod:
+      specifier: 4.4.3
+      version: 4.4.3
+
 importers:
 
   .:
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.13.3
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vite:
+        specifier: 'catalog:'
+        version: 8.2.1(@types/node@24.13.3)(yaml@2.9.0)
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.10(@types/node@24.13.3)(vite@8.2.1(@types/node@24.13.3)(yaml@2.9.0))
+
+  packages/agents:
     dependencies:
+      '@ai-symphony/core':
+        specifier: workspace:*
+        version: link:../core
       '@anthropic-ai/claude-agent-sdk':
         specifier: 0.3.226
         version: 0.3.226(@anthropic-ai/sdk@0.116.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))(zod@4.4.3)
-      '@linear/sdk':
-        specifier: 89.0.0
-        version: 89.0.0(graphql@17.0.2)
       '@openai/codex':
         specifier: 0.147.0
         version: 0.147.0
       '@openai/codex-sdk':
         specifier: 0.147.0
         version: 0.147.0
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.13.3
+
+  packages/cli:
+    dependencies:
+      '@ai-symphony/agents':
+        specifier: workspace:*
+        version: link:../agents
+      '@ai-symphony/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ai-symphony/server':
+        specifier: workspace:*
+        version: link:../server
+      '@ai-symphony/trackers':
+        specifier: workspace:*
+        version: link:../trackers
+      '@anthropic-ai/claude-agent-sdk':
+        specifier: 0.3.226
+        version: 0.3.226(@anthropic-ai/sdk@0.116.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))(zod@4.4.3)
+      '@openai/codex':
+        specifier: 0.147.0
+        version: 0.147.0
       commander:
         specifier: 15.0.0
         version: 15.0.0
-      fastify:
-        specifier: 5.11.3
-        version: 5.11.3
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.13.3
+
+  packages/core:
+    dependencies:
       liquidjs:
         specifier: 10.28.0
         version: 10.28.0
@@ -33,15 +101,18 @@ importers:
         specifier: 10.3.1
         version: 10.3.1
       yaml:
-        specifier: 2.9.0
+        specifier: 'catalog:'
         version: 2.9.0
       zod:
-        specifier: 4.4.3
+        specifier: 'catalog:'
         version: 4.4.3
     devDependencies:
       '@types/node':
-        specifier: 24.13.3
+        specifier: 'catalog:'
         version: 24.13.3
+
+  packages/dashboard:
+    devDependencies:
       '@types/react':
         specifier: 19.2.18
         version: 19.2.18
@@ -54,15 +125,50 @@ importers:
       react-dom:
         specifier: 19.2.8
         version: 19.2.8(react@19.2.8)
-      typescript:
-        specifier: 7.0.2
-        version: 7.0.2
       vite:
-        specifier: 8.2.1
+        specifier: 'catalog:'
         version: 8.2.1(@types/node@24.13.3)(yaml@2.9.0)
-      vitest:
-        specifier: 4.1.10
-        version: 4.1.10(@types/node@24.13.3)(vite@8.2.1(@types/node@24.13.3)(yaml@2.9.0))
+
+  packages/server:
+    dependencies:
+      '@ai-symphony/agents':
+        specifier: workspace:*
+        version: link:../agents
+      '@ai-symphony/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ai-symphony/trackers':
+        specifier: workspace:*
+        version: link:../trackers
+      fastify:
+        specifier: 5.11.3
+        version: 5.11.3
+    devDependencies:
+      '@ai-symphony/dashboard':
+        specifier: workspace:*
+        version: link:../dashboard
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.13.3
+      yaml:
+        specifier: 'catalog:'
+        version: 2.9.0
+
+  packages/trackers:
+    dependencies:
+      '@ai-symphony/core':
+        specifier: workspace:*
+        version: link:../core
+      '@linear/sdk':
+        specifier: 89.0.0
+        version: 89.0.0(graphql@17.0.2)
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.13.3
 
 packages:
 

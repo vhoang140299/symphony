@@ -1,0 +1,20 @@
+{
+  "name": "@ai-symphony/dashboard",
+  "version": "0.6.0",
+  "description": "Operations dashboard served by the Symphony operations HTTP server",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "vite"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "vite": "catalog:"
+  }
+}

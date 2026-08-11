@@ -1,0 +1,28 @@
+{
+  "name": "@ai-symphony/server",
+  "version": "0.6.0",
+  "description": "Orchestrator run loop and operations HTTP server for Symphony",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@ai-symphony/agents": "workspace:*",
+    "@ai-symphony/core": "workspace:*",
+    "@ai-symphony/trackers": "workspace:*",
+    "fastify": "5.11.3"
+  },
+  "devDependencies": {
+    "@ai-symphony/dashboard": "workspace:*",
+    "@types/node": "catalog:",
+    "yaml": "catalog:"
+  }
+}

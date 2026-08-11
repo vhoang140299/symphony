@@ -1,77 +1,27 @@
 {
-  "name": "@ai-symphony/node",
+  "name": "@ai-symphony/monorepo",
   "version": "0.6.0",
-  "description": "TypeScript implementation of the Symphony coding-agent orchestrator",
-  "keywords": [
-    "ai",
-    "automation",
-    "coding-agent",
-    "orchestrator"
-  ],
-  "homepage": "https://github.com/vhoang140299/symphony/tree/main/node#readme",
-  "bugs": {
-    "url": "https://github.com/vhoang140299/symphony/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/vhoang140299/symphony.git",
-    "directory": "node"
-  },
+  "description": "Monorepo for the TypeScript implementation of the Symphony coding-agent orchestrator",
+  "private": true,
   "packageManager": "pnpm@11.20.0",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=24.0.0"
   },
-  "main": "dist/src/index.js",
-  "types": "dist/src/index.d.ts",
-  "bin": {
-    "symphony-node": "dist/src/cli.js"
-  },
-  "files": [
-    "dist/dashboard",
-    "dist/src",
-    "codex-symphony-wrapper.mjs",
-    "NOTICE",
-    "WORKFLOW.md",
-    "WORKFLOW.codex.github.md",
-    "WORKFLOW.github.md"
-  ],
-  "publishConfig": {
-    "executableFiles": [
-      "./codex-symphony-wrapper.mjs"
-    ]
-  },
   "scripts": {
-    "build": "tsc -p tsconfig.json && pnpm run build:dashboard",
-    "build:dashboard": "tsc -p tsconfig.ui.json --noEmit && vite build --config vite.dashboard.config.ts",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ui.json --noEmit",
-    "prepack": "pnpm run build",
-    "start": "node dist/src/cli.js",
+    "build": "tsc -b && pnpm --filter @ai-symphony/dashboard run build",
+    "check": "tsc -b && tsc -p tsconfig.test.json && pnpm --filter @ai-symphony/dashboard run check",
+    "clean": "tsc -b --clean && rm -rf packages/*/dist",
+    "start": "node packages/cli/dist/cli.js",
     "test": "pnpm run build && vitest run",
-    "test:pack": "node scripts/packaging-smoke.mjs",
+    "test:integration:github": "vitest run --reporter=verbose packages/trackers/test/github-live.test.ts",
     "test:watch": "vitest"
   },
-  "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.226",
-    "@linear/sdk": "89.0.0",
-    "@openai/codex": "0.147.0",
-    "@openai/codex-sdk": "0.147.0",
-    "commander": "15.0.0",
-    "fastify": "5.11.3",
-    "liquidjs": "10.28.0",
-    "pino": "10.3.1",
-    "yaml": "2.9.0",
-    "zod": "4.4.3"
-  },
   "devDependencies": {
-    "@types/node": "24.13.3",
-    "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.4",
-    "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "typescript": "7.0.2",
-    "vite": "8.2.1",
-    "vitest": "4.1.10"
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
   }
 }

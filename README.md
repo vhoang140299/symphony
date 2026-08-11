@@ -28,10 +28,11 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 ### Option 2. Use an experimental implementation
 
 Choose the implementation that fits your environment. Both follow [SPEC.md](SPEC.md) and keep
-independent toolchains and release tags:
+independent toolchains:
 
 - [Node.js/TypeScript](node/README.md) — setup: `cd node && mise trust && mise install && mise exec
-  -- pnpm install --frozen-lockfile`; validate: `mise exec -- pnpm test`; releases: `node-v*`.
+  -- pnpm install --frozen-lockfile`; validate: `mise exec -- pnpm test`; packages are currently
+  private and are not published.
 - [Elixir](elixir/README.md) — setup: `cd elixir && mise trust && mise install && mise exec -- make
   setup`; validate: `mise exec -- make all`; releases: `v*`.
 
