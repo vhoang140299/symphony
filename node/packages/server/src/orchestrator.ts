@@ -28,6 +28,7 @@ import { WorkspaceManager, workspaceKey } from "@ai-symphony/core/workspace/mana
 
 const continuationPrompt =
   "Continue working on the same issue. Inspect the current workspace, finish any remaining work, and verify the result.";
+const maxTimerDelayMs = 2_147_483_647;
 
 const zeroUsage = (): AgentUsage => ({
   inputTokens: 0,
@@ -1804,25 +1805,32 @@ export class Orchestrator {
     return stateCount < stateLimit;
   }
 
-  #scheduleNextPoll(): void {
+  #scheduleNextPoll(remainingDelayMs?: number): void {
     if (!this.#started || this.#shuttingDown || this.#persistenceFailure !== undefined) return;
     if (this.#timer) clearTimeout(this.#timer);
-    const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
-    let delayMs = intervalMs;
-    if (!this.#dispatchPaused) {
-      let nextRetryAt = Infinity;
-      for (const { dueAtMs } of this.#retrying.values()) {
-        nextRetryAt = Math.min(nextRetryAt, dueAtMs);
+    let delayMs = remainingDelayMs;
+    if (delayMs === undefined) {
+      const intervalMs = this.#requireWorkflow().config.polling.intervalMs;
+      delayMs = intervalMs;
+      if (!this.#dispatchPaused) {
+        let nextRetryAt = Infinity;
+        for (const { dueAtMs } of this.#retrying.values()) {
+          nextRetryAt = Math.min(nextRetryAt, dueAtMs);
+        }
+        const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
+        delayMs = Math.min(intervalMs, retryDelayMs);
       }
-      const retryDelayMs = Number.isFinite(nextRetryAt) ? Math.max(0, nextRetryAt - this.#now()) : intervalMs;
-      delayMs = Math.min(intervalMs, retryDelayMs);
     }
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      if (delayMs > maxTimerDelayMs) {
+        this.#scheduleNextPoll(delayMs - maxTimerDelayMs);
+        return;
+      }
       void this.pollOnce()
         .catch((error: unknown) => this.#logger.error({ error }, "Poll cycle failed"))
         .finally(() => this.#scheduleNextPoll());
-    }, delayMs);
+    }, Math.min(delayMs, maxTimerDelayMs));
   }
 
   #wakeForRetry(): void {

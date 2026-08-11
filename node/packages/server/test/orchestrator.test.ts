@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdtemp, readFile, realpath, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, test } from "vitest";
+import { afterAll, test, vi } from "vitest";
 import { stringify as stringifyYaml } from "yaml";
 import { WorkflowStore } from "@ai-symphony/core/config/store.js";
 import type { AgentDriver, AgentEvent, AgentRunContext, Issue, Tracker } from "@ai-symphony/core/domain.js";
@@ -2304,6 +2304,41 @@ test("the earliest retry wakes the scheduler before the regular poll interval", 
   assert.deepEqual(compactState(orchestrator), { running: 0, retrying: 1, blocked: 0 });
   await orchestrator.stop();
   await rm(directory, { recursive: true, force: true });
+});
+
+test("chunks polling intervals longer than Node's maximum timeout", async () => {
+  const maxTimerDelayMs = 2_147_483_647;
+  const directory = await mkdtemp(path.join(tmpdir(), "symphony-long-poll-timer-"));
+  const workflowPath = await writeWorkflow(directory, [], { pollIntervalMs: maxTimerDelayMs + 1_000 });
+  const orchestrator = new Orchestrator(new WorkflowStore(workflowPath, logger), logger, {
+    tracker: new MemoryTracker({ issues: [] }),
+    driver: new FakeDriver(async function* () {
+      assert.fail("no work should be dispatched");
+    }),
+  });
+  const pollOnce = vi.spyOn(orchestrator, "pollOnce");
+
+  vi.useFakeTimers();
+  const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+  try {
+    await orchestrator.start();
+    assert.equal(pollOnce.mock.calls.length, 1);
+    assert.equal(setTimeoutSpy.mock.calls.at(-1)?.[1], maxTimerDelayMs);
+
+    await vi.advanceTimersByTimeAsync(maxTimerDelayMs);
+    assert.equal(pollOnce.mock.calls.length, 1);
+    assert.equal(setTimeoutSpy.mock.calls.at(-1)?.[1], 1_000);
+
+    await vi.advanceTimersByTimeAsync(999);
+    assert.equal(pollOnce.mock.calls.length, 1);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(pollOnce.mock.calls.length, 2);
+  } finally {
+    await orchestrator.stop();
+    setTimeoutSpy.mockRestore();
+    vi.useRealTimers();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("turn timeout measures stream silence instead of total runtime", async () => {
