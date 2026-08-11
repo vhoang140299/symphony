@@ -1296,6 +1296,11 @@ test("validates and redacts GitHub publishing boundaries", async () => {
       { number: 0, html_url: "https://github.com/acme/widget/pull/0" },
       { number: 3, html_url: "javascript:alert(1)" },
       { number: 3, html_url: "https://evil.example/acme/widget/pull/3" },
+      { number: 3, html_url: "https://github.com/acme/other/pull/3" },
+      { number: 3, html_url: "https://github.com/acme/widget/pull/4" },
+      { number: 3, html_url: "https://github.com:8443/acme/widget/pull/3" },
+      { number: 3, html_url: "https://github.com/acme/widget/pull/3?diff=split" },
+      { number: 3, html_url: "https://github.com/acme/widget/pull/3#discussion" },
     ]) {
       let calls = 0;
       const invalidResponse = new GitHubTracker(

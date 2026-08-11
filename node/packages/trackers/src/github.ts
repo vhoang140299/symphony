@@ -338,7 +338,10 @@ export class GitHubTracker implements Tracker {
 
     const branch = `symphony/issue-${issueNumber}`;
     const pushUrl = repositoryGitUrl(this.#settings);
-    const pullRequestHost = new URL(pushUrl).hostname;
+    const repositoryUrl = new URL(
+      `/${encodeURIComponent(this.#settings.owner)}/${encodeURIComponent(this.#settings.repo)}`,
+      new URL(pushUrl).origin,
+    );
     if (signal.aborted) throw new Error("GitHub git publishing was aborted");
     let published: Awaited<ReturnType<GitPublisher>>;
     try {
@@ -346,7 +349,7 @@ export class GitHubTracker implements Tracker {
         workspacePath,
         expectedOwner: this.#settings.owner,
         expectedRepo: this.#settings.repo,
-        expectedHost: new URL(pushUrl).host,
+        expectedHost: repositoryUrl.host,
         pushUrl,
         token,
         branch,
@@ -373,14 +376,14 @@ export class GitHubTracker implements Tracker {
         payload: pullPayload,
         signal,
       });
-      const pull = parsePullRequest(response.payload, "PATCH", url.pathname, pullRequestHost);
+      const pull = parsePullRequest(response.payload, "PATCH", url.pathname, repositoryUrl);
       if (pull.number !== number) {
         throw new Error(`GitHub API PATCH ${url.pathname} returned a different pull request`);
       }
       return { ...pull, branch };
     };
 
-    const existing = await this.#findOpenPull(branch, baseBranch, pullRequestHost, signal);
+    const existing = await this.#findOpenPull(branch, baseBranch, repositoryUrl, signal);
     if (existing !== null) return updatePull(existing.number);
 
     const url = this.#pullsUrl();
@@ -391,14 +394,14 @@ export class GitHubTracker implements Tracker {
       allowStatus: 422,
     });
     if (created.status === 422) {
-      const raced = await this.#findOpenPull(branch, baseBranch, pullRequestHost, signal);
+      const raced = await this.#findOpenPull(branch, baseBranch, repositoryUrl, signal);
       if (raced === null) {
         throw new Error(`GitHub API POST ${url.pathname} failed with HTTP 422`);
       }
       return updatePull(raced.number);
     }
 
-    const pull = parsePullRequest(created.payload, "POST", url.pathname, pullRequestHost);
+    const pull = parsePullRequest(created.payload, "POST", url.pathname, repositoryUrl);
     return { ...pull, branch };
   }
 
@@ -432,7 +435,7 @@ export class GitHubTracker implements Tracker {
   async #findOpenPull(
     branch: string,
     baseBranch: string,
-    pullRequestHost: string,
+    repositoryUrl: URL,
     signal: AbortSignal,
   ): Promise<{ number: number; url: string } | null> {
     const url = this.#pullsUrl();
@@ -451,7 +454,7 @@ export class GitHubTracker implements Tracker {
     }
     return response.payload.length === 0
       ? null
-      : parsePullRequest(response.payload[0], "GET", url.pathname, pullRequestHost);
+      : parsePullRequest(response.payload[0], "GET", url.pathname, repositoryUrl);
   }
 
   #request(url: URL, allowNotFound: false, options?: GitHubRequestOptions): Promise<GitHubResponse>;
@@ -668,22 +671,32 @@ function parsePullRequest(
   raw: unknown,
   method: string,
   path: string,
-  expectedHost: string,
+  expectedRepositoryUrl: URL,
 ): { number: number; url: string } {
   const parsed = githubPullRequestSchema.safeParse(raw);
-  if (!parsed.success || !isExpectedPullRequestUrl(parsed.data.html_url, expectedHost)) {
+  if (
+    !parsed.success ||
+    !isExpectedPullRequestUrl(parsed.data.html_url, expectedRepositoryUrl, parsed.data.number)
+  ) {
     throw new Error(`GitHub API ${method} ${path} returned an invalid pull request`);
   }
   return { number: parsed.data.number, url: parsed.data.html_url };
 }
 
-function isExpectedPullRequestUrl(value: string, expectedHost: string): boolean {
+function isExpectedPullRequestUrl(
+  value: string,
+  expectedRepositoryUrl: URL,
+  number: number,
+): boolean {
   const url = new URL(value);
   return (
     url.protocol === "https:" &&
-    url.hostname.toLowerCase() === expectedHost.toLowerCase() &&
+    url.origin === expectedRepositoryUrl.origin &&
     url.username === "" &&
-    url.password === ""
+    url.password === "" &&
+    url.search === "" &&
+    url.hash === "" &&
+    url.pathname.toLowerCase() === `${expectedRepositoryUrl.pathname}/pull/${number}`.toLowerCase()
   );
 }
 

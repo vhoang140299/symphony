@@ -307,8 +307,10 @@ Manual comments are not idempotent. Host delivery hashes its UUID marker, scans 
 and creates or updates the lowest matching ID. Publishing validates the workspace, pushes a branch,
 and creates or reuses one open pull request. Repository, positive issue ID, and numeric `nativeRef`
 are bound to the configured tracker; the deterministic branch is
-`symphony/issue-<positive issue id>`. The exact model-facing schema and results are in the shared
-tool table above.
+`symphony/issue-<positive issue id>`. Returned pull-request URLs must use the configured Git
+repository's HTTPS origin and path, contain the payload's pull-request number, and have no
+credentials, query, or fragment. The exact model-facing schema and results are in the shared tool
+table above.
 
 GitHub request messages are redacted templates:
 
