@@ -45,7 +45,7 @@ function issue(number = 7, overrides: Partial<Issue> = {}): Issue {
   };
 }
 
-test("fetches every state page, ignores pull requests, and normalizes issues", async () => {
+test("fetches every state page and keeps pull requests non-dispatchable", async () => {
   const requests: Array<{ url: URL; authorization: string | null }> = [];
   const firstPage = Array.from({ length: 100 }, (_, index) =>
     index === 99 ? rawIssue(100, { pull_request: {} }) : rawIssue(index + 1),
@@ -77,8 +77,8 @@ test("fetches every state page, ignores pull requests, and normalizes issues", a
     assert.equal(requests[0]?.url.searchParams.get("per_page"), "100");
     assert.equal(requests[1]?.url.searchParams.get("page"), "2");
     assert.deepEqual(requests.map(({ authorization }) => authorization), ["Bearer top-secret", "Bearer top-secret"]);
-    assert.equal(issues.length, 100);
-    assert.equal(issues.some(({ id }) => id === "100"), false);
+    assert.equal(issues.length, 101);
+    assert.equal(issues.find(({ id }) => id === "100")?.dispatchable, false);
     assert.deepEqual(issues.at(-1), {
       id: "101",
       nativeRef: { owner: "acme", repo: "widget", number: 101 },
@@ -183,7 +183,7 @@ test("bounds issue pagination when every page advertises a next Link", async () 
   assert.equal(requests, 1_000);
 });
 
-test("deduplicates exact issue fetches, skips missing issues and pull requests", async () => {
+test("deduplicates exact issue fetches and keeps pull requests non-dispatchable", async () => {
   const paths: string[] = [];
   const fetchImpl: typeof fetch = async (input) => {
     const url = new URL(input instanceof Request ? input.url : input.toString());
@@ -200,7 +200,8 @@ test("deduplicates exact issue fetches, skips missing issues and pull requests",
     "/repos/acme/widget/issues/2",
     "/repos/acme/widget/issues/3",
   ]);
-  assert.deepEqual(issues.map(({ id }) => id), ["1"]);
+  assert.deepEqual(issues.map(({ id }) => id), ["1", "3"]);
+  assert.equal(issues[1]?.dispatchable, false);
 });
 
 test("validates configuration, states, ids, payloads, and redacts tokens from errors", async () => {
@@ -290,6 +291,7 @@ test("uses GITHUB_TOKEN fallback and registers count-only malformed-candidate wa
     } as unknown as Pick<AppLogger, "warn">;
     const malformed = rawIssue(2, {
       title: " ",
+      pull_request: {},
       providerSecret: "secret-provider-payload-1",
     });
     const secondPageMalformed = rawIssue(6, {

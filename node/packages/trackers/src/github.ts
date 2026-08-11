@@ -173,7 +173,7 @@ export class GitHubTracker implements Tracker {
       for (const raw of payload) {
         try {
           const issue = normalizeIssue(raw, this.#settings, url.pathname);
-          if (issue && requested.has(issue.state as GitHubState)) issues.push(issue);
+          if (requested.has(issue.state as GitHubState)) issues.push(issue);
         } catch (error) {
           if (!(error instanceof TrackerError) || error.category !== "tracker_response") throw error;
           malformedCount += 1;
@@ -227,7 +227,6 @@ export class GitHubTracker implements Tracker {
       if (response === undefined) continue;
 
       const issue = normalizeIssue(response.payload, this.#settings, url.pathname);
-      if (!issue) continue;
       if (issue.id !== id) {
         throw new TrackerError(
           "tracker_response",
@@ -993,9 +992,7 @@ function validateIssueIds(ids: string[]): string[] {
   return [...unique];
 }
 
-function normalizeIssue(raw: unknown, settings: GitHubSettings, path: string): Issue | null {
-  if (isRecord(raw) && Object.hasOwn(raw, "pull_request")) return null;
-
+function normalizeIssue(raw: unknown, settings: GitHubSettings, path: string): Issue {
   const parsed = githubIssueSchema.safeParse(raw);
   if (!parsed.success) {
     const details = parsed.error.issues
@@ -1025,7 +1022,7 @@ function normalizeIssue(raw: unknown, settings: GitHubSettings, path: string): I
     assigneeId: issue.assignee?.login ?? null,
     labels: [...new Set(labels.map((label) => label.trim().toLowerCase()).filter(Boolean))],
     blockedBy: [],
-    dispatchable: true,
+    dispatchable: !Object.hasOwn(issue, "pull_request"),
     createdAt: issue.created_at ?? null,
     updatedAt: issue.updated_at ?? null,
   };

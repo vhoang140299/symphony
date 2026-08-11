@@ -261,7 +261,8 @@ coding-agent environment allowlist.
 
 Reads are repository-scoped under `/repos/<owner>/<repo>/issues`. Required routing labels are not a
 provider-side scope; the scheduler filters them. Pull requests returned by the Issues API are
-omitted. State inputs are trimmed, lowercased, and deduplicated; `all` expands to both `open` and
+retained as normalized records with `dispatchable: false`, so the scheduler excludes them from
+dispatch. State inputs are trimmed, lowercased, and deduplicated; `all` expands to both `open` and
 `closed` and is sent as the provider's `state=all` request.
 
 State pages use `per_page=100`, `sort=created`, and `direction=asc`, with a maximum of 1,000 pages.
@@ -270,8 +271,9 @@ falls back to the next numeric page. Pagination rejects loops, credentials, a di
 path, fragments, invalid syntax, and multiple next targets. One 30-second deadline covers each REST
 request and its body read, redirects fail closed, and the adapter performs no retry.
 
-ID inputs are deduplicated and fetched serially, one GET per unique issue. HTTP 404 and pull-request
-records are omitted; a returned issue number that differs from the request fails the read. Internal
+ID inputs are deduplicated and fetched serially, one GET per unique issue. HTTP 404 responses are
+omitted; pull-request records are returned with `dispatchable: false`. A returned issue number that
+differs from the request fails the read. Internal
 idempotent comment lookup scans 100 comments per page for at most 100 pages and updates the lowest
 matching comment ID. Open-pull-request lookup requests up to 100 results and rejects multiple
 matches.
@@ -284,17 +286,18 @@ matches.
   `open` or `closed`; `priority` and `branchName` are `null`; `url` is `html_url` or `null`;
   `assigneeId` is the assignee login or `null`.
 - Labels accept strings or label objects, then trim, lowercase, deduplicate, and drop blank,
-  missing, null, or malformed names. `blockedBy` is `[]` and `dispatchable` is `true`.
+  missing, null, or malformed names. `blockedBy` is `[]`; `dispatchable` is `false` when the payload
+  has its own `pull_request` key and `true` otherwise.
 - `createdAt` and `updatedAt` preserve supplied RFC 3339 timestamps with an offset; absent or
   unusable timestamps become `null`. Unusable optional body, URL, or assignee values also become
   `null`.
 
-State-list reads omit non-PR payloads rejected by the issue schema. When a logger is supplied—as all
+State-list reads omit payloads rejected by the issue schema. When a logger is supplied—as all
 built-in CLI and orchestrator paths do—each affected provider page emits one warning, `Dropping
 malformed GitHub issue records`, with only the aggregate `malformed_count`; raw records are never
-logged. ID refresh remains strict: any non-PR payload rejected by the issue schema, or any refreshed
+logged. ID refresh remains strict: any payload rejected by the issue schema, or any refreshed
 identity mismatch, makes the complete read fail with `tracker_response`. An object with its own
-`pull_request` key is omitted before issue-schema validation; state reads also omit otherwise valid
+`pull_request` key is normalized with `dispatchable: false`; state reads also omit otherwise valid
 issues outside the requested state set.
 
 ### Mutation, publishing, and error mapping
