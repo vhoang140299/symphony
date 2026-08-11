@@ -30,7 +30,9 @@ function compareIssues(left: Issue, right: Issue): number {
   if (priorityDifference !== 0) return priorityDifference;
   const createdDifference = dateRank(left.createdAt) - dateRank(right.createdAt);
   if (createdDifference !== 0) return createdDifference;
-  return left.identifier.localeCompare(right.identifier);
+  if (left.identifier < right.identifier) return -1;
+  if (left.identifier > right.identifier) return 1;
+  return 0;
 }
 
 function priorityRank(priority: number | null): number {

@@ -14,6 +14,7 @@ import {
 } from "../src/config/workflow.js";
 import type { Issue } from "../src/domain.js";
 import { createLogger } from "../src/log.js";
+import { selectRoutableIssues } from "../src/routing.js";
 import { workflowScopeHash } from "../src/state/scope.js";
 
 function workflowError(code: WorkflowErrorCode): (error: unknown) => boolean {
@@ -202,6 +203,19 @@ test("normalizes per-state concurrency limits and ignores invalid entries", () =
       agent: { max_concurrent_agents_by_state: maxConcurrentAgentsByState },
     }));
   }
+});
+
+test("uses an ordinal identifier tie-breaker for equal candidates", () => {
+  const config = parseWorkflowConfig({ tracker: { kind: "memory" } });
+  const candidates = [
+    { ...sampleIssue, id: "composed", identifier: "\u00e9" },
+    { ...sampleIssue, id: "decomposed", identifier: "e\u0301" },
+  ];
+
+  assert.deepEqual(
+    selectRoutableIssues(candidates, config).map(({ id }) => id),
+    ["decomposed", "composed"],
+  );
 });
 
 test("keeps state optional and validates its strict shape", () => {
