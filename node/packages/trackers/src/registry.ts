@@ -14,7 +14,7 @@ export function createTracker(
   options: Pick<LinearTrackerDependencies, "logger" | "terminalStates"> = {},
 ): Tracker {
   if (kind === "memory") return new MemoryTracker(provider);
-  if (kind === "github") return new GitHubTracker(provider);
+  if (kind === "github") return new GitHubTracker(provider, undefined, undefined, options.logger);
   if (kind === "linear") return new LinearTracker(provider, options);
   throw new TrackerError("unsupported_tracker_kind", `Unsupported tracker kind: ${kind}`);
 }

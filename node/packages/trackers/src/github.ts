@@ -7,6 +7,7 @@ import type {
   PublishChangeInput,
   Tracker,
 } from "@ai-symphony/core/domain.js";
+import type { AppLogger } from "@ai-symphony/core/log.js";
 import { publishGitBranch } from "@ai-symphony/core/publish/git.js";
 import { asInvalidTrackerConfig, TrackerError } from "./error.js";
 import {
@@ -36,24 +37,27 @@ const githubIssueSchema = z
   .object({
     number: z.number().int().positive().safe(),
     title: z.string().trim().min(1),
-    body: z.string().nullable().optional(),
+    body: z.string().nullable().catch(null).optional(),
     state: z.enum(["open", "closed"]),
-    html_url: z.string().url().nullable().optional(),
+    html_url: z.string().url().nullable().catch(null).optional(),
     assignee: z
       .object({ login: z.string().trim().min(1) })
       .passthrough()
       .nullable()
+      .catch(null)
       .optional(),
     labels: z
       .array(
         z.union([
           z.string(),
           z.object({ name: z.string().nullable().optional() }).passthrough(),
-        ]),
+          z.null(),
+        ]).catch(null),
       )
+      .catch([])
       .optional(),
-    created_at: z.string().datetime({ offset: true }).nullable().optional(),
-    updated_at: z.string().datetime({ offset: true }).nullable().optional(),
+    created_at: z.string().datetime({ offset: true }).nullable().catch(null).optional(),
+    updated_at: z.string().datetime({ offset: true }).nullable().catch(null).optional(),
   })
   .passthrough();
 
@@ -123,15 +127,18 @@ export class GitHubTracker implements Tracker {
   readonly #settings: GitHubSettings;
   readonly #fetch: FetchLike;
   readonly #publishGitBranch: GitPublisher;
+  readonly #logger: Pick<AppLogger, "warn"> | undefined;
 
   constructor(
     provider: Record<string, unknown>,
     fetchImpl: FetchLike = globalThis.fetch,
     gitPublisher: GitPublisher = publishGitBranch,
+    logger?: Pick<AppLogger, "warn">,
   ) {
     this.#settings = parseSettings(provider);
     this.#fetch = fetchImpl;
     this.#publishGitBranch = gitPublisher;
+    this.#logger = logger;
   }
 
   async fetchIssuesByStates(states: string[]): Promise<Issue[]> {
@@ -162,9 +169,21 @@ export class GitHubTracker implements Tracker {
         );
       }
 
+      let malformedCount = 0;
       for (const raw of payload) {
-        const issue = normalizeIssue(raw, this.#settings, url.pathname);
-        if (issue && requested.has(issue.state as GitHubState)) issues.push(issue);
+        try {
+          const issue = normalizeIssue(raw, this.#settings, url.pathname);
+          if (issue && requested.has(issue.state as GitHubState)) issues.push(issue);
+        } catch (error) {
+          if (!(error instanceof TrackerError) || error.category !== "tracker_response") throw error;
+          malformedCount += 1;
+        }
+      }
+      if (malformedCount > 0) {
+        this.#logger?.warn(
+          { malformed_count: malformedCount },
+          "Dropping malformed GitHub issue records",
+        );
       }
 
       const linkedPage = nextPageUrl(response.link, url, expectedUrl);
@@ -975,7 +994,7 @@ function validateIssueIds(ids: string[]): string[] {
 }
 
 function normalizeIssue(raw: unknown, settings: GitHubSettings, path: string): Issue | null {
-  if (isRecord(raw) && "pull_request" in raw) return null;
+  if (isRecord(raw) && Object.hasOwn(raw, "pull_request")) return null;
 
   const parsed = githubIssueSchema.safeParse(raw);
   if (!parsed.success) {
@@ -990,7 +1009,7 @@ function normalizeIssue(raw: unknown, settings: GitHubSettings, path: string): I
 
   const issue = parsed.data;
   const labels = (issue.labels ?? []).flatMap((label) =>
-    typeof label === "string" ? [label] : typeof label.name === "string" ? [label.name] : [],
+    typeof label === "string" ? [label] : typeof label?.name === "string" ? [label.name] : [],
   );
 
   return {

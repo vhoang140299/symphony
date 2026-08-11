@@ -284,14 +284,18 @@ matches.
   `open` or `closed`; `priority` and `branchName` are `null`; `url` is `html_url` or `null`;
   `assigneeId` is the assignee login or `null`.
 - Labels accept strings or label objects, then trim, lowercase, deduplicate, and drop blank,
-  missing, or null names. `blockedBy` is `[]` and `dispatchable` is `true`.
-- `createdAt` and `updatedAt` preserve supplied RFC 3339 timestamps with an offset; absent values
-  become `null`.
+  missing, null, or malformed names. `blockedBy` is `[]` and `dispatchable` is `true`.
+- `createdAt` and `updatedAt` preserve supplied RFC 3339 timestamps with an offset; absent or
+  unusable timestamps become `null`. Unusable optional body, URL, or assignee values also become
+  `null`.
 
-Any non-PR payload rejected by the issue schema, or any refreshed identity mismatch, makes the
-complete read fail with `tracker_response`. An object containing a `pull_request` key is omitted
-before issue-schema validation; state reads also omit otherwise valid issues outside the requested
-state set.
+State-list reads omit non-PR payloads rejected by the issue schema. When a logger is supplied—as all
+built-in CLI and orchestrator paths do—each affected provider page emits one warning, `Dropping
+malformed GitHub issue records`, with only the aggregate `malformed_count`; raw records are never
+logged. ID refresh remains strict: any non-PR payload rejected by the issue schema, or any refreshed
+identity mismatch, makes the complete read fail with `tracker_response`. An object with its own
+`pull_request` key is omitted before issue-schema validation; state reads also omit otherwise valid
+issues outside the requested state set.
 
 ### Mutation, publishing, and error mapping
 
@@ -314,8 +318,8 @@ GitHub request messages are redacted templates:
   retry timing metadata. Mutation paths may explicitly accept an operation-specific status such as
   the pull-request creation race's HTTP 422.
 - Invalid JSON uses `tracker_response` and
-  `GitHub API <METHOD> <PATH> returned invalid JSON`. Invalid issue lists, issue schemas, and
-  refreshed identities use respectively `... returned a non-array issue list`,
+  `GitHub API <METHOD> <PATH> returned invalid JSON`. Invalid issue lists, strict ID-refresh issue
+  schemas, and refreshed identities use respectively `... returned a non-array issue list`,
   `... returned an invalid issue: <validation details>`, or
   `... returned issue <actual> instead of <requested>`. A response-body stream interruption is
   `tracker_request` and uses the redacted `... failed` message.

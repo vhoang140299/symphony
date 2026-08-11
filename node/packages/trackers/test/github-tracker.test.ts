@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "vitest";
 import type { Issue, IssueMutation } from "@ai-symphony/core/domain.js";
+import type { AppLogger } from "@ai-symphony/core/log.js";
 import { GitHubTracker } from "../src/github.js";
 import { createTracker, validateTrackerProvider } from "../src/registry.js";
 import { trackerError } from "./assertions.js";
@@ -241,15 +242,6 @@ test("validates configuration, states, ids, payloads, and redacts tokens from er
     if (previousToken === undefined) delete process.env.SYMPHONY_GITHUB_TEST_TOKEN;
     else process.env.SYMPHONY_GITHUB_TEST_TOKEN = previousToken;
   }
-
-  const malformed = new GitHubTracker(
-    { owner: "acme", repo: "widget" },
-    async () => Response.json([{ number: 1, title: "", state: "open" }]),
-  );
-  await assert.rejects(
-    malformed.fetchIssuesByStates(["open"]),
-    trackerError("tracker_response", /returned an invalid issue: title:/),
-  );
 });
 
 test("validates GitHub provider syntax without resolving authentication", () => {
@@ -277,8 +269,9 @@ test("validates GitHub provider syntax without resolving authentication", () => 
   }
 });
 
-test("uses GITHUB_TOKEN fallback and registry creates the GitHub tracker", async () => {
+test("uses GITHUB_TOKEN fallback and registers count-only malformed-candidate warnings", async () => {
   const previousToken = process.env.GITHUB_TOKEN;
+  const originalFetch = globalThis.fetch;
   process.env.GITHUB_TOKEN = "fallback-token";
   try {
     let authorization: string | null = null;
@@ -288,12 +281,75 @@ test("uses GITHUB_TOKEN fallback and registry creates the GitHub tracker", async
     });
     assert.deepEqual(await tracker.fetchIssuesByStates(["all"]), []);
     assert.equal(authorization, "Bearer fallback-token");
-    assert.ok(createTracker("github", { owner: "acme", repo: "widget" }) instanceof GitHubTracker);
+
+    const warnings: Array<{ bindings: Record<string, unknown>; message: string }> = [];
+    const logger = {
+      warn(bindings: Record<string, unknown>, message: string) {
+        warnings.push({ bindings, message });
+      },
+    } as unknown as Pick<AppLogger, "warn">;
+    const malformed = rawIssue(2, {
+      title: " ",
+      providerSecret: "secret-provider-payload-1",
+    });
+    const secondPageMalformed = rawIssue(6, {
+      number: "invalid",
+      providerSecret: "secret-provider-payload-3",
+    });
+    const optionalFallback = rawIssue(4, {
+      body: 4,
+      html_url: "not-a-url",
+      assignee: { login: " " },
+      labels: [{ name: 4 }, " Usable "],
+      created_at: "not-a-timestamp",
+      updated_at: 4,
+    });
+    globalThis.fetch = async (input) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.endsWith("/2")) return Response.json(malformed);
+      if (url.searchParams.get("page") === "2") {
+        return Response.json([rawIssue(5), secondPageMalformed]);
+      }
+      const next = new URL(url);
+      next.searchParams.set("page", "2");
+      return Response.json([
+        rawIssue(1),
+        malformed,
+        rawIssue(3, { state: "invalid", providerSecret: "secret-provider-payload-2" }),
+        optionalFallback,
+      ], { headers: { Link: `<${next.href}>; rel="next"` } });
+    };
+    const registered = createTracker("github", { owner: "acme", repo: "widget" }, { logger });
+    assert.ok(registered instanceof GitHubTracker);
+    const candidates = await registered.fetchIssuesByStates(["open"]);
+    assert.deepEqual(candidates.map(({ id }) => id), ["1", "4", "5"]);
+    assert.equal(candidates[1]?.description, null);
+    assert.equal(candidates[1]?.url, null);
+    assert.equal(candidates[1]?.assigneeId, null);
+    assert.deepEqual(candidates[1]?.labels, ["usable"]);
+    assert.equal(candidates[1]?.createdAt, null);
+    assert.equal(candidates[1]?.updatedAt, null);
+    assert.deepEqual(warnings, [
+      {
+        bindings: { malformed_count: 2 },
+        message: "Dropping malformed GitHub issue records",
+      },
+      {
+        bindings: { malformed_count: 1 },
+        message: "Dropping malformed GitHub issue records",
+      },
+    ]);
+    assert.doesNotMatch(JSON.stringify(warnings), /secret-provider-payload/);
+    await assert.rejects(
+      registered.fetchIssuesByIds(["2"]),
+      trackerError("tracker_response", /returned an invalid issue: title:/),
+    );
     assert.throws(
       () => createTracker("unsupported", {}),
       trackerError("unsupported_tracker_kind", /Unsupported tracker kind: unsupported/),
     );
   } finally {
+    globalThis.fetch = originalFetch;
     if (previousToken === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = previousToken;
   }
